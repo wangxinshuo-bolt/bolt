@@ -1,0 +1,175 @@
+/*
+ * Copyright (c) ByteDance Ltd. and/or its affiliates.
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#pragma once
+
+#include <condition_variable>
+#include <exception>
+#include <memory>
+#include <mutex>
+
+#include "bolt/common/memory/bm/BufferHandle.h"
+#include "bolt/common/memory/bm/BufferPool.h"
+#include "bolt/common/memory/bm/SpillStore.h"
+
+namespace bytedance::bolt::memory::bm {
+
+class BufferManager;
+
+// Internal state-machine wrapper for a BufferManager block. BlockHandle owns
+// the resident memory (or compressed/spilled representation) and tracks the
+// lifecycle a block goes through: kAllocating -> kLoaded -> {kCompressed,
+// kSpilled} and back to kLoaded on Pin reload. Multiple BufferHandle pins may
+// reference the same BlockHandle; the block is evictable iff pinCount_ == 0.
+//
+// Threading: BlockHandle is fully thread-safe. All public methods take
+// mutex_; cv_ is used to coordinate concurrent Pin reloads (only one thread
+// performs the I/O, the rest wait on the load generation).
+//
+// BlockHandle is held inside BufferManager via shared_ptr and inherits
+// BlockHandleBase so the BlockEvictor can reference it through weak_ptr in
+// EvictionNode.
+class BlockHandle : public BlockHandleBase,
+                    public std::enable_shared_from_this<BlockHandle> {
+ public:
+  // Constructs a block descriptor in the kAllocating state. No resident
+  // memory is attached yet; BufferManager::Allocate calls InstallMemory()
+  // once the BufferPool reservation succeeds. 'manager' must outlive this
+  // BlockHandle (BufferManager invalidates blocks on shutdown via
+  // InvalidateForManagerDestruction). 'options' is captured by value and
+  // drives the eviction policy and recovery callback.
+  BlockHandle(BufferManager* manager, AllocateOptions options);
+
+  // Releases any resident memory, compressed payload, and spilled file the
+  // block still owns. Marks the block invalid. Never throws.
+  ~BlockHandle();
+
+  // Returns the current eviction sequence number. Each time the block's
+  // identity-as-eviction-candidate changes (e.g. a spill failure restores
+  // kLoaded, or a Pin reload bumps the generation) this counter is
+  // incremented so that stale EvictionNode entries can be detected.
+  // See design doc §7.1 and §9.1.
+  uint64_t EvictionSequence() const override;
+
+  // Acquires a read pin on the block, reloading from compressed/spilled
+  // state if necessary. Returns a non-initial-write BufferHandle on success.
+  //
+  // Behavior by current State():
+  //   kLoaded                -> increments pinCount_, returns immediately.
+  //   kCompressed            -> decompresses into a fresh BufferPool
+  //                              reservation, transitions to kLoaded.
+  //   kSpilled               -> reads back from SpillStore via the
+  //                              registered recovery path.
+  //   kAllocating / kInvalid -> throws BoltUserError.
+  //   kEvicting              -> waits on cv_ until eviction resolves, then
+  //                              retries (one of the resolutions above).
+  //
+  // Concurrent Pin calls coordinate via loadGeneration_; only one thread
+  // performs the I/O, others wait and re-check. If the load fails the
+  // exception is rethrown to all waiters of that generation.
+  BufferHandle Pin();
+
+  // Synchronous, cheap-only eviction path used by BlockEvictor for
+  // kEvictAndDiscard / kEvictAndRecompute policies. Frees resident memory
+  // when safe and returns the bytes actually released (0 if the block was
+  // pinned, already evicted, or under a spill policy).
+  // Throws nothing under normal operation; bugs in the recovery contract
+  // surface as BoltUserError.
+  ByteCount TryEvict(ByteCount targetBytes);
+
+  // Compresses an in-memory kCompressThenSpill block into 'compressed_',
+  // releasing the live BlockBuffer reservation. Returns the bytes released
+  // (resident_size - compressed_size, never negative). No-op if the block
+  // is pinned, already kCompressed, or not under kCompressThenSpill.
+  ByteCount CompressInPlace();
+
+  // Writes the immutable block to spill storage and frees resident memory
+  // and any compressed payload. Returns the bytes released (i.e. the
+  // resident size that disappeared from the BufferPool). Bumps
+  // evictionSequence_. Throws on I/O failure with the block restored to
+  // its pre-spill state (kLoaded or kCompressed).
+  ByteCount SpillToDisk();
+
+  // Marks the block kInvalid and releases its accounted memory and spill
+  // file. Used by BufferManager during shutdown so dangling BufferHandle
+  // pins observe predictable failures rather than a use-after-free.
+  void InvalidateForManagerDestruction() noexcept;
+
+  // Returns the current state in the lifecycle state machine.
+  BlockState State() const;
+
+  // Returns the logical (uncompressed) block size in bytes. Constant for
+  // the lifetime of the block once InstallMemory() has run.
+  ByteCount Size() const;
+
+  // Returns true once the initial write window has been closed, i.e. the
+  // initial-write BufferHandle has been destroyed. Sealed blocks are
+  // immutable and become eligible for eviction.
+  bool IsSealed() const;
+
+  // Returns true iff at least one BufferHandle pin is active. A pinned
+  // block cannot be evicted, compressed, or spilled.
+  bool IsPinned() const;
+
+  // Returns a process-local monotonic block id for diagnostics and log
+  // correlation. Stable across the block's lifetime.
+  uint64_t Id() const {
+    return id_;
+  }
+
+ private:
+  friend class BufferHandle;
+  friend class BufferManager;
+  friend class BlockEvictor;
+
+  // Installs newly allocated AccountedMemory and creates the initial-write
+  // pin (transitions kAllocating -> kLoaded with pinCount_==1, sealed_==false).
+  // Called exactly once by BufferManager::Allocate before the block is
+  // exposed to user code.
+  void InstallMemory(std::unique_ptr<AccountedMemory> memory);
+
+  // Releases one pin. When 'initialWrite' is true the block is also sealed.
+  // Decrements pinCount_; on transition to zero, broadcasts cv_ so
+  // eviction/spill paths waiting for unpinning can proceed. Never throws.
+  void Unpin(bool initialWrite) noexcept;
+
+  // Returns immutable bytes for the current resident representation.
+  // Caller MUST hold mutex_. Throws BoltUserError if the block is not in
+  // a state with resident bytes (kCompressed/kSpilled/kInvalid).
+  ConstDataPtr DataLocked() const;
+
+  // Returns mutable bytes for the initial-write handle while the block is
+  // unsealed. Caller MUST hold mutex_. Throws BoltUserError on a sealed
+  // block, on reader handles, or when memory_ has been released.
+  DataPtr MutableDataLocked(bool initialWrite);
+
+  const uint64_t id_{0};
+  BufferManager* manager_{nullptr};
+  const AllocateOptions options_;
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  BlockState state_{BlockState::kInvalid};
+  std::unique_ptr<AccountedMemory> memory_;
+  // Sole owner of compressed bytes when state_ == kCompressed. The compressed
+  // payload is a private representation (currently a passthrough copy) and is
+  // accounted as kNormal in BufferPool just like memory_.
+  std::unique_ptr<AccountedMemory> compressed_;
+  SpillLocation spillLocation_;
+  ByteCount size_{0};
+  uint32_t pinCount_{0};
+  bool sealed_{false};
+  // Monotonic load attempt id used to disambiguate concurrent Pin reloads so
+  // that one failure is reported exactly once to its waiters.
+  uint64_t loadGeneration_{0};
+  // Captured exception from the most recent failed reload of loadGeneration_.
+  // Cleared whenever a new load attempt succeeds or starts.
+  std::exception_ptr lastLoadError_;
+  // Per design doc §7.1: incremented whenever the eviction candidate identity
+  // changes (e.g. spill failure restoring kLoaded). Stale EvictionNode entries
+  // referencing an older value must be skipped by the Evictor.
+  uint64_t evictionSequence_{0};
+};
+
+} // namespace bytedance::bolt::memory::bm

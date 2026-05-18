@@ -37,6 +37,7 @@
 #include "bolt/common/memory/MallocAllocator.h"
 #include "bolt/common/memory/MemoryPoolForGluten.h"
 #include "bolt/common/memory/MmapAllocator.h"
+#include "bolt/common/memory/bm/BufferManager.h"
 
 DECLARE_int32(bolt_memory_num_shared_leaf_pools);
 namespace bytedance::bolt::memory {
@@ -228,9 +229,19 @@ MemoryManager::MemoryManager(const MemoryManager::Options& options)
   BOLT_CHECK_EQ(
       sharedLeafPools_.size(),
       std::max(1, FLAGS_bolt_memory_num_shared_leaf_pools));
+  if (options.enableBufferManager) {
+    bm::BufferManagerConfig config;
+    config.memoryLimitBytes = options.bufferManagerCapacity == 0
+        ? static_cast<uint64_t>(capacity())
+        : static_cast<uint64_t>(options.bufferManagerCapacity);
+    config.pinnedLimitBytes = config.memoryLimitBytes;
+    config.poolName = "__buffer_manager__";
+    bufferManager_ = std::make_unique<bm::BufferManager>(*this, config);
+  }
 }
 
 MemoryManager::~MemoryManager() {
+  bufferManager_.reset();
   arbitrator_->shutdown();
 
   if (pools_.size() != 0) {
@@ -445,6 +456,14 @@ MemoryAllocator* MemoryManager::allocator() {
 
 MemoryArbitrator* MemoryManager::arbitrator() {
   return arbitrator_.get();
+}
+
+bm::BufferManager* MemoryManager::bufferManager() {
+  return bufferManager_.get();
+}
+
+const bm::BufferManager* MemoryManager::bufferManager() const {
+  return bufferManager_.get();
 }
 
 std::string MemoryManager::toString(bool detail) const {

@@ -27,6 +27,7 @@
 
 if(${BOLT_BUILD_TESTING})
   add_subdirectory(tests)
+  add_subdirectory(bm/tests)
   add_subdirectory(sparksql/tests)
 endif()
 
@@ -43,6 +44,17 @@ bolt_add_library(
   MemoryAllocationListener.cpp
   MemoryAllocator.cpp
   MemoryArbitrator.cpp
+  bm/BlockHandle.cpp
+  bm/BufferHandle.cpp
+  bm/BufferManager.cpp
+  bm/BufferPool.cpp
+  bm/Evictor.cpp
+  bm/GlobalSpillScheduler.cpp
+  bm/ProcessSpillService.cpp
+  bm/SpillClient.cpp
+  bm/SpillStore.cpp
+  bm/TemporaryMemoryManager.cpp
+  bm/Types.cpp
   MemoryPool.cpp
   MemoryPoolForGluten.cpp
   MemoryUtils.cpp

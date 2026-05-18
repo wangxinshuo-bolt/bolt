@@ -58,6 +58,10 @@ DECLARE_bool(bolt_memory_leak_check_enabled);
 DECLARE_bool(bolt_memory_pool_debug_enabled);
 DECLARE_bool(bolt_enable_memory_usage_track_in_default_memory_pool);
 namespace bytedance::bolt::memory {
+namespace bm {
+class BufferManager;
+} // namespace bm
+
 #define BOLT_MEM_LOG_PREFIX "[MEM] "
 #define BOLT_MEM_LOG(severity) LOG(severity) << BOLT_MEM_LOG_PREFIX
 #define BOLT_MEM_LOG_EVERY_MS(severity, ms) \
@@ -200,6 +204,15 @@ class MemoryManager {
     /// If true, the memory manager will use the memory pool for gluten
     bool useMemoryPoolForGluten{false};
     bool enableDynamicMemoryQuotaManager{false};
+
+    /// If true, creates a process-wide BufferManager sub-component backed by a
+    /// dedicated Bolt memory pool. Disabled by default to keep existing users'
+    /// behavior unchanged.
+    bool enableBufferManager{false};
+
+    /// Capacity in bytes of the optional BufferManager root pool. 0 means use
+    /// the memory manager's allocator capacity.
+    int64_t bufferManagerCapacity{0};
   };
 
   explicit MemoryManager(const Options& options = Options{});
@@ -287,6 +300,11 @@ class MemoryManager {
 
   MemoryArbitrator* arbitrator();
 
+  /// Returns the optional process-wide BufferManager. It is null unless
+  /// Options::enableBufferManager is set.
+  bm::BufferManager* bufferManager();
+  const bm::BufferManager* bufferManager() const;
+
   /// Returns debug string of this memory manager. If 'detail' is true, it
   /// returns the detailed tree memory usage from all the top level root memory
   /// pools.
@@ -361,6 +379,8 @@ class MemoryManager {
   mutable folly::SharedMutex mutex_;
   // All user root pools allocated from 'this'.
   std::unordered_map<std::string, std::weak_ptr<MemoryPool>> pools_;
+
+  std::unique_ptr<bm::BufferManager> bufferManager_;
 };
 
 /// Initializes the process-wide memory manager based on the specified

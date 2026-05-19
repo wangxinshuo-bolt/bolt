@@ -131,17 +131,17 @@ const char* ToString(BlockState state) {
   return "unknown";
 }
 
-const char* ToString(MediumKind kind) {
+const char* ToString(DiskKind kind) {
   switch (kind) {
-    case MediumKind::kUnknown:
+    case DiskKind::kUnknown:
       return "unknown";
-    case MediumKind::kHdd:
+    case DiskKind::kHdd:
       return "hdd";
-    case MediumKind::kSsd:
+    case DiskKind::kSsd:
       return "ssd";
-    case MediumKind::kNvme:
+    case DiskKind::kNvme:
       return "nvme";
-    case MediumKind::kNetworkFs:
+    case DiskKind::kNetworkFs:
       return "network_fs";
   }
   return "unknown";

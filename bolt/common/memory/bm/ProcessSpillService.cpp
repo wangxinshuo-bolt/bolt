@@ -15,6 +15,7 @@
 
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/memory/Memory.h"
+#include "bolt/common/memory/bm/DiskProbe.h"
 
 namespace bytedance::bolt::memory::bm {
 namespace {
@@ -52,12 +53,26 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
       !config_.dirs.empty(),
       "ProcessSpillService requires at least one spill directory");
   CleanupStaleDirsAtStartup();
+  bool configuredDiskIo = false;
   for (const auto& dir : config_.dirs) {
     SpillStoreConfig storeCfg;
     storeCfg.spillDir = dir.path;
     storeCfg.cleanupOnDestroy = config_.cleanupOnDestroy;
     storeCfg.forcedKind = dir.forcedKind;
     storeCfg.unknownFallbackKind = config_.unknownFallbackKind;
+    DiskProbeConfig probeConfig;
+    probeConfig.directory = storeCfg.spillDir;
+    probeConfig.duration = config_.diskProbeDuration;
+    probeConfig.forcedKind = storeCfg.forcedKind;
+    probeConfig.fallbackKind = storeCfg.unknownFallbackKind;
+    storeCfg.diskProbe = ProbeDisk(probeConfig);
+    if (!configuredDiskIo) {
+      DiskIoConfig ioConfig;
+      ioConfig.backend = DiskIoBackend::kUring;
+      ioConfig.targetP95LatencyUs = storeCfg.diskProbe.targetP95LatencyUs;
+      ProcessDiskIoService::ConfigureDefaultIfNeeded(ioConfig);
+      configuredDiskIo = true;
+    }
     SpillStore::CleanupAtStartup(storeCfg);
     stores_.push_back(
         std::make_unique<SpillStore>(storeCfg, config_.metrics));

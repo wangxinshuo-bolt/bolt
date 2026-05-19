@@ -7,6 +7,7 @@ add_executable(
   bolt_memory_bm_test
   BlockHandleTest.cpp
   BufferPoolTest.cpp
+  DiskIoTest.cpp
   MemoryManagerIntegrationTest.cpp
   SpillTest.cpp
   TemporaryMemoryManagerTest.cpp)

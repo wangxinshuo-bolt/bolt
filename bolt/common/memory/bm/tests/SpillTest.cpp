@@ -206,6 +206,7 @@ TEST(SpillTest, spillLocationRoutesReleaseToOriginalStore) {
   serviceConfig.dirs.push_back(SpillDirConfig{.path = (root / "b").string()});
   serviceConfig.workerThreadCount = 0;
   serviceConfig.cleanupOnDestroy = true;
+  serviceConfig.diskProbeDuration = std::chrono::milliseconds(0);
   auto service = ProcessSpillService::CreateForTesting(std::move(serviceConfig));
 
   SpillClientConfig clientConfig;

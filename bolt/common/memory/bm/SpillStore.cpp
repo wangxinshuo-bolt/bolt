@@ -5,8 +5,11 @@
 
 #include "bolt/common/memory/bm/SpillStore.h"
 
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <filesystem>
-#include <fstream>
+#include <memory>
 #include <utility>
 #include <vector>
 
@@ -18,30 +21,38 @@
 namespace bytedance::bolt::memory::bm {
 namespace {
 
-// Best-effort medium probe based on the configured directory. The MVP only
-// inspects the path; real implementations will read /sys/block + statfs and
-// fall back to config.unknownFallbackKind. Per design doc §10.2 forced kinds
-// always win over probing.
-MediumKind probeMedium(const SpillStoreConfig& config) {
-  if (config.forcedKind != MediumKind::kUnknown) {
-    return config.forcedKind;
-  }
-  // No real probing yet: return the user-supplied fallback.
-  return config.unknownFallbackKind;
-}
-
 MetricsRegistry& effectiveRegistry(MetricsRegistry* metrics) {
   return metrics == nullptr ? NoOpMetricsRegistry() : *metrics;
 }
 
+class ScopedFd {
+ public:
+  explicit ScopedFd(int fd) : fd_(fd) {}
+  ~ScopedFd() {
+    if (fd_ >= 0) {
+      ::close(fd_);
+    }
+  }
+
+  ScopedFd(const ScopedFd&) = delete;
+  ScopedFd& operator=(const ScopedFd&) = delete;
+
+  int get() const {
+    return fd_;
+  }
+
+ private:
+  int fd_{-1};
+};
+
 } // namespace
 
-SpillWriteSession::SpillWriteSession(SpillStore* store, MediumKind medium)
-    : store_(store), medium_(medium) {}
+SpillWriteSession::SpillWriteSession(SpillStore* store, DiskKind disk)
+    : store_(store), disk_(disk) {}
 
 SpillWriteSession::SpillWriteSession(SpillWriteSession&& other) noexcept
     : store_(other.store_),
-      medium_(other.medium_),
+      disk_(other.disk_),
       consumed_(other.consumed_) {
   other.store_ = nullptr;
   other.consumed_ = true;
@@ -51,7 +62,7 @@ SpillWriteSession& SpillWriteSession::operator=(
     SpillWriteSession&& other) noexcept {
   if (this != &other) {
     store_ = other.store_;
-    medium_ = other.medium_;
+    disk_ = other.disk_;
     consumed_ = other.consumed_;
     other.store_ = nullptr;
     other.consumed_ = true;
@@ -78,11 +89,31 @@ SpillLocation SpillWriteSession::Write(
   store_->RegisterLiveFile(path);
 
   try {
-    std::ofstream out(path, std::ios::binary | std::ios::trunc);
-    BOLT_USER_CHECK(out.good(), "Failed to open spill file {} for write", path);
-    out.write(reinterpret_cast<const char*>(src), bytes);
-    out.close();
-    BOLT_USER_CHECK(out.good(), "Failed to write spill file {}", path);
+    ScopedFd fd(::open(path.c_str(), O_CREAT | O_TRUNC | O_WRONLY, 0644));
+    BOLT_USER_CHECK_GE(
+        fd.get(), 0, "Failed to open spill file {} for write", path);
+
+    DiskIoRequest write;
+    write.op = DiskIoOp::kWrite;
+    write.priority = DiskIoPriority::kLow;
+    write.fd = fd.get();
+    write.buffer = const_cast<DataPtr>(src);
+    write.size = bytes;
+    write.offset = 0;
+    auto writeDone = store_->ioScheduler_->SubmitAndWait(write);
+    BOLT_USER_CHECK_GE(
+        writeDone.result,
+        0,
+        "Failed to write spill file {}: errno {}",
+        path,
+        -writeDone.result);
+    BOLT_USER_CHECK_EQ(
+        writeDone.result,
+        bytes,
+        "Short write to spill file {}: wrote {}, expected {}",
+        path,
+        writeDone.result,
+        bytes);
   } catch (...) {
     // Roll back the live-file registration and remove the partial file so the
     // session destructor never has to do I/O.
@@ -95,30 +126,48 @@ SpillLocation SpillWriteSession::Write(
   store_->bytesWrittenCounter_.Add(bytes);
   BOLT_MEM_LOG(INFO) << "BufferManager SpillStore wrote " << bytes
                      << " bytes to " << path << " tag=" << ToString(tag)
-                     << " medium=" << ToString(medium_);
-  return SpillLocation{std::move(path), bytes, bytes, 0, medium_};
+                     << " disk=" << ToString(disk_);
+  return SpillLocation{std::move(path), bytes, bytes, 0, disk_};
 }
 
-SpillStore::SpillStore(SpillStoreConfig config, MetricsRegistry* metrics)
+SpillStore::SpillStore(
+    SpillStoreConfig config,
+    MetricsRegistry* metrics,
+    DiskIoScheduler* ioScheduler)
     : config_(std::move(config)),
       metrics_(effectiveRegistry(metrics)),
+      ioScheduler_(
+          ioScheduler == nullptr ? &ProcessDiskIoService::Instance().Scheduler()
+                                 : ioScheduler),
+      diskProbe_(config_.diskProbe.kind == DiskKind::kUnknown
+                     ? DiskProbeResult{
+                           config_.unknownFallbackKind,
+                           0,
+                           0,
+                           TargetP95LatencyForDisk(config_.unknownFallbackKind),
+                           false}
+                     : config_.diskProbe),
       bytesWrittenCounter_(metrics_.GetCounter(
           "bm_spill_bytes_written",
-          fmt::format("medium={}", ToString(probeMedium(config_))))),
+          fmt::format("disk={}", ToString(diskProbe_.kind)))),
       bytesReadCounter_(metrics_.GetCounter(
           "bm_spill_bytes_read",
-          fmt::format("medium={}", ToString(probeMedium(config_))))),
+          fmt::format("disk={}", ToString(diskProbe_.kind)))),
       doubleReleaseCounter_(metrics_.GetCounter(
           "bm_spill_double_release",
-          fmt::format("medium={}", ToString(probeMedium(config_))))),
+          fmt::format("disk={}", ToString(diskProbe_.kind)))),
       invalidReleaseCounter_(metrics_.GetCounter(
           "bm_spill_invalid_release",
-          fmt::format("medium={}", ToString(probeMedium(config_))))),
-      medium_(probeMedium(config_)) {
+          fmt::format("disk={}", ToString(diskProbe_.kind)))),
+      disk_(diskProbe_.kind) {
   std::filesystem::create_directories(config_.spillDir);
   BOLT_MEM_LOG(INFO) << "BufferManager SpillStore created at "
                      << config_.spillDir
-                     << " medium=" << ToString(medium_);
+                     << " disk=" << ToString(disk_)
+                     << " write_iops=" << diskProbe_.writeIops
+                     << " read_iops=" << diskProbe_.readIops
+                     << " active_probe=" << diskProbe_.activeProbeRan
+                     << " direct_io=" << diskProbe_.directIoUsed;
 }
 
 SpillStore::~SpillStore() {
@@ -145,7 +194,7 @@ SpillStore::~SpillStore() {
 SpillWriteSession SpillStore::BeginWriteAttempt(
     MemoryTag /*tag*/,
     bool /*allowCompression*/) {
-  return SpillWriteSession(this, medium_);
+  return SpillWriteSession(this, disk_);
 }
 
 SpillLocation SpillStore::Write(
@@ -175,16 +224,31 @@ void SpillStore::Read(
   BOLT_MEM_LOG(INFO) << "BufferManager SpillStore reading "
                      << location.logicalBytes << " bytes from "
                      << location.path
-                     << " medium=" << ToString(location.medium);
-  std::ifstream in(location.path, std::ios::binary);
-  BOLT_USER_CHECK(
-      in.good(), "Failed to open spill file {} for read", location.path);
-  in.read(reinterpret_cast<char*>(dst), location.logicalBytes);
-  BOLT_USER_CHECK(
-      static_cast<ByteCount>(in.gcount()) == location.logicalBytes,
+                     << " disk=" << ToString(location.disk);
+  ScopedFd fd(::open(location.path.c_str(), O_RDONLY));
+  BOLT_USER_CHECK_GE(
+      fd.get(), 0, "Failed to open spill file {} for read", location.path);
+
+  DiskIoRequest read;
+  read.op = DiskIoOp::kRead;
+  read.priority = DiskIoPriority::kHigh;
+  read.fd = fd.get();
+  read.buffer = dst;
+  read.size = location.logicalBytes;
+  read.offset = 0;
+  auto readDone = ioScheduler_->SubmitAndWait(read);
+  BOLT_USER_CHECK_GE(
+      readDone.result,
+      0,
+      "Failed to read spill file {}: errno {}",
+      location.path,
+      -readDone.result);
+  BOLT_USER_CHECK_EQ(
+      readDone.result,
+      location.logicalBytes,
       "Short read from spill file {}: got {}, expected {}",
       location.path,
-      in.gcount(),
+      readDone.result,
       location.logicalBytes);
   bytesReadCounter_.Add(location.logicalBytes);
 }

@@ -48,6 +48,8 @@ bolt_add_library(
   bm/BufferHandle.cpp
   bm/BufferManager.cpp
   bm/BufferPool.cpp
+  bm/DiskIo.cpp
+  bm/DiskProbe.cpp
   bm/Evictor.cpp
   bm/GlobalSpillScheduler.cpp
   bm/ProcessSpillService.cpp
@@ -97,3 +99,8 @@ target_link_libraries(
          arrow::arrow
   PRIVATE re2::re2
 )
+
+if(KERNEL_SUPPORTS_IO_URING)
+  find_package(liburing REQUIRED)
+  target_link_libraries(bolt_memory PUBLIC liburing::liburing)
+endif()

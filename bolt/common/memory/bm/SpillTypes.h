@@ -12,12 +12,12 @@
 
 namespace bytedance::bolt::memory::bm {
 
-// Coarse storage medium classification used to select per-directory spill
-// profiles (concentration of medium-aware logic is contained in SpillStore,
+// Coarse storage disk classification used to select per-directory spill
+// profiles (concentration of disk-aware logic is contained in SpillStore,
 // per design doc §10.2). kUnknown only appears as an intermediate value:
-// after SpillStore construction, Medium() always returns one of the
+// after SpillStore construction, Disk() always returns one of the
 // concrete kinds (forced > probed > config.unknownFallbackKind).
-enum class MediumKind : uint8_t {
+enum class DiskKind : uint8_t {
   kUnknown,
   kHdd,
   kSsd,
@@ -27,9 +27,9 @@ enum class MediumKind : uint8_t {
 
 // Returns a stable lower-case debug string for 'kind' (e.g. "unknown",
 // "hdd", "ssd", "nvme", "network_fs"). Never throws.
-const char* ToString(MediumKind kind);
+const char* ToString(DiskKind kind);
 
-// Configuration of one spill directory entry. The user may force a medium
+// Configuration of one spill directory entry. The user may force a disk
 // (overriding probing) and supply per-directory tuning. 'path' must be a
 // non-empty filesystem path; SpillStore creates the directory at startup
 // if it does not exist (parents must already exist).
@@ -38,8 +38,8 @@ struct SpillDirConfig {
   // sub-paths under. Empty path is rejected by ProcessSpillService.
   std::string path;
   // When set to anything other than kUnknown the value overrides probing
-  // and is reported by SpillStore::Medium() / SpillLocation::medium.
-  MediumKind forcedKind{MediumKind::kUnknown};
+  // and is reported by SpillStore::Disk() / SpillLocation::disk.
+  DiskKind forcedKind{DiskKind::kUnknown};
 };
 
 // Per-tenant configuration of one SpillClient bound to ProcessSpillService.

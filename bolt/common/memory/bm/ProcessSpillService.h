@@ -6,6 +6,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -40,9 +41,12 @@ struct ProcessSpillServiceConfig {
   // Optional metrics sink shared by every component the service owns.
   MetricsRegistry* metrics{nullptr};
   // Default classification when probing returns kUnknown.
-  MediumKind unknownFallbackKind{MediumKind::kHdd};
+  DiskKind unknownFallbackKind{DiskKind::kHdd};
   // Whether to remove spill files when ProcessSpillService is destroyed.
   bool cleanupOnDestroy{true};
+  // Active disk probe duration for each spill directory. Zero disables active
+  // probing and uses the configured forced/fallback kind.
+  std::chrono::milliseconds diskProbeDuration{std::chrono::seconds(1)};
 };
 
 // Single global spill service (design doc §11/§14). Owns the worker pool,

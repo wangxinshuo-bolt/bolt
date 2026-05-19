@@ -6,19 +6,21 @@
 #pragma once
 
 #include <atomic>
-#include <fstream>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_set>
 
+#include "bolt/common/memory/bm/DiskIo.h"
+#include "bolt/common/memory/bm/DiskProbe.h"
 #include "bolt/common/memory/bm/Types.h"
 
 namespace bytedance::bolt::memory::bm {
 
 class SpillStore;
 
-// Concrete address of one spilled payload. The medium kind is captured at
-// write time so reload paths can attribute Read latency to the right medium
+// Concrete address of one spilled payload. The disk kind is captured at
+// write time so reload paths can attribute Read latency to the right disk
 // without re-probing (per design doc §10.2).
 //
 // SpillLocation is a value type. After successful Write, callers MUST keep
@@ -37,8 +39,8 @@ struct SpillLocation {
   ByteCount storedBytes{0};
   // Reserved for future compressed spill format: 0 == uncompressed.
   uint8_t compressionCodec{0};
-  // Medium snapshot at write time (used for metrics labeling on Read).
-  MediumKind medium{MediumKind::kUnknown};
+  // Disk snapshot at write time (used for metrics labeling on Read).
+  DiskKind disk{DiskKind::kUnknown};
   // Index of the SpillStore that created this location. ProcessSpillService
   // uses it to route Read/Release back to the store that owns the live-file
   // bookkeeping; UINT64_MAX keeps legacy/default locations invalid for
@@ -62,13 +64,16 @@ struct SpillStoreConfig {
   // produced. Set to false in tests that want to inspect the on-disk
   // artifacts after destruction.
   bool cleanupOnDestroy{true};
-  // Forces the medium classification when probing is unavailable or
+  // Forces the disk classification when probing is unavailable or
   // intentionally overridden. Always wins over probing (design doc §10.2).
-  MediumKind forcedKind{MediumKind::kUnknown};
-  // Fallback medium when probing is inconclusive. Only consulted when
+  DiskKind forcedKind{DiskKind::kUnknown};
+  // Fallback disk when probing is inconclusive. Only consulted when
   // forcedKind == kUnknown. Defaults to HDD as the conservative latency
   // assumption.
-  MediumKind unknownFallbackKind{MediumKind::kHdd};
+  DiskKind unknownFallbackKind{DiskKind::kHdd};
+  // Precomputed disk probe result for this spill directory. Active probing is
+  // owned by ProcessSpillService/DiskProbe, not by SpillStore.
+  DiskProbeResult diskProbe;
 };
 
 // RAII handle for a single spill write attempt. Per design doc §10.1 a write
@@ -105,10 +110,10 @@ class SpillWriteSession {
 
  private:
   friend class SpillStore;
-  SpillWriteSession(SpillStore* store, MediumKind medium);
+  SpillWriteSession(SpillStore* store, DiskKind disk);
 
   SpillStore* store_{nullptr};
-  MediumKind medium_{MediumKind::kUnknown};
+  DiskKind disk_{DiskKind::kUnknown};
   bool consumed_{false};
 };
 
@@ -121,9 +126,12 @@ class SpillWriteSession {
 class SpillStore {
  public:
   // Creates the spill directory (mkdir -p style) and prepares file
-  // bookkeeping. Probes the medium once during construction.
+  // bookkeeping. The disk profile must already be present in the config.
   // Throws std::filesystem_error if the directory cannot be created.
-  SpillStore(SpillStoreConfig config, MetricsRegistry* metrics = nullptr);
+  SpillStore(
+      SpillStoreConfig config,
+      MetricsRegistry* metrics = nullptr,
+      DiskIoScheduler* ioScheduler = nullptr);
 
   // Removes live spill files when cleanupOnDestroy is enabled. Failures to
   // remove individual files are logged but never thrown -- the destructor
@@ -160,10 +168,10 @@ class SpillStore {
   //   * Invalid location  -> no-op.
   void Release(const SpillLocation& location);
 
-  // Returns the medium effective for this store after construction-time
+  // Returns the disk effective for this store after construction-time
   // probing and config overrides. Stable for the store's lifetime.
-  MediumKind Medium() const {
-    return medium_;
+  DiskKind Disk() const {
+    return disk_;
   }
 
   // Best-effort cleanup of stale BufferManager-owned spill files under
@@ -189,11 +197,13 @@ class SpillStore {
 
   const SpillStoreConfig config_;
   MetricsRegistry& metrics_;
+  DiskIoScheduler* ioScheduler_;
+  const DiskProbeResult diskProbe_;
   Counter& bytesWrittenCounter_;
   Counter& bytesReadCounter_;
   Counter& doubleReleaseCounter_;
   Counter& invalidReleaseCounter_;
-  const MediumKind medium_;
+  const DiskKind disk_;
   mutable std::mutex mutex_;
   std::atomic<uint64_t> nextFileId_{0};
   std::unordered_set<std::string> liveFiles_;

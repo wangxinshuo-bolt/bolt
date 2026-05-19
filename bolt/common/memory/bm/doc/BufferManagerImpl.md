@@ -44,7 +44,7 @@ Pin 已加载 block、Reserve 未超限、Unpin 普通 block 等热路径必须�
 
 ### 2.4 介质感知收敛在 SpillStore
 
-HDD、SSD、NVMe、网络盘等差异只应影响磁盘写入策略、文件布局、并发度和压缩参数。上层 BufferPool、BlockHandle、GlobalSpillScheduler 不应出现 `if (MediumKind::kHdd)` 之类的分支。
+HDD、SSD、NVMe、网络盘等差异只应影响磁盘写入策略、文件布局、并发度和压缩参数。上层 BufferPool、BlockHandle、GlobalSpillScheduler 不应出现 `if (DiskKind::kHdd)` 之类的分支。
 
 ### 2.5 Spill 存储层进程级单例
 
@@ -177,7 +177,7 @@ struct EvictResult {
     ByteCount freed_bytes;
 };
 
-enum class MediumKind : uint8_t {
+enum class DiskKind : uint8_t {
     kUnknown,
     kHdd,
     kSsd,
@@ -640,20 +640,20 @@ public:
     void Release(const SpillLocation&);
 
     static void CleanupAtStartup(const SpillStoreConfig&);
-    MediumSummary GetMediumSummary() const;
+    DiskSummary GetDiskSummary() const;
     Stats GetStats() const;
 };
 ```
 
 ### 10.2 目录、介质与 profile
 
-每个 spill dir 在构造期确定 effective `MediumKind` 和 `MediumProfile`：
+每个 spill dir 在构造期确定 effective `DiskKind` 和 `DiskProfile`：
 
 ```text
 1. 如果用户 forced_kind，直接使用。
 2. 否则调用 DiskProbe。
 3. Probe 失败或 kUnknown 时，使用 unknown_fallback_kind，默认 kHdd。
-4. profile = profile_override 或 MediumProfileRegistry::DefaultFor(kind)。
+4. profile = profile_override 或 DiskProfileRegistry::DefaultFor(kind)。
 5. 构造 PerDirState：profile、token bucket、统计和 metrics label。
 ```
 
@@ -720,7 +720,7 @@ struct ProcessSpillServiceConfig {
     uint32_t workerThreadCount = 0;            // 0 = 同步路径
     uint32_t maxActiveAttempts = 16;
     MetricsRegistry* metrics = nullptr;
-    MediumKind unknownFallbackKind = MediumKind::kHdd;
+    DiskKind unknownFallbackKind = DiskKind::kHdd;
     bool cleanupOnDestroy = true;
 };
 
@@ -1083,9 +1083,9 @@ public:
 - `buffer_pool.eviction_candidate_total{cost,priority,result}`
 - `block.pin_wait_total{state,outcome}`
 - `block.evict_total{policy,result}`
-- `spill.write.bytes_total{medium}`
-- `spill.write.errors_total{medium,reason}`
-- `spill.write.queue_depth{path,medium}`
+- `spill.write.bytes_total{disk}`
+- `spill.write.errors_total{disk,reason}`
+- `spill.write.queue_depth{path,disk}`
 - `spill.scheduler.backpressured_total{reason}`
 - `spill.scheduler.inflight_bytes`
 - `spill.scheduler.progress_epoch`
@@ -1106,7 +1106,7 @@ public:
 5. **SpillStore MVP**：单目录、普通文件、Write/Read/Release、cleanup、mock scratch。
 6. **同步 spill/reload**：打通 BlockHandle 与 SpillStore，先不引入后台线程。
 7. **进程级 spill 服务**：`ProcessSpillService` 单例 + `GlobalSpillScheduler` worker pool + `SpillClient` per-tenant 视图，实现 progress_epoch、DRF-lite 公平调度与 backpressure。
-8. **压缩与介质感知**：加入 compression、DiskProbe、MediumProfile、per-dir token。
+8. **压缩与介质感知**：加入 compression、DiskProbe、DiskProfile、per-dir token。
 9. **TemporaryMemoryManager**：基于 snapshot 做 advisory budget。
 10. **BufferManager 生命周期集成**：构造顺序、后置注入、析构 invalidate、端到端测试。
 11. **压力与故障注入**：多线程、OOM、磁盘错误、Stop/析构竞态、4× memory workload。

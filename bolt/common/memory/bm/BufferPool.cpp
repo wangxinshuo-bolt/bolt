@@ -200,12 +200,14 @@ bool BufferPool::TryReserveLocked(
     ByteCount bytes,
     ReservationKind kind) {
   if (kind == ReservationKind::kPinned &&
-      usedPinnedBytes_ + bytes > pinnedLimitBytes_) {
+      (usedPinnedBytes_ > pinnedLimitBytes_ ||
+       bytes > pinnedLimitBytes_ - usedPinnedBytes_)) {
     return false;
   }
   if (kind == ReservationKind::kScratchEmergency &&
       (emergencyScratchBytes_ == 0 ||
-       usedEmergencyScratchBytes_ + bytes > emergencyScratchBytes_)) {
+       usedEmergencyScratchBytes_ > emergencyScratchBytes_ ||
+       bytes > emergencyScratchBytes_ - usedEmergencyScratchBytes_)) {
     return false;
   }
   const auto limit = kind == ReservationKind::kScratchEmergency
@@ -213,7 +215,7 @@ bool BufferPool::TryReserveLocked(
       : (memoryLimitBytes_ > emergencyScratchBytes_
              ? memoryLimitBytes_ - emergencyScratchBytes_
              : memoryLimitBytes_);
-  if (usedTotalBytes_ + bytes > limit) {
+  if (usedTotalBytes_ > limit || bytes > limit - usedTotalBytes_) {
     return false;
   }
   usedTotalBytes_ += bytes;

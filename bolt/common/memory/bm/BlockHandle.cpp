@@ -43,6 +43,8 @@ BufferHandle BlockHandle::Pin() {
   std::unique_ptr<AccountedMemory> loaded;
   std::optional<SpillLocation> oldSpill;
   std::unique_ptr<AccountedMemory> oldCompressed;
+  std::shared_ptr<SpillClient> spillForRelease;
+  std::optional<SpillLocation> spillToRelease;
   uint64_t myGeneration = 0;
   {
     std::unique_lock<std::mutex> l(mutex_);
@@ -130,21 +132,27 @@ BufferHandle BlockHandle::Pin() {
     std::rethrow_exception(error);
   }
 
-  std::lock_guard<std::mutex> l(mutex_);
-  if (state_ == BlockState::kInvalid || state_ == BlockState::kDiscarded) {
-    return BufferHandle();
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (state_ == BlockState::kInvalid || state_ == BlockState::kDiscarded) {
+      return BufferHandle();
+    }
+    memory_ = std::move(loaded);
+    state_ = BlockState::kLoaded;
+    if (oldSpill.has_value() && manager_ != nullptr) {
+      spillForRelease = manager_->Spill();
+      spillToRelease = *oldSpill;
+      spillLocation_ = SpillLocation{};
+    }
+    oldCompressed.reset();
+    ++pinCount_;
+    BOLT_MEM_LOG(INFO) << "Loaded and pinned BufferManager block id=" << id_
+                       << " pinCount=" << pinCount_;
   }
-  memory_ = std::move(loaded);
-  state_ = BlockState::kLoaded;
-  if (oldSpill.has_value() && manager_ != nullptr) {
-    manager_->Spill()->Release(*oldSpill);
-    spillLocation_ = SpillLocation{};
-  }
-  oldCompressed.reset();
-  ++pinCount_;
-  BOLT_MEM_LOG(INFO) << "Loaded and pinned BufferManager block id=" << id_
-                     << " pinCount=" << pinCount_;
   cv_.notify_all();
+  if (spillForRelease != nullptr && spillToRelease.has_value()) {
+    spillForRelease->Release(*spillToRelease);
+  }
   return BufferHandle(shared_from_this(), false);
 }
 
@@ -185,6 +193,8 @@ ByteCount BlockHandle::CompressInPlace() {
   // block into compressed_, releases the original BlockBuffer, and leaves the
   // block ready to be either spilled later or pinned through decompress.
   std::unique_ptr<AccountedMemory> evicted;
+  std::unique_ptr<AccountedMemory> compressed;
+  std::vector<uint8_t> copy;
   ByteCount originalBytes = 0;
   ByteCount compressedBytes = 0;
   {
@@ -194,14 +204,48 @@ ByteCount BlockHandle::CompressInPlace() {
         manager_ == nullptr) {
       return 0;
     }
+    originalBytes = memory_->Size();
+    // Copy while holding the block mutex so manager destruction or a racing
+    // eviction cannot free memory_ underneath us. The quota-bearing allocation
+    // happens after dropping the mutex to avoid Reserve()->Reclaim() trying to
+    // re-enter this block and deadlocking on mutex_. kSpilling is used here as
+    // a transient "externalization in progress" state; Pin waits on it and
+    // reclaim skips it just like a real spill attempt.
+    copy.resize(originalBytes);
+    std::memcpy(copy.data(), memory_->Data(), originalBytes);
+    state_ = BlockState::kSpilling;
+  }
+
+  try {
     // MVP compressor is a passthrough: allocate a separate AccountedMemory
     // chunk and copy the bytes. This keeps compressed_ as the sole owner per
-    // design doc §5.1.
-    auto compressed = manager_->Allocator().Allocate(
-        options_.tag, memory_->Size(), ReservationKind::kNormal);
-    std::memcpy(compressed->Data(), memory_->Data(), memory_->Size());
-    originalBytes = memory_->Size();
+    // design doc §5.1. If this allocation cannot be satisfied under pressure,
+    // restore kLoaded and let Reclaim fall through to direct spill.
+    compressed = manager_->Allocator().Allocate(
+        options_.tag, originalBytes, ReservationKind::kNormal);
+    std::memcpy(compressed->Data(), copy.data(), originalBytes);
     compressedBytes = compressed->Size();
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      if (state_ == BlockState::kSpilling) {
+        state_ = BlockState::kLoaded;
+        ++evictionSequence_;
+      }
+    }
+    cv_.notify_all();
+    BOLT_MEM_LOG(WARNING)
+        << "Failed to compress BufferManager block id=" << id_
+        << ", restored to loaded for direct spill fallback";
+    return 0;
+  }
+
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (state_ != BlockState::kSpilling || manager_ == nullptr) {
+      cv_.notify_all();
+      return 0;
+    }
     compressed_ = std::move(compressed);
     evicted = std::move(memory_);
     state_ = BlockState::kCompressed;

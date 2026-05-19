@@ -9,6 +9,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "bolt/common/memory/bm/GlobalSpillScheduler.h"
@@ -80,6 +81,12 @@ class ProcessSpillService {
   // when no Instance has been created.
   static void ResetForTesting();
 
+  // Tests only: creates an isolated, non-singleton service. This is useful
+  // for cases that need a different process-level configuration than the
+  // singleton used by other tests.
+  static std::unique_ptr<ProcessSpillService> CreateForTesting(
+      ProcessSpillServiceConfig config);
+
   // Allocates a new SpillClient bound to this service. The returned
   // shared_ptr keeps the client alive even after BufferManager teardown
   // so any in-flight spill workers can finish their I/O. Tenants may
@@ -121,6 +128,15 @@ class ProcessSpillService {
   // Picks one of the configured stores for a new write. Round-robin via
   // 'storeRobinCursor_'. Caller does not need to hold any lock.
   SpillStore& PickStore();
+
+  // Picks a store for a new write and returns its stable index together with
+  // the store reference so SpillLocation can route future Read/Release calls
+  // back to the same store.
+  std::pair<uint64_t, SpillStore&> PickStoreForWrite();
+
+  // Returns the store that owns 'location'. Throws BoltUserError if the
+  // location was not produced by this service or the store index is invalid.
+  SpillStore& StoreFor(const SpillLocation& location);
 
   // Reserves 'bytes' against the process and per-client quotas. Both
   // counters are bumped atomically; on overflow neither is changed and

@@ -4,6 +4,7 @@
  */
 
 #include <cstring>
+#include <filesystem>
 
 #include <gtest/gtest.h>
 
@@ -156,6 +157,74 @@ TEST(SpillTest, compressInPlaceLeavesCompressedState) {
   ASSERT_TRUE(pinned.IsValid());
   ASSERT_EQ(pinned.Data()[0], 23);
   ASSERT_EQ(block->State(), BlockState::kLoaded);
+}
+
+TEST(SpillTest, compressThenSpillFallsBackWhenCompressionNeedsExtraQuota) {
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{
+          .memoryLimitBytes = 1 << 20,
+          .pinnedLimitBytes = 1 << 20,
+          .emergencyScratchBytes = 512 << 10,
+          .poolName = "bm_compress_fallback",
+          .reserveWaitTimeout = std::chrono::milliseconds(10),
+          .spillClient = test::makeSpillClientConfig(
+              "bm_compress_fallback")});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kHashTable,
+                      .size = 512 << 10,
+                      .policy = EvictPolicy::kCompressThenSpill},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 37, bytes); });
+
+  // The passthrough compressor would need a second 512KiB normal
+  // reservation, but operator capacity is only memoryLimit-emergencyScratch =
+  // 512KiB. Reclaim must not deadlock while the nested Reserve attempts reclaim;
+  // it should restore kLoaded and fall through to direct spill.
+  ASSERT_EQ(manager.Reclaim(512 << 10), 512 << 10);
+  ASSERT_EQ(block->State(), BlockState::kSpilled);
+  ASSERT_EQ(manager.GetMemoryUsage(), 0);
+
+  auto pinned = manager.Pin(block);
+  ASSERT_TRUE(pinned.IsValid());
+  ASSERT_EQ(pinned.Data()[0], 37);
+  ASSERT_EQ(pinned.Data()[pinned.Size() - 1], 37);
+}
+
+TEST(SpillTest, spillLocationRoutesReleaseToOriginalStore) {
+  // Use a directly-owned ProcessSpillService instead of the singleton so this
+  // test can configure multiple stores without affecting other unit tests.
+  auto root = std::filesystem::temp_directory_path() /
+      "bolt_bm_test_multi_spill_root";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root / "a");
+  std::filesystem::create_directories(root / "b");
+
+  ProcessSpillServiceConfig serviceConfig;
+  serviceConfig.dirs.push_back(SpillDirConfig{.path = (root / "a").string()});
+  serviceConfig.dirs.push_back(SpillDirConfig{.path = (root / "b").string()});
+  serviceConfig.workerThreadCount = 0;
+  serviceConfig.cleanupOnDestroy = true;
+  auto service = ProcessSpillService::CreateForTesting(std::move(serviceConfig));
+
+  SpillClientConfig clientConfig;
+  clientConfig.enableSpill = true;
+  clientConfig.tenantId = "bm_multi_store";
+  auto client = service->CreateClient(std::move(clientConfig));
+
+  uint8_t payload[4] = {1, 2, 3, 4};
+  auto first = client->Write(MemoryTag::kShuffle, payload, sizeof(payload));
+  auto second = client->Write(MemoryTag::kShuffle, payload, sizeof(payload));
+  ASSERT_NE(first.storeIndex, second.storeIndex);
+  ASSERT_TRUE(std::filesystem::exists(first.path));
+  ASSERT_TRUE(std::filesystem::exists(second.path));
+
+  client->Release(first);
+  client->Release(second);
+  ASSERT_FALSE(std::filesystem::exists(first.path));
+  ASSERT_FALSE(std::filesystem::exists(second.path));
+  ASSERT_EQ(service->UsedDiskBytes(), 0);
 }
 
 // Per design doc §14.2: when emergency scratch is zero, both kSpillToDisk and

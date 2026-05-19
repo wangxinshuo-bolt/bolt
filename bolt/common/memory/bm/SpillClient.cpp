@@ -48,7 +48,9 @@ SpillLocation SpillClient::Write(
   BOLT_USER_CHECK_NOT_NULL(service_, "SpillClient has no service");
   service_->ChargeQuota(*this, bytes);
   try {
-    auto location = service_->PickStore().Write(tag, src, bytes);
+    auto [storeIndex, store] = service_->PickStoreForWrite();
+    auto location = store.Write(tag, src, bytes);
+    location.storeIndex = storeIndex;
     return location;
   } catch (...) {
     service_->CreditQuota(*this, bytes);
@@ -61,11 +63,7 @@ void SpillClient::Read(
     DataPtr dst,
     ByteCount dstCapacity) {
   BOLT_USER_CHECK_NOT_NULL(service_, "SpillClient has no service");
-  // The location contains its source path; SpillStore::Read does not need
-  // the originating store. Use the first store as the read entry point.
-  // SpillStore::Read is stateless w.r.t. which store wrote the file, since
-  // it opens 'location.path' directly.
-  service_->PickStore().Read(location, dst, dstCapacity);
+  service_->StoreFor(location).Read(location, dst, dstCapacity);
 }
 
 void SpillClient::Release(const SpillLocation& location) noexcept {
@@ -73,7 +71,7 @@ void SpillClient::Release(const SpillLocation& location) noexcept {
     return;
   }
   try {
-    service_->PickStore().Release(location);
+    service_->StoreFor(location).Release(location);
   } catch (...) {
     // Release errors are already logged by SpillStore; never propagate.
   }

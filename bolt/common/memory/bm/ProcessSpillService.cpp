@@ -122,6 +122,12 @@ void ProcessSpillService::ResetForTesting() {
   dying.reset();
 }
 
+std::unique_ptr<ProcessSpillService> ProcessSpillService::CreateForTesting(
+    ProcessSpillServiceConfig config) {
+  return std::unique_ptr<ProcessSpillService>(
+      new ProcessSpillService(std::move(config)));
+}
+
 std::shared_ptr<SpillClient> ProcessSpillService::CreateClient(
     SpillClientConfig config) {
   const auto schedulerId =
@@ -136,10 +142,25 @@ std::shared_ptr<SpillClient> ProcessSpillService::CreateClient(
 SpillStore& ProcessSpillService::PickStore() {
   // Round-robin among configured stores. The set is fixed at init so we
   // never need a lock here.
+  return PickStoreForWrite().second;
+}
+
+std::pair<uint64_t, SpillStore&> ProcessSpillService::PickStoreForWrite() {
   const auto idx =
       storeRobinCursor_.fetch_add(1, std::memory_order_relaxed) %
       stores_.size();
-  return *stores_[idx];
+  return {idx, *stores_[idx]};
+}
+
+SpillStore& ProcessSpillService::StoreFor(const SpillLocation& location) {
+  BOLT_USER_CHECK(location.Valid(), "Invalid spill location");
+  BOLT_USER_CHECK_LT(
+      location.storeIndex,
+      stores_.size(),
+      "Invalid spill store index {} for {} stores",
+      location.storeIndex,
+      stores_.size());
+  return *stores_[location.storeIndex];
 }
 
 void ProcessSpillService::ChargeQuota(SpillClient& client, ByteCount bytes) {
@@ -147,7 +168,8 @@ void ProcessSpillService::ChargeQuota(SpillClient& client, ByteCount bytes) {
     auto current = usedDiskBytes_.load(std::memory_order_relaxed);
     while (true) {
       BOLT_USER_CHECK(
-          current + bytes <= config_.processDiskQuotaBytes,
+          current <= config_.processDiskQuotaBytes &&
+              bytes <= config_.processDiskQuotaBytes - current,
           "ProcessSpillService disk quota exceeded: used={} request={} limit={}",
           current,
           bytes,
@@ -166,7 +188,8 @@ void ProcessSpillService::ChargeQuota(SpillClient& client, ByteCount bytes) {
   if (client.config_.diskQuotaBytes != 0) {
     auto current = client.usedDiskBytes_.load(std::memory_order_relaxed);
     while (true) {
-      if (current + bytes > client.config_.diskQuotaBytes) {
+      if (current > client.config_.diskQuotaBytes ||
+          bytes > client.config_.diskQuotaBytes - current) {
         // Roll back the process-level reservation we just took.
         usedDiskBytes_.fetch_sub(bytes, std::memory_order_relaxed);
         BOLT_USER_FAIL(

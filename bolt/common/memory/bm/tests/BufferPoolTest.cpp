@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/bm/BufferManager.h"
 
@@ -76,6 +78,37 @@ TEST(BufferPoolTest, snapshotTracksEmergencyScratchHeadroom) {
   snapshot = pool.Snapshot();
   ASSERT_EQ(snapshot.usedScratchBytes, 64);
   ASSERT_EQ(snapshot.usedEmergencyScratchBytes, 64);
+}
+
+TEST(BufferPoolTest, rejectsOverflowingReservations) {
+  BufferPool pool(BufferManagerConfig{.memoryLimitBytes = 1024,
+                                      .pinnedLimitBytes = 512,
+                                      .emergencyScratchBytes = 128,
+                                      .poolName = "bm_overflow_guard"});
+
+  ASSERT_THROW(
+      pool.Reserve(
+          MemoryTag::kHashTable,
+          std::numeric_limits<ByteCount>::max(),
+          ReservationKind::kNormal),
+      ::bytedance::bolt::BoltException);
+  ASSERT_EQ(pool.GetMemoryUsage(), 0);
+
+  ASSERT_THROW(
+      pool.Reserve(
+          MemoryTag::kInternal,
+          std::numeric_limits<ByteCount>::max(),
+          ReservationKind::kPinned),
+      ::bytedance::bolt::BoltException);
+  ASSERT_EQ(pool.GetMemoryUsage(), 0);
+
+  ASSERT_THROW(
+      pool.Reserve(
+          MemoryTag::kInternal,
+          std::numeric_limits<ByteCount>::max(),
+          ReservationKind::kScratchEmergency),
+      ::bytedance::bolt::BoltException);
+  ASSERT_EQ(pool.GetMemoryUsage(), 0);
 }
 
 } // namespace bytedance::bolt::memory::bm

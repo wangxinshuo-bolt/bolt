@@ -39,6 +39,11 @@ struct SpillLocation {
   uint8_t compressionCodec{0};
   // Medium snapshot at write time (used for metrics labeling on Read).
   MediumKind medium{MediumKind::kUnknown};
+  // Index of the SpillStore that created this location. ProcessSpillService
+  // uses it to route Read/Release back to the store that owns the live-file
+  // bookkeeping; UINT64_MAX keeps legacy/default locations invalid for
+  // indexed routing while preserving path-based Valid().
+  uint64_t storeIndex{UINT64_MAX};
 
   // Returns true if this location refers to a real spill file.
   // Default-constructed and moved-from locations return false.

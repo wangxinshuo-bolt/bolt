@@ -94,7 +94,7 @@ SpillLocation SpillWriteSession::Write(
     store_->compressSavedBytesCounter_.Add(bytes - payload.storedBytes);
   } else if (compressionAttempted) {
     store_->compressFallbackRawCounter_.Add(1);
-    BOLT_MEM_LOG(INFO) << "BufferManager SpillStore compression fallback"
+    BOLT_MEM_VLOG(1) << "BufferManager SpillStore compression fallback"
                        << " logical=" << bytes
                        << " stored=" << payload.storedBytes
                        << " minSavingsRatio="
@@ -139,7 +139,7 @@ SpillLocation SpillWriteSession::Write(
   } else {
     store_->dedicatedFileCounter_.Add(1);
   }
-  BOLT_MEM_LOG(INFO) << "BufferManager SpillStore wrote " << bytes
+  BOLT_MEM_VLOG(1) << "BufferManager SpillStore wrote " << bytes
       << " bytes to " << location.path
                      << " offset=" << location.offset
                      << " stored=" << location.storedBytes
@@ -291,7 +291,7 @@ void SpillStore::Read(
       dstCapacity,
       location.logicalBytes);
 
-  BOLT_MEM_LOG(INFO) << "BufferManager SpillStore reading "
+  BOLT_MEM_VLOG(1) << "BufferManager SpillStore reading "
                      << location.logicalBytes << " bytes from "
                      << location.path
                      << " offset=" << location.offset
@@ -387,7 +387,7 @@ void SpillStore::Release(const SpillLocation& location) {
       BOLT_MEM_LOG(WARNING) << "Failed to remove BufferManager spill file "
                             << location.path << ": " << ec.message();
     } else {
-      BOLT_MEM_LOG(INFO) << "BufferManager SpillStore released "
+      BOLT_MEM_VLOG(1) << "BufferManager SpillStore released "
                          << location.path;
     }
   }

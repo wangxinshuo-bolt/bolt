@@ -29,7 +29,7 @@ BlockHandle::BlockHandle(BufferManager* manager, AllocateOptions options)
       manager_(manager),
       options_(std::move(options)),
       size_(options_.size) {
-  BOLT_MEM_LOG(INFO) << "Created BufferManager block id=" << id_
+  BOLT_MEM_VLOG(1) << "Created BufferManager block id=" << id_
                      << " size=" << size_
                      << " policy=" << ToString(options_.policy)
                      << " tag=" << ToString(options_.tag);
@@ -54,12 +54,12 @@ BufferHandle BlockHandle::Pin() {
           ++evictionSequence_;
         }
         ++pinCount_;
-        BOLT_MEM_LOG(INFO) << "Pinned resident BufferManager block id=" << id_
+        BOLT_MEM_VLOG(1) << "Pinned resident BufferManager block id=" << id_
                            << " pinCount=" << pinCount_;
         return BufferHandle(shared_from_this(), false);
       }
       if (state_ == BlockState::kDiscarded || state_ == BlockState::kInvalid) {
-        BOLT_MEM_LOG(INFO) << "Pin returned invalid for BufferManager block id="
+        BOLT_MEM_VLOG(1) << "Pin returned invalid for BufferManager block id="
                            << id_ << " state=" << ToString(state_);
         return BufferHandle();
       }
@@ -85,7 +85,7 @@ BufferHandle BlockHandle::Pin() {
     if (state_ == BlockState::kSpilled) {
       oldSpill = spillLocation_;
     }
-    BOLT_MEM_LOG(INFO) << "Loading BufferManager block id=" << id_
+    BOLT_MEM_VLOG(1) << "Loading BufferManager block id=" << id_
                        << " from state=" << ToString(state_);
     state_ = BlockState::kLoading;
     myGeneration = ++loadGeneration_;
@@ -132,7 +132,7 @@ BufferHandle BlockHandle::Pin() {
       spillLocation_ = SpillLocation{};
     }
     ++pinCount_;
-    BOLT_MEM_LOG(INFO) << "Loaded and pinned BufferManager block id=" << id_
+    BOLT_MEM_VLOG(1) << "Loaded and pinned BufferManager block id=" << id_
                        << " pinCount=" << pinCount_;
   }
   cv_.notify_all();
@@ -168,7 +168,7 @@ ByteCount BlockHandle::TryEvict(ByteCount targetBytes) {
   const auto freed = evicted == nullptr ? 0 : evicted->Size();
   evicted.reset();
   cv_.notify_all();
-  BOLT_MEM_LOG(INFO) << "Evicted BufferManager block id=" << id_
+  BOLT_MEM_VLOG(1) << "Evicted BufferManager block id=" << id_
                      << " policy=" << ToString(options_.policy)
                      << " freed=" << freed;
   return freed;
@@ -194,7 +194,7 @@ ByteCount BlockHandle::SpillToDisk() {
     state_ = BlockState::kSpilling;
     spillingMemory = std::move(memory_);
     spill = manager_->Spill();
-    BOLT_MEM_LOG(INFO) << "Spilling BufferManager block id=" << id_
+    BOLT_MEM_VLOG(1) << "Spilling BufferManager block id=" << id_
                        << " size=" << spillingMemory->Size()
                        << " policy=" << ToString(options_.policy);
   }
@@ -239,7 +239,7 @@ ByteCount BlockHandle::SpillToDisk() {
   const auto freed = evicted == nullptr ? 0 : evicted->Size();
   evicted.reset();
   cv_.notify_all();
-  BOLT_MEM_LOG(INFO) << "Spilled BufferManager block id=" << id_
+  BOLT_MEM_VLOG(1) << "Spilled BufferManager block id=" << id_
                      << " freed=" << freed
                      << " file=" << spillLocation_.path;
   return freed;
@@ -326,7 +326,7 @@ void BlockHandle::InstallMemory(std::unique_ptr<AccountedMemory> memory) {
   memory_ = std::move(memory);
   state_ = BlockState::kLoaded;
   pinCount_ = 1;
-  BOLT_MEM_LOG(INFO) << "Installed memory for BufferManager block id=" << id_
+  BOLT_MEM_VLOG(1) << "Installed memory for BufferManager block id=" << id_
                      << " size=" << size_;
 }
 
@@ -339,7 +339,7 @@ void BlockHandle::Unpin(bool initialWrite) noexcept {
     if (initialWrite) {
       sealed_ = true;
     }
-    BOLT_MEM_LOG(INFO) << "Unpinned BufferManager block id=" << id_
+    BOLT_MEM_VLOG(1) << "Unpinned BufferManager block id=" << id_
                        << " pinCount=" << pinCount_
                        << " sealed=" << sealed_;
   }

@@ -152,7 +152,7 @@ EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
   }
   if (resolveWorkerThreadCount(config_.workerThreadCount) == 0) {
     backpressuredCounter_.Add(1);
-    BOLT_MEM_LOG(INFO) << "ProcessSpillService backpressured spill submit"
+    BOLT_MEM_VLOG(1) << "ProcessSpillService backpressured spill submit"
                        << " workerThreadCount=0";
     return EvictResult{EvictResultKind::kBackpressured, 0};
   }
@@ -168,7 +168,7 @@ EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
     queueDepthGauge_.Set(static_cast<int64_t>(queueDepth));
   }
   scheduledCounter_.Add(1);
-  BOLT_MEM_LOG(INFO) << "ProcessSpillService scheduled spill submit"
+  BOLT_MEM_VLOG(1) << "ProcessSpillService scheduled spill submit"
                      << " queueDepth=" << queueDepth;
   cv_.notify_one();
   return EvictResult{EvictResultKind::kScheduled, 0};
@@ -303,7 +303,7 @@ void ProcessSpillService::ExecuteSpill(EvictionNode node) {
     const auto bytes = handle->SpillToDisk();
     executedCounter_.Add(1);
     freedBytesCounter_.Add(bytes);
-    BOLT_MEM_LOG(INFO) << "ProcessSpillService processed block "
+    BOLT_MEM_VLOG(1) << "ProcessSpillService processed block "
                        << handle->Id() << " freed=" << bytes;
   } catch (const std::exception& e) {
     handle->ClearSpillScheduled();
@@ -374,7 +374,7 @@ void ProcessSpillService::CleanupStaleDirsAtStartup() {
             << "ProcessSpillService failed to clean stale dir "
             << entry.path().string() << ": " << rmEc.message();
       } else {
-        BOLT_MEM_LOG(INFO)
+        BOLT_MEM_VLOG(1)
             << "ProcessSpillService cleaned stale dir "
             << entry.path().string();
       }

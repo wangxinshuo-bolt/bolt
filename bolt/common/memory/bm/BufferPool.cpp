@@ -93,7 +93,7 @@ BufferPoolReservation BufferPool::Reserve(
   {
     std::lock_guard<std::mutex> l(mutex_);
     ReserveLocked(tag, bytes, kind);
-    BOLT_MEM_LOG(INFO) << "BufferManager reserve bytes=" << bytes
+    BOLT_MEM_VLOG(1) << "BufferManager reserve bytes=" << bytes
                        << " tag=" << ToString(tag)
                        << " kind=" << ToString(kind)
                        << " used=" << usedTotalBytes_;
@@ -110,7 +110,7 @@ void BufferPool::Release(
   }
   std::lock_guard<std::mutex> l(mutex_);
   ReleaseLocked(tag, bytes, kind);
-  BOLT_MEM_LOG(INFO) << "BufferManager release bytes=" << bytes
+  BOLT_MEM_VLOG(1) << "BufferManager release bytes=" << bytes
                      << " tag=" << ToString(tag)
                      << " kind=" << ToString(kind)
                      << " used=" << usedTotalBytes_;

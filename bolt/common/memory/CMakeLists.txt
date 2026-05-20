@@ -31,6 +31,10 @@ if(${BOLT_BUILD_TESTING})
   add_subdirectory(sparksql/tests)
 endif()
 
+if(${BOLT_BUILD_BENCHMARKS})
+  add_subdirectory(bm/benchmarks)
+endif()
+
 bolt_add_library(
   bolt_memory
   Allocation.cpp

@@ -143,7 +143,7 @@ BufferHandle BufferManager::Allocate(AllocateOptions options) {
   const auto snapshot = pool_.Snapshot();
   usedMemoryGauge_.Set(static_cast<int64_t>(snapshot.usedTotalBytes));
   pinnedMemoryGauge_.Set(static_cast<int64_t>(snapshot.usedPinnedBytes));
-  BOLT_MEM_LOG(INFO) << "Allocated BufferManager block id=" << block->Id()
+  BOLT_MEM_VLOG(1) << "Allocated BufferManager block id=" << block->Id()
                      << " size=" << options.size
                      << " tag=" << ToString(options.tag)
                      << " policy=" << ToString(options.policy)
@@ -256,7 +256,7 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
 
     if (node.cost == EvictionCostClass::kSpill) {
       auto submit = evictor_.TryScheduleEvict(node);
-      BOLT_MEM_LOG(INFO) << "BufferManager reclaim spill candidate"
+      BOLT_MEM_VLOG(1) << "BufferManager reclaim spill candidate"
                          << " target=" << targetBytes
                          << " result=" << ToString(submit.kind)
                          << " freed=" << submit.freedBytes
@@ -275,7 +275,7 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
     }
 
     auto result = evictor_.TryEvictNodeSync(node);
-    BOLT_MEM_LOG(INFO) << "BufferManager reclaim sync candidate"
+    BOLT_MEM_VLOG(1) << "BufferManager reclaim sync candidate"
                        << " target=" << targetBytes
                        << " result=" << ToString(result.kind)
                        << " freed=" << result.freedBytes
@@ -341,7 +341,7 @@ void BufferManager::EnqueueEvictionCandidate(
     return;
   }
   auto node = MakeEvictionNode(block);
-  BOLT_MEM_LOG(INFO) << "BufferManager enqueue eviction candidate"
+  BOLT_MEM_VLOG(1) << "BufferManager enqueue eviction candidate"
                      << " block_id=" << block->Id()
                      << " cost=" << ToString(node.cost)
                      << " priority=" << static_cast<int>(node.priority)

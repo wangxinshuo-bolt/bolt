@@ -64,6 +64,7 @@ class BufferManager;
 
 #define BOLT_MEM_LOG_PREFIX "[MEM] "
 #define BOLT_MEM_LOG(severity) LOG(severity) << BOLT_MEM_LOG_PREFIX
+#define BOLT_MEM_VLOG(level) VLOG(level) << BOLT_MEM_LOG_PREFIX
 #define BOLT_MEM_LOG_EVERY_MS(severity, ms) \
   FB_LOG_EVERY_MS(severity, ms) << BOLT_MEM_LOG_PREFIX
 

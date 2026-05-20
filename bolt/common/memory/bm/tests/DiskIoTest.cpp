@@ -130,17 +130,37 @@ TEST(DiskIoTest, uringEngineRoundTripsReadWrite) {
   assertRoundTrip(*engine, "bolt_bm_uring_disk_io_test.bin");
 }
 
-TEST(DiskIoTest, adaptiveQueueDepthDropsOnHighLatency) {
+TEST(DiskIoTest, adaptiveQueueDepthDoesNotDropForStableHighLatency) {
   auto config = syncConfig();
   config.initialQueueDepth = 8;
   config.maxQueueDepth = 16;
-  config.targetP95LatencyUs = 100;
   AdaptiveQueueDepth depth(config);
 
   DiskIoCompletion completion;
   completion.op = DiskIoOp::kRead;
   completion.result = 4096;
-  completion.latencyUs = 1000;
+  completion.latencyUs = 1'000'000;
+  for (int i = 0; i < 16; ++i) {
+    depth.Observe(completion);
+  }
+  ASSERT_GE(depth.Limit(), 8);
+}
+
+TEST(DiskIoTest, adaptiveQueueDepthDropsWhenLatencyRisesAndThroughputStalls) {
+  auto config = syncConfig();
+  config.initialQueueDepth = 8;
+  config.maxQueueDepth = 16;
+  AdaptiveQueueDepth depth(config);
+
+  DiskIoCompletion completion;
+  completion.op = DiskIoOp::kRead;
+  completion.result = 4096;
+  completion.latencyUs = 100;
+  for (int i = 0; i < 8; ++i) {
+    depth.Observe(completion);
+  }
+
+  completion.latencyUs = 10'000;
   for (int i = 0; i < 8; ++i) {
     depth.Observe(completion);
   }

@@ -24,13 +24,10 @@ struct DiskProbeResult {
   DiskKind kind{DiskKind::kUnknown};
   uint64_t writeIops{0};
   uint64_t readIops{0};
-  uint64_t targetP95LatencyUs{50'000};
   bool activeProbeRan{false};
   bool directIoUsed{false};
 };
 
 DiskProbeResult ProbeDisk(const DiskProbeConfig& config);
-
-uint64_t TargetP95LatencyForDisk(DiskKind kind);
 
 } // namespace bytedance::bolt::memory::bm

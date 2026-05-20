@@ -37,7 +37,6 @@ struct DiskIoConfig {
   int initialQueueDepth{16};
   int minQueueDepth{1};
   int maxQueueDepth{128};
-  uint64_t targetP95LatencyUs{50'000};
   std::array<uint32_t, 3> priorityWeights{{1, 4, 8}};
 };
 
@@ -102,14 +101,17 @@ class AdaptiveQueueDepth {
 
  private:
   uint64_t Percentile95();
+  double WindowThroughputMiBPerSec() const;
 
   mutable std::mutex mutex_;
   int depth_;
   int minDepth_;
   int maxDepth_;
-  uint64_t targetP95LatencyUs_;
   uint64_t windowBytes_{0};
-  double lastMiB_{0.0};
+  uint64_t windowLatencyUs_{0};
+  uint64_t lastP95Us_{0};
+  double lastThroughputMiBPerSec_{0.0};
+  bool hasPreviousWindow_{false};
   std::vector<uint64_t> latencies_;
 };
 

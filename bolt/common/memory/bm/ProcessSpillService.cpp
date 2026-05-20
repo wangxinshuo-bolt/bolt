@@ -77,7 +77,6 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
   storeCfg.diskProbe = ProbeDisk(probeConfig);
   DiskIoConfig ioConfig;
   ioConfig.backend = DiskIoBackend::kUring;
-  ioConfig.targetP95LatencyUs = storeCfg.diskProbe.targetP95LatencyUs;
   ProcessDiskIoService::ConfigureDefaultIfNeeded(ioConfig);
   SpillStore::CleanupAtStartup(storeCfg);
   store_ = std::make_unique<SpillStore>(storeCfg, config_.metrics);

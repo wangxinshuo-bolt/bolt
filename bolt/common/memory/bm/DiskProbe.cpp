@@ -106,7 +106,7 @@ uint64_t countDirectIopsFor(
 }
 
 DiskProbeResult inactiveResult(DiskKind kind) {
-  return DiskProbeResult{kind, 0, 0, TargetP95LatencyForDisk(kind), false, false};
+  return DiskProbeResult{kind, 0, 0, false, false};
 }
 
 DiskProbeResult logProbeResult(
@@ -126,30 +126,12 @@ DiskProbeResult logProbeResult(
                      << " duration_ms=" << config.duration.count()
                      << " write_iops=" << result.writeIops
                      << " read_iops=" << result.readIops
-                     << " target_p95_latency_us="
-                     << result.targetP95LatencyUs
                      << " forced_kind=" << ToString(config.forcedKind)
                      << " fallback_kind=" << ToString(config.fallbackKind);
   return result;
 }
 
 } // namespace
-
-uint64_t TargetP95LatencyForDisk(DiskKind kind) {
-  switch (kind) {
-    case DiskKind::kNvme:
-      return 5'000;
-    case DiskKind::kSsd:
-      return 20'000;
-    case DiskKind::kHdd:
-      return 100'000;
-    case DiskKind::kNetworkFs:
-      return 150'000;
-    case DiskKind::kUnknown:
-      return 50'000;
-  }
-  return 50'000;
-}
 
 DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
   constexpr size_t kBlockBytes = 4096;
@@ -235,8 +217,7 @@ DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
       classifyIopsThreshold(writeIops), classifyIopsThreshold(readIops));
   return logProbeResult(
       config,
-      DiskProbeResult{
-          kind, writeIops, readIops, TargetP95LatencyForDisk(kind), true, true},
+      DiskProbeResult{kind, writeIops, readIops, true, true},
       "completed",
       kProbeFileBytes,
       kBlockBytes);

@@ -164,7 +164,7 @@ SpillStore::SpillStore(
                            config_.unknownFallbackKind,
                            0,
                            0,
-                           TargetP95LatencyForDisk(config_.unknownFallbackKind),
+                           false,
                            false}
                      : config_.diskProbe),
       compressionConfig_(config_.compression),

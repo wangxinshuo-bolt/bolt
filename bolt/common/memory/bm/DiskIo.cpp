@@ -23,6 +23,16 @@
 namespace bytedance::bolt::memory::bm {
 namespace {
 
+constexpr size_t kAdaptiveWindowCompletions = 8;
+constexpr size_t kPercentScale = 100;
+constexpr size_t kP95Percentile = 95;
+constexpr double kLatencyRisingRatio = 1.25;
+constexpr double kLatencyStableRatio = 1.10;
+constexpr double kThroughputDroppingRatio = 0.95;
+constexpr double kThroughputHealthyRatio = 0.98;
+constexpr double kQueueDepthDecreaseRatio = 0.70;
+constexpr double kQueueDepthIncreaseRatio = 1.20;
+
 uint64_t elapsedUs(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::microseconds>(
              std::chrono::steady_clock::now() - start)
@@ -31,6 +41,10 @@ uint64_t elapsedUs(std::chrono::steady_clock::time_point start) {
 
 size_t priorityIndex(DiskIoPriority priority) {
   return static_cast<size_t>(priority);
+}
+
+size_t percentileIndex(size_t count, size_t percentile) {
+  return std::min(count - 1, count * percentile / kPercentScale);
 }
 
 void validateRequest(const DiskIoRequest& request) {
@@ -277,8 +291,7 @@ DiskIoCompletion UringDiskIoEngine::Execute(const DiskIoRequest& request) {
 AdaptiveQueueDepth::AdaptiveQueueDepth(DiskIoConfig config)
     : depth_(config.initialQueueDepth),
       minDepth_(config.minQueueDepth),
-      maxDepth_(config.maxQueueDepth),
-      targetP95LatencyUs_(config.targetP95LatencyUs) {
+      maxDepth_(config.maxQueueDepth) {
   validateConfig(config);
 }
 
@@ -294,28 +307,56 @@ void AdaptiveQueueDepth::Observe(const DiskIoCompletion& completion) {
 
   std::lock_guard<std::mutex> l(mutex_);
   windowBytes_ += static_cast<uint64_t>(completion.result);
+  windowLatencyUs_ += completion.latencyUs;
   latencies_.push_back(completion.latencyUs);
-  if (latencies_.size() < 8) {
+  if (latencies_.size() < kAdaptiveWindowCompletions) {
     return;
   }
 
   const auto p95 = Percentile95();
-  const double mib = static_cast<double>(windowBytes_) / 1024.0 / 1024.0;
-  if (p95 > targetP95LatencyUs_ * 2) {
-    depth_ = std::max(minDepth_, static_cast<int>(depth_ * 0.7));
-  } else if (p95 < targetP95LatencyUs_ && mib >= lastMiB_ * 0.98) {
-    depth_ = std::min(maxDepth_, static_cast<int>(depth_ * 1.2) + 1);
+  const double throughput = WindowThroughputMiBPerSec();
+  if (hasPreviousWindow_) {
+    const bool latencyRising =
+        p95 > static_cast<uint64_t>(
+                  static_cast<double>(lastP95Us_) * kLatencyRisingRatio);
+    const bool latencyStable =
+        p95 <= static_cast<uint64_t>(
+                   static_cast<double>(lastP95Us_) * kLatencyStableRatio);
+    const bool throughputDropping =
+        throughput < lastThroughputMiBPerSec_ * kThroughputDroppingRatio;
+    const bool throughputHealthy =
+        throughput >= lastThroughputMiBPerSec_ * kThroughputHealthyRatio;
+
+    if (latencyRising && throughputDropping) {
+      depth_ = std::max(
+          minDepth_, static_cast<int>(depth_ * kQueueDepthDecreaseRatio));
+    } else if (latencyStable && throughputHealthy) {
+      depth_ = std::min(
+          maxDepth_, static_cast<int>(depth_ * kQueueDepthIncreaseRatio) + 1);
+    }
   }
-  lastMiB_ = mib;
+  lastP95Us_ = p95;
+  lastThroughputMiBPerSec_ = throughput;
+  hasPreviousWindow_ = true;
   windowBytes_ = 0;
+  windowLatencyUs_ = 0;
   latencies_.clear();
 }
 
 uint64_t AdaptiveQueueDepth::Percentile95() {
-  std::sort(latencies_.begin(), latencies_.end());
-  const auto index =
-      std::min(latencies_.size() - 1, latencies_.size() * 95 / 100);
-  return latencies_[index];
+  const auto index = percentileIndex(latencies_.size(), kP95Percentile);
+  auto selected = latencies_.begin() + static_cast<std::ptrdiff_t>(index);
+  std::nth_element(latencies_.begin(), selected, latencies_.end());
+  return *selected;
+}
+
+double AdaptiveQueueDepth::WindowThroughputMiBPerSec() const {
+  if (windowLatencyUs_ == 0) {
+    return 0.0;
+  }
+  const double mib = static_cast<double>(windowBytes_) / 1024.0 / 1024.0;
+  const double seconds = static_cast<double>(windowLatencyUs_) / 1'000'000.0;
+  return seconds == 0.0 ? 0.0 : mib / seconds;
 }
 
 DiskIoScheduler::DiskIoScheduler(

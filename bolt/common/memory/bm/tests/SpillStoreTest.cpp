@@ -56,7 +56,6 @@ DiskProbeResult ssdProbe() {
       DiskKind::kSsd,
       10'000,
       12'000,
-      TargetP95LatencyForDisk(DiskKind::kSsd),
       true,
       true};
 }

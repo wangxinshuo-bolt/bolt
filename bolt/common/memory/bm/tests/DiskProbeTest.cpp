@@ -25,7 +25,6 @@ TEST(DiskProbeTest, honorsForcedKind) {
   EXPECT_EQ(result.kind, DiskKind::kNvme);
   EXPECT_FALSE(result.activeProbeRan);
   EXPECT_FALSE(result.directIoUsed);
-  EXPECT_EQ(result.targetP95LatencyUs, TargetP95LatencyForDisk(DiskKind::kNvme));
 }
 
 TEST(DiskProbeTest, usesFallbackWithoutActiveProbe) {
@@ -60,7 +59,6 @@ TEST(DiskProbeTest, runsActiveIopsProbe) {
   EXPECT_NE(result.kind, DiskKind::kUnknown);
   EXPECT_GT(result.writeIops, 0);
   EXPECT_GT(result.readIops, 0);
-  EXPECT_EQ(result.targetP95LatencyUs, TargetP95LatencyForDisk(result.kind));
 }
 
 } // namespace

@@ -13,17 +13,32 @@
 #include "bolt/common/memory/bm/tests/BufferManagerTestUtil.h"
 
 namespace bytedance::bolt::memory::bm {
+namespace {
+
+class CountingSpillRequester final : public SpillRequester {
+ public:
+  EvictResult SubmitSpill(EvictionNode /*node*/) override {
+    ++submitCount;
+    return EvictResult{EvictResultKind::kScheduled, 0};
+  }
+
+  bool WaitForProgress(
+      ByteCount /*bytesNeeded*/,
+      std::chrono::milliseconds /*timeout*/) override {
+    return false;
+  }
+
+  int submitCount{0};
+};
+
+} // namespace
 
 TEST(SpillTest, spillBlockCanBeReloaded) {
+  test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{.memoryLimitBytes = 1 << 20,
-                          .pinnedLimitBytes = 1 << 20,
-                          .emergencyScratchBytes = 64 << 10,
-                          .poolName = "bm_block_spill",
-                          .spillClient = test::makeSpillClientConfig(
-                              "bm_block_spill")});
+      BufferManagerConfig{.poolName = "bm_block_spill"});
 
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
@@ -44,15 +59,11 @@ TEST(SpillTest, spillBlockCanBeReloaded) {
 }
 
 TEST(SpillTest, synchronousSpillWorksWhenWorkersDisabled) {
+  test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{
-          .memoryLimitBytes = 1 << 20,
-          .pinnedLimitBytes = 1 << 20,
-          .emergencyScratchBytes = 64 << 10,
-          .poolName = "bm_sync_spill",
-          .spillClient = test::makeSpillClientConfig("bm_sync_spill")});
+      BufferManagerConfig{.poolName = "bm_sync_spill"});
 
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,
@@ -70,15 +81,11 @@ TEST(SpillTest, synchronousSpillWorksWhenWorkersDisabled) {
 }
 
 TEST(SpillTest, pinnedSpillBlockIsNotReclaimed) {
+  test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{
-          .memoryLimitBytes = 1 << 20,
-          .pinnedLimitBytes = 1 << 20,
-          .emergencyScratchBytes = 64 << 10,
-          .poolName = "bm_pinned_spill",
-          .spillClient = test::makeSpillClientConfig("bm_pinned_spill")});
+      BufferManagerConfig{.poolName = "bm_pinned_spill"});
 
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
@@ -91,169 +98,95 @@ TEST(SpillTest, pinnedSpillBlockIsNotReclaimed) {
   ASSERT_EQ(block->State(), BlockState::kLoaded);
 }
 
-TEST(SpillTest, compressThenSpillRoundTrip) {
-  // Verifies the kCompressThenSpill state path: kLoaded -> kCompressed
-  // (synchronous compress) -> kSpilled (async/sync spill) -> kLoaded after
-  // Pin.
+TEST(SpillTest, reclaimUsesEvictionQueueCostOrder) {
+  test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{
-          .memoryLimitBytes = 1 << 20,
-          .pinnedLimitBytes = 1 << 20,
-          .emergencyScratchBytes = 64 << 10,
-          .poolName = "bm_compress_then_spill",
-          .spillClient = test::makeSpillClientConfig(
-              "bm_compress_then_spill")});
+      BufferManagerConfig{.poolName = "bm_reclaim_queue_order"});
 
-  auto block = manager.AllocatePersistent(
-      AllocateOptions{.tag = MemoryTag::kHashTable,
-                      .size = 256,
-                      .policy = EvictPolicy::kCompressThenSpill},
-      [](DataPtr data, ByteCount bytes) { std::memset(data, 91, bytes); });
+  auto spillBlock = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 128,
+                      .policy = EvictPolicy::kSpillToDisk},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 1, bytes); });
+  auto discardBlock = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kScanCache,
+                      .size = 64,
+                      .policy = EvictPolicy::kDiscard},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 2, bytes); });
 
-  ASSERT_GT(manager.Reclaim(256), 0);
-  // After reclaim with 0 worker threads, the synchronous spill path should
-  // have moved the block all the way to kSpilled. With the MVP passthrough
-  // compressor the compress step is net-neutral, so reclaim falls through to
-  // SpillToDisk on the kCompressed payload.
-  ASSERT_EQ(block->State(), BlockState::kSpilled);
-  ASSERT_EQ(manager.GetMemoryUsage(), 0);
-
-  auto pinned = manager.Pin(block);
-  ASSERT_TRUE(pinned.IsValid());
-  ASSERT_EQ(pinned.Data()[0], 91);
-  ASSERT_EQ(pinned.Data()[255], 91);
+  ASSERT_EQ(manager.Reclaim(64), 64);
+  ASSERT_EQ(discardBlock->State(), BlockState::kDiscarded);
+  ASSERT_EQ(spillBlock->State(), BlockState::kLoaded);
+  ASSERT_EQ(manager.GetMemoryUsage(), 128);
 }
 
-TEST(SpillTest, compressInPlaceLeavesCompressedState) {
-  // Drives only the compression half of kCompressThenSpill by exposing the
-  // BlockHandle directly. This verifies the kLoaded -> kCompressed transition
-  // independently of the async spill scheduler.
+TEST(SpillTest, spillCandidateIsNotSubmittedTwiceWhileScheduled) {
+  test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{
-          .memoryLimitBytes = 1 << 20,
-          .pinnedLimitBytes = 1 << 20,
-          .emergencyScratchBytes = 64 << 10,
-          .poolName = "bm_compress_in_place",
-          .spillClient = test::makeSpillClientConfig(
-              "bm_compress_in_place")});
+      BufferManagerConfig{.poolName = "bm_no_duplicate_submit"});
 
   auto block = manager.AllocatePersistent(
-      AllocateOptions{.tag = MemoryTag::kHashTable,
+      AllocateOptions{.tag = MemoryTag::kShuffle,
                       .size = 128,
-                      .policy = EvictPolicy::kCompressThenSpill},
-      [](DataPtr data, ByteCount bytes) { std::memset(data, 23, bytes); });
+                      .policy = EvictPolicy::kSpillToDisk},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 3, bytes); });
+  CountingSpillRequester requester;
+  dynamic_cast<BlockEvictor&>(manager.EvictionQueue())
+      .SetSpillRequester(&requester);
 
-  // The MVP compressor is a passthrough; net freed bytes is zero but the
-  // block still transitions to kCompressed so a subsequent spill attempt can
-  // operate on the compressed payload.
-  ASSERT_EQ(block->CompressInPlace(), 0);
-  ASSERT_EQ(block->State(), BlockState::kCompressed);
-
-  auto pinned = manager.Pin(block);
-  ASSERT_TRUE(pinned.IsValid());
-  ASSERT_EQ(pinned.Data()[0], 23);
+  EvictionNode node;
+  ASSERT_TRUE(manager.EvictionQueue().TryPopAnyCandidate(node));
+  ASSERT_EQ(manager.EvictionQueue().TryScheduleEvict(node).kind,
+            EvictResultKind::kScheduled);
+  ASSERT_EQ(manager.EvictionQueue().TryScheduleEvict(node).kind,
+            EvictResultKind::kSkipped);
+  ASSERT_EQ(requester.submitCount, 1);
   ASSERT_EQ(block->State(), BlockState::kLoaded);
 }
 
-TEST(SpillTest, compressThenSpillFallsBackWhenCompressionNeedsExtraQuota) {
-  memory::MemoryManager memoryManager;
-  BufferManager manager(
-      memoryManager,
-      BufferManagerConfig{
-          .memoryLimitBytes = 1 << 20,
-          .pinnedLimitBytes = 1 << 20,
-          .emergencyScratchBytes = 512 << 10,
-          .poolName = "bm_compress_fallback",
-          .reserveWaitTimeout = std::chrono::milliseconds(10),
-          .spillClient = test::makeSpillClientConfig(
-              "bm_compress_fallback")});
-
-  auto block = manager.AllocatePersistent(
-      AllocateOptions{.tag = MemoryTag::kHashTable,
-                      .size = 512 << 10,
-                      .policy = EvictPolicy::kCompressThenSpill},
-      [](DataPtr data, ByteCount bytes) { std::memset(data, 37, bytes); });
-
-  // The passthrough compressor would need a second 512KiB normal
-  // reservation, but operator capacity is only memoryLimit-emergencyScratch =
-  // 512KiB. Reclaim must not deadlock while the nested Reserve attempts reclaim;
-  // it should restore kLoaded and fall through to direct spill.
-  ASSERT_EQ(manager.Reclaim(512 << 10), 512 << 10);
-  ASSERT_EQ(block->State(), BlockState::kSpilled);
-  ASSERT_EQ(manager.GetMemoryUsage(), 0);
-
-  auto pinned = manager.Pin(block);
-  ASSERT_TRUE(pinned.IsValid());
-  ASSERT_EQ(pinned.Data()[0], 37);
-  ASSERT_EQ(pinned.Data()[pinned.Size() - 1], 37);
-}
-
-TEST(SpillTest, spillLocationRoutesReleaseToOriginalStore) {
+TEST(SpillTest, spillLocationReleaseUsesSingleStore) {
   // Use a directly-owned ProcessSpillService instead of the singleton so this
-  // test can configure multiple stores without affecting other unit tests.
+  // test can inspect the store without affecting other unit tests.
   auto root = std::filesystem::temp_directory_path() /
-      "bolt_bm_test_multi_spill_root";
+      "bolt_bm_test_single_spill_root";
   std::filesystem::remove_all(root);
-  std::filesystem::create_directories(root / "a");
-  std::filesystem::create_directories(root / "b");
+  std::filesystem::create_directories(root);
 
   ProcessSpillServiceConfig serviceConfig;
-  serviceConfig.dirs.push_back(SpillDirConfig{.path = (root / "a").string()});
-  serviceConfig.dirs.push_back(SpillDirConfig{.path = (root / "b").string()});
+  serviceConfig.spillDir = root.string();
   serviceConfig.workerThreadCount = 0;
   serviceConfig.cleanupOnDestroy = true;
   serviceConfig.diskProbeDuration = std::chrono::milliseconds(0);
   auto service = ProcessSpillService::CreateForTesting(std::move(serviceConfig));
 
-  SpillClientConfig clientConfig;
-  clientConfig.enableSpill = true;
-  clientConfig.tenantId = "bm_multi_store";
-  auto client = service->CreateClient(std::move(clientConfig));
-
   uint8_t payload[4] = {1, 2, 3, 4};
-  auto first = client->Write(MemoryTag::kShuffle, payload, sizeof(payload));
-  auto second = client->Write(MemoryTag::kShuffle, payload, sizeof(payload));
-  ASSERT_NE(first.storeIndex, second.storeIndex);
-  ASSERT_TRUE(std::filesystem::exists(first.path));
-  ASSERT_TRUE(std::filesystem::exists(second.path));
+  auto location = service->Write(MemoryTag::kShuffle, payload, sizeof(payload));
+  ASSERT_TRUE(std::filesystem::exists(location.path));
+  ASSERT_GT(service->UsedDiskBytes(), 0);
 
-  client->Release(first);
-  client->Release(second);
-  ASSERT_FALSE(std::filesystem::exists(first.path));
-  ASSERT_FALSE(std::filesystem::exists(second.path));
+  service->Release(location);
+  ASSERT_FALSE(std::filesystem::exists(location.path));
   ASSERT_EQ(service->UsedDiskBytes(), 0);
 }
 
-// Per design doc §14.2: when emergency scratch is zero, both kSpillToDisk and
-// kCompressThenSpill must be rejected at allocate time so callers do not get
-// silently degraded spill behaviour.
-TEST(SpillTest, zeroEmergencyScratchRejectsSpillPolicies) {
+TEST(SpillTest, spillPoliciesUseConfiguredProcessService) {
+  test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{
-          .memoryLimitBytes = 1 << 20,
-          .pinnedLimitBytes = 1 << 20,
-          .emergencyScratchBytes = 0,
-          .poolName = "bm_zero_emergency_spill",
-          .spillClient = test::makeSpillClientConfig(
-              "bm_zero_emergency_spill")});
+      BufferManagerConfig{.poolName = "bm_process_spill_service"});
 
-  ASSERT_THROW(
-      manager.Allocate(AllocateOptions{.tag = MemoryTag::kHashTable,
-                                       .size = 1024,
-                                       .policy = EvictPolicy::kSpillToDisk}),
-      ::bytedance::bolt::BoltUserError);
-  ASSERT_THROW(
-      manager.Allocate(
-          AllocateOptions{.tag = MemoryTag::kHashTable,
-                          .size = 1024,
-                          .policy = EvictPolicy::kCompressThenSpill}),
-      ::bytedance::bolt::BoltUserError);
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kHashTable,
+                      .size = 1024,
+                      .policy = EvictPolicy::kSpillToDisk},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 55, bytes); });
+  ASSERT_EQ(manager.Reclaim(1024), 1024);
+  ASSERT_EQ(block->State(), BlockState::kSpilled);
 }
 
 } // namespace bytedance::bolt::memory::bm

@@ -15,7 +15,7 @@
 namespace bytedance::bolt::memory::bm {
 namespace {
 
-constexpr size_t kCostClassCount = 3;
+constexpr size_t kCostClassCount = 2;
 constexpr size_t kPriorityCount = 4;
 
 size_t costIndex(EvictionCostClass cost) {
@@ -47,7 +47,7 @@ void BlockEvictor::Enqueue(EvictionNode node) {
 }
 
 bool BlockEvictor::TryPopAnyCandidate(EvictionNode& out) {
-  // Cheap-first scan order: kFreeOrCheap -> kCompress -> kSpill, and within
+  // Cheap-first scan order: kFreeOrCheap -> kSpill, and within
   // each cost class kLow -> kCritical (design doc §7.2). We sacrifice the
   // cheapest, lowest-priority candidate first.
   std::lock_guard<std::mutex> l(mutex_);
@@ -98,16 +98,7 @@ EvictResult BlockEvictor::TryEvictNodeSync(const EvictionNode& node) {
   if (policy == EvictPolicy::kSpillToDisk) {
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
-  if (policy == EvictPolicy::kCompressThenSpill &&
-      block->State() == BlockState::kCompressed) {
-    return EvictResult{EvictResultKind::kSkipped, 0};
-  }
-  ByteCount freed = 0;
-  if (policy == EvictPolicy::kCompressThenSpill) {
-    freed = block->CompressInPlace();
-  } else {
-    freed = block->TryEvict(0);
-  }
+  const auto freed = block->TryEvict(0);
   if (freed == 0) {
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
@@ -122,15 +113,23 @@ EvictResult BlockEvictor::TryScheduleEvict(const EvictionNode& node) {
   if (!IsSpillPolicy(block->options_.policy)) {
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
+  if (!block->TryMarkSpillScheduled(node.evictionSequence)) {
+    return EvictResult{EvictResultKind::kSkipped, 0};
+  }
   auto* requester = spillRequester_.load(std::memory_order_acquire);
   if (requester == nullptr) {
+    block->ClearSpillScheduled();
     // No requester wired (e.g. shutting down). Reserve must observe a
     // failure rather than spin: the caller will fall through to its
     // backpressure-wait logic and then re-check.
     return EvictResult{EvictResultKind::kFailed, 0};
   }
   EvictionNode submitted = node;
-  return requester->SubmitSpill(std::move(submitted));
+  auto result = requester->SubmitSpill(std::move(submitted));
+  if (result.kind != EvictResultKind::kScheduled) {
+    block->ClearSpillScheduled();
+  }
+  return result;
 }
 
 bool BlockEvictor::WaitForProgress(

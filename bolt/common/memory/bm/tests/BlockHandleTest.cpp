@@ -20,8 +20,7 @@ TEST(BlockHandleTest, blockSealPinAndDiscardReclaim) {
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{.memoryLimitBytes = 1 << 20,
-                          .poolName = "bm_block_discard"});
+      BufferManagerConfig{.poolName = "bm_block_discard"});
 
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
@@ -44,12 +43,28 @@ TEST(BlockHandleTest, blockSealPinAndDiscardReclaim) {
   ASSERT_FALSE(manager.Pin(block).IsValid());
 }
 
+TEST(BlockHandleTest, discardReclaimReturnsActualFreedBytes) {
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_discard_actual_freed"});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kScanCache,
+                      .size = 256,
+                      .policy = EvictPolicy::kDiscard},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 7, bytes); });
+
+  ASSERT_EQ(manager.Reclaim(128), 256);
+  ASSERT_EQ(manager.GetMemoryUsage(), 0);
+  ASSERT_EQ(block->State(), BlockState::kDiscarded);
+}
+
 TEST(BlockHandleTest, recomputeBlockCanBePinnedAfterReclaim) {
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{.memoryLimitBytes = 1 << 20,
-                          .poolName = "bm_block_recompute"});
+      BufferManagerConfig{.poolName = "bm_block_recompute"});
 
   AllocateOptions options;
   options.tag = MemoryTag::kOperatorState;
@@ -75,8 +90,7 @@ TEST(BlockHandleTest, pinnedHandlePreventsDiscardReclaim) {
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{.memoryLimitBytes = 1 << 20,
-                          .poolName = "bm_pinned_handle"});
+      BufferManagerConfig{.poolName = "bm_pinned_handle"});
 
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
@@ -94,9 +108,7 @@ TEST(BlockHandleTest, pinnedForeverBlockIsNeverReclaimed) {
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{.memoryLimitBytes = 1 << 20,
-                          .pinnedLimitBytes = 1 << 20,
-                          .poolName = "bm_pinned_forever"});
+      BufferManagerConfig{.poolName = "bm_pinned_forever"});
 
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kInternal,
@@ -118,8 +130,7 @@ TEST(BlockHandleTest, reloadFailurePropagatesAndDoesNotThunder) {
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{.memoryLimitBytes = 1 << 20,
-                          .poolName = "bm_pin_thundering_herd"});
+      BufferManagerConfig{.poolName = "bm_pin_thundering_herd"});
 
   std::atomic<int> recoveryCalls{0};
   AllocateOptions opts;
@@ -170,16 +181,11 @@ TEST(BlockHandleTest, reloadFailurePropagatesAndDoesNotThunder) {
 // SpillToDisk worker without dereferencing the torn-down manager_. This races
 // the destructor with a manual SpillToDisk and asserts there is no crash.
 TEST(BlockHandleTest, destroyManagerDuringSpillDoesNotCrash) {
+  test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   auto bm = std::make_unique<BufferManager>(
       memoryManager,
-      BufferManagerConfig{
-          .memoryLimitBytes = 1 << 20,
-          .pinnedLimitBytes = 1 << 20,
-          .emergencyScratchBytes = 64 << 10,
-          .poolName = "bm_destroy_during_spill",
-          .spillClient = test::makeSpillClientConfig(
-              "bm_destroy_during_spill")});
+      BufferManagerConfig{.poolName = "bm_destroy_during_spill"});
 
   auto block = bm->AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,

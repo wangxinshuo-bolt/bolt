@@ -51,11 +51,8 @@ bolt_add_library(
   bm/DiskIo.cpp
   bm/DiskProbe.cpp
   bm/Evictor.cpp
-  bm/GlobalSpillScheduler.cpp
   bm/ProcessSpillService.cpp
-  bm/SpillClient.cpp
   bm/SpillStore.cpp
-  bm/TemporaryMemoryManager.cpp
   bm/Types.cpp
   MemoryPool.cpp
   MemoryPoolForGluten.cpp
@@ -83,6 +80,7 @@ endif()
 
 find_package(GTest CONFIG REQUIRED)
 find_package(Arrow CONFIG REQUIRED)
+find_package(zstd CONFIG REQUIRED)
 
 target_link_libraries(
   bolt_memory
@@ -98,6 +96,7 @@ target_link_libraries(
          glog::glog
          arrow::arrow
   PRIVATE re2::re2
+          zstd::libzstd_static
 )
 
 if(KERNEL_SUPPORTS_IO_URING)

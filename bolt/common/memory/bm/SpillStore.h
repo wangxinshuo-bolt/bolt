@@ -6,10 +6,15 @@
 #pragma once
 
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
+#include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include "bolt/common/memory/bm/DiskIo.h"
 #include "bolt/common/memory/bm/DiskProbe.h"
@@ -18,6 +23,11 @@
 namespace bytedance::bolt::memory::bm {
 
 class SpillStore;
+
+enum class SpillCompressionCodec : uint8_t {
+  kNone = 0,
+  kZstd = 1,
+};
 
 // Concrete address of one spilled payload. The disk kind is captured at
 // write time so reload paths can attribute Read latency to the right disk
@@ -31,27 +41,48 @@ struct SpillLocation {
   // Filesystem path of the spill file. Empty iff this is an invalid
   // (default-constructed) location.
   std::string path;
+  // Byte offset inside 'path'. Dedicated files always use offset 0; small
+  // slot-backed locations use the slot's file offset.
+  uint64_t offset{0};
   // Logical (uncompressed) bytes the file represents. This is what the
   // caller has to hand back to Read's destination buffer.
   ByteCount logicalBytes{0};
-  // Bytes actually stored on disk. Equal to logicalBytes when the
-  // payload was written uncompressed (current MVP).
+  // Bytes charged to spill storage. Dedicated files use logicalBytes; small
+  // slot-backed locations use the owning slot size.
   ByteCount storedBytes{0};
-  // Reserved for future compressed spill format: 0 == uncompressed.
-  uint8_t compressionCodec{0};
+  // Slot size for small spill files. 0 means this is a dedicated file.
+  ByteCount slotBytes{0};
+  // True when the payload lives in a reusable slot inside a slab file.
+  bool smallSlot{false};
+  // Compression codec used for bytes stored on disk.
+  SpillCompressionCodec compressionCodec{SpillCompressionCodec::kNone};
   // Disk snapshot at write time (used for metrics labeling on Read).
   DiskKind disk{DiskKind::kUnknown};
-  // Index of the SpillStore that created this location. ProcessSpillService
-  // uses it to route Read/Release back to the store that owns the live-file
-  // bookkeeping; UINT64_MAX keeps legacy/default locations invalid for
-  // indexed routing while preserving path-based Valid().
-  uint64_t storeIndex{UINT64_MAX};
-
   // Returns true if this location refers to a real spill file.
   // Default-constructed and moved-from locations return false.
   bool Valid() const {
     return !path.empty();
   }
+};
+
+struct SpillCompressionConfig {
+  bool enabled{true};
+  SpillCompressionCodec codec{SpillCompressionCodec::kZstd};
+  int level{1};
+  ByteCount minBytes{0};
+  double minSavingsRatio{0.05};
+};
+
+// Config for small spill block packing. Blocks up to
+// dedicatedFileThresholdBytes are written into size-class slab files and reuse
+// released slots; larger blocks keep the simple one-file-per-block path.
+struct SmallSpillConfig {
+  bool enabled{true};
+  // 0 means use the DiskKind-specific default.
+  ByteCount dedicatedFileThresholdBytes{0};
+  // 0 means use the DiskKind-specific default.
+  ByteCount slabFileBytes{0};
+  std::vector<ByteCount> sizeClasses;
 };
 
 // Configuration for one spill directory. Multiple SpillStores share the same
@@ -74,6 +105,12 @@ struct SpillStoreConfig {
   // Precomputed disk probe result for this spill directory. Active probing is
   // owned by ProcessSpillService/DiskProbe, not by SpillStore.
   DiskProbeResult diskProbe;
+  // Small-block packing policy. When sizeClasses is empty, SpillStore derives
+  // disk-kind-specific defaults from the effective DiskKind.
+  SmallSpillConfig smallSpill;
+  // Compression policy applied before choosing the spill file/slot. Enabled
+  // by default; compression is accepted only when it saves enough bytes.
+  SpillCompressionConfig compression;
 };
 
 // RAII handle for a single spill write attempt. Per design doc §10.1 a write
@@ -96,8 +133,8 @@ class SpillWriteSession {
   // any partially written file was already cleaned up inline. Never throws.
   ~SpillWriteSession() noexcept;
 
-  // Writes 'bytes' from 'src' into a fresh file under the session's
-  // directory and returns a SpillLocation describing it. May only be
+  // Writes 'bytes' from 'src' into either a dedicated file or a reusable
+  // small-block slot and returns a SpillLocation describing it. May only be
   // called once per session.
   // Throws BoltUserError if:
   //   * the session has already been consumed
@@ -183,9 +220,50 @@ class SpillStore {
  private:
   friend class SpillWriteSession;
 
-  // Allocates a new on-disk path under spillDir for tag-tagged file.
+  struct SmallSlabFile {
+    std::string path;
+    ByteCount slotBytes{0};
+    uint64_t nextSlot{0};
+    uint64_t usedSlots{0};
+    uint64_t totalSlots{0};
+    bool deleted{false};
+    std::deque<uint64_t> freeSlots;
+  };
+
+  struct SmallSizeClass {
+    ByteCount slotBytes{0};
+    ByteCount slabFileBytes{0};
+    std::vector<SmallSlabFile> slabs;
+  };
+
+  struct PreparedPayload {
+    ConstDataPtr data{nullptr};
+    ByteCount storedBytes{0};
+    SpillCompressionCodec codec{SpillCompressionCodec::kNone};
+    std::vector<uint8_t> compressed;
+  };
+
+  // Allocates a new on-disk path under spillDir for a dedicated file.
   // Caller must Register/Forget the returned path in lockstep with I/O.
-  std::string MakePath(MemoryTag tag);
+  std::string MakeDedicatedPath(MemoryTag tag);
+
+  std::string MakeSmallSlabPath(ByteCount slotBytes);
+  std::string LocationKey(const SpillLocation& location) const;
+  std::string LocationKey(const std::string& path, uint64_t offset) const;
+  std::optional<size_t> SmallClassFor(ByteCount bytes) const;
+  PreparedPayload PreparePayload(ConstDataPtr src, ByteCount bytes) const;
+  SpillLocation AllocateSmallSlot(
+      MemoryTag tag,
+      ByteCount logicalBytes,
+      ByteCount storedBytes,
+      SpillCompressionCodec codec);
+  SpillLocation AllocateDedicated(
+      MemoryTag tag,
+      ByteCount logicalBytes,
+      ByteCount storedBytes,
+      SpillCompressionCodec codec);
+  void RollbackSmallSlot(const SpillLocation& location) noexcept;
+  void WriteToLocation(const SpillLocation& location, ConstDataPtr src);
 
   // Records 'path' as live so Release() / cleanup can find it later.
   // Idempotent: re-registering an existing path is harmless.
@@ -199,6 +277,8 @@ class SpillStore {
   MetricsRegistry& metrics_;
   DiskIoScheduler* ioScheduler_;
   const DiskProbeResult diskProbe_;
+  const SmallSpillConfig smallConfig_;
+  const SpillCompressionConfig compressionConfig_;
   Counter& bytesWrittenCounter_;
   Counter& bytesReadCounter_;
   Counter& doubleReleaseCounter_;
@@ -206,11 +286,14 @@ class SpillStore {
   const DiskKind disk_;
   mutable std::mutex mutex_;
   std::atomic<uint64_t> nextFileId_{0};
+  std::atomic<uint64_t> nextSmallSlabId_{0};
   std::unordered_set<std::string> liveFiles_;
+  std::unordered_set<std::string> liveLocations_;
   // Paths that have been successfully released. Used to distinguish double
   // release (idempotent + counter) from invalid releases (throw) per design
   // doc §10.3.
   std::unordered_set<std::string> releasedFiles_;
+  std::vector<SmallSizeClass> smallClasses_;
 };
 
 } // namespace bytedance::bolt::memory::bm

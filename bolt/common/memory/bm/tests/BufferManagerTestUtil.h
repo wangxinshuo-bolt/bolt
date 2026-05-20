@@ -43,25 +43,13 @@ inline std::string ensureTestSpillService() {
     ProcessDiskIoService::ConfigureDefault(ioConfig);
 
     ProcessSpillServiceConfig cfg;
-    SpillDirConfig dir;
-    dir.path = root;
-    cfg.dirs.push_back(std::move(dir));
+    cfg.spillDir = root;
     cfg.workerThreadCount = 0; // synchronous spill keeps unit tests deterministic
     cfg.cleanupOnDestroy = true;
     cfg.diskProbeDuration = std::chrono::milliseconds(0);
     ProcessSpillService::ConfigureDefault(std::move(cfg));
   });
   return root;
-}
-
-// Constructs a SpillClientConfig that enables spill participation for a
-// BufferManager. The tenantId is used purely for metric labels.
-inline SpillClientConfig makeSpillClientConfig(const std::string& tenantId) {
-  ensureTestSpillService();
-  SpillClientConfig cfg;
-  cfg.enableSpill = true;
-  cfg.tenantId = tenantId;
-  return cfg;
 }
 
 } // namespace bytedance::bolt::memory::bm::test

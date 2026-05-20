@@ -231,10 +231,6 @@ MemoryManager::MemoryManager(const MemoryManager::Options& options)
       std::max(1, FLAGS_bolt_memory_num_shared_leaf_pools));
   if (options.enableBufferManager) {
     bm::BufferManagerConfig config;
-    config.memoryLimitBytes = options.bufferManagerCapacity == 0
-        ? static_cast<uint64_t>(capacity())
-        : static_cast<uint64_t>(options.bufferManagerCapacity);
-    config.pinnedLimitBytes = config.memoryLimitBytes;
     config.poolName = "__buffer_manager__";
     bufferManager_ = std::make_unique<bm::BufferManager>(*this, config);
   }

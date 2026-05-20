@@ -25,9 +25,9 @@ class BufferManager;
 // bytes.
 //
 // The contract splits sync and async paths to keep the locking simple:
-//   * TryEvictNodeSync handles cheap policies (kFreeOrCheap, kCompress).
+//   * TryEvictNodeSync handles cheap policies (kFreeOrCheap).
 //     Returns kFreed/kSkipped/kFailed only.
-//   * TryScheduleEvict hands kSpill nodes off to the spill scheduler.
+//   * TryScheduleEvict hands kSpill nodes off to the spill service.
 //     Returns kScheduled/kBackpressured/kSkipped/kFailed only.
 //   * WaitForProgress blocks until the spill subsystem makes forward
 //     progress (kFreed bytes) or the timeout elapses.
@@ -45,11 +45,10 @@ class Evictor {
   // Out-of-range cost/priority values are silently dropped.
   virtual void Enqueue(EvictionNode node) = 0;
 
-  // Synchronously evicts a cheap candidate by calling either
-  // BlockHandle::TryEvict or BlockHandle::CompressInPlace based on its
-  // policy. Never performs I/O. Returns:
+  // Synchronously evicts a cheap candidate by calling BlockHandle::TryEvict.
+  // Never performs I/O. Returns:
   //   kFreed{N}  -- freed N bytes; the block is now in a non-resident
-  //                  state (kEvicted/kCompressed).
+  //                  state.
   //   kSkipped   -- node was stale, the policy is kSpillToDisk, or the
   //                  block is already in the target state. No bytes freed.
   //   kFailed    -- the call would have produced bytes but the block
@@ -83,8 +82,8 @@ class Evictor {
 
 // Concrete Evictor backed by per-cost / per-priority FIFO queues
 // (design doc §7.2). One process-local instance is owned by BufferManager.
-// Sync eviction is fully handled in-process; spill goes through an external
-// SpillRequester (in production: the per-tenant SpillClient).
+// Sync eviction is fully handled in-process; spill goes through the process
+// spill service via the SpillRequester interface.
 class BlockEvictor : public Evictor {
  public:
   // Builds an evictor without a spill requester. Call SetSpillRequester
@@ -98,7 +97,7 @@ class BlockEvictor : public Evictor {
   // Installs (or detaches) the SpillRequester used by TryScheduleEvict and
   // WaitForProgress. Storing happens with release semantics so other
   // threads observe a fully-constructed requester. Pass nullptr during
-  // teardown to disconnect the scheduler before it is destroyed; in-flight
+  // teardown to disconnect the spill service before it is destroyed; in-flight
   // calls observe a kFailed/false response instead of dereferencing a
   // dangling pointer.
   void SetSpillRequester(SpillRequester* requester);
@@ -116,8 +115,8 @@ class BlockEvictor : public Evictor {
   EvictResult TryScheduleEvict(const EvictionNode& node) override;
 
   // See Evictor::TryPopAnyCandidate. Iterates queues in cost-then-priority
-  // order (kFreeOrCheap < kCompress < kSpill, kLow < kCritical) and pops
-  // the first non-empty bucket's front.
+  // order (kFreeOrCheap < kSpill, kLow < kCritical) and pops the first
+  // non-empty bucket's front.
   bool TryPopAnyCandidate(EvictionNode& out) override;
 
   // See Evictor::WaitForProgress. Forwards to the registered requester;
@@ -127,7 +126,7 @@ class BlockEvictor : public Evictor {
       std::chrono::milliseconds timeout) override;
 
  private:
-  static constexpr size_t kCostClassCount = 3;
+  static constexpr size_t kCostClassCount = 2;
   static constexpr size_t kPriorityCount = 4;
 
   // Validates a node against its block (design doc §9.1) and returns the

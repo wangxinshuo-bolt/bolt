@@ -101,8 +101,6 @@ const char* ToString(EvictPolicy policy) {
       return "discard";
     case EvictPolicy::kRecompute:
       return "recompute";
-    case EvictPolicy::kCompressThenSpill:
-      return "compress_then_spill";
     case EvictPolicy::kPinnedForever:
       return "pinned_forever";
   }
@@ -119,8 +117,6 @@ const char* ToString(BlockState state) {
       return "loading";
     case BlockState::kSpilling:
       return "spilling";
-    case BlockState::kCompressed:
-      return "compressed";
     case BlockState::kSpilled:
       return "spilled";
     case BlockState::kDiscarded:
@@ -151,8 +147,6 @@ const char* ToString(EvictionCostClass cost) {
   switch (cost) {
     case EvictionCostClass::kFreeOrCheap:
       return "free_or_cheap";
-    case EvictionCostClass::kCompress:
-      return "compress";
     case EvictionCostClass::kSpill:
       return "spill";
   }
@@ -181,19 +175,15 @@ ReservationKind BodyReservationKind(EvictPolicy policy) {
 }
 
 bool IsSpillPolicy(EvictPolicy policy) {
-  return policy == EvictPolicy::kSpillToDisk ||
-      policy == EvictPolicy::kCompressThenSpill;
+  return policy == EvictPolicy::kSpillToDisk;
 }
 
 EvictionCostClass EvictionCostFor(EvictPolicy policy, BlockState state) {
+  (void)state;
   switch (policy) {
     case EvictPolicy::kDiscard:
     case EvictPolicy::kRecompute:
       return EvictionCostClass::kFreeOrCheap;
-    case EvictPolicy::kCompressThenSpill:
-      // After the block has already been compressed, only a spill remains.
-      return state == BlockState::kCompressed ? EvictionCostClass::kSpill
-                                              : EvictionCostClass::kCompress;
     case EvictPolicy::kSpillToDisk:
       return EvictionCostClass::kSpill;
     case EvictPolicy::kPinnedForever:

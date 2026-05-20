@@ -9,8 +9,7 @@ add_executable(
   BufferPoolTest.cpp
   DiskIoTest.cpp
   MemoryManagerIntegrationTest.cpp
-  SpillTest.cpp
-  TemporaryMemoryManagerTest.cpp)
+  SpillTest.cpp)
 
 target_compile_features(bolt_memory_bm_test PRIVATE cxx_std_20)
 

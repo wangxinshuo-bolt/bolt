@@ -15,6 +15,7 @@
 
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/memory/Memory.h"
+#include "bolt/common/memory/bm/BlockHandle.h"
 #include "bolt/common/memory/bm/DiskProbe.h"
 
 namespace bytedance::bolt::memory::bm {
@@ -45,47 +46,38 @@ MetricsRegistry& effectiveRegistry(MetricsRegistry* metrics) {
 
 ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
     : config_(std::move(config)),
-      metrics_(effectiveRegistry(config_.metrics)),
-      scheduler_(std::make_unique<GlobalSpillScheduler>(
-          resolveWorkerThreadCount(config_.workerThreadCount),
-          metrics_)) {
+      metrics_(effectiveRegistry(config_.metrics)) {
   BOLT_USER_CHECK(
-      !config_.dirs.empty(),
-      "ProcessSpillService requires at least one spill directory");
+      !config_.spillDir.empty(),
+      "ProcessSpillService requires a spill directory");
   CleanupStaleDirsAtStartup();
-  bool configuredDiskIo = false;
-  for (const auto& dir : config_.dirs) {
-    SpillStoreConfig storeCfg;
-    storeCfg.spillDir = dir.path;
-    storeCfg.cleanupOnDestroy = config_.cleanupOnDestroy;
-    storeCfg.forcedKind = dir.forcedKind;
-    storeCfg.unknownFallbackKind = config_.unknownFallbackKind;
-    DiskProbeConfig probeConfig;
-    probeConfig.directory = storeCfg.spillDir;
-    probeConfig.duration = config_.diskProbeDuration;
-    probeConfig.forcedKind = storeCfg.forcedKind;
-    probeConfig.fallbackKind = storeCfg.unknownFallbackKind;
-    storeCfg.diskProbe = ProbeDisk(probeConfig);
-    if (!configuredDiskIo) {
-      DiskIoConfig ioConfig;
-      ioConfig.backend = DiskIoBackend::kUring;
-      ioConfig.targetP95LatencyUs = storeCfg.diskProbe.targetP95LatencyUs;
-      ProcessDiskIoService::ConfigureDefaultIfNeeded(ioConfig);
-      configuredDiskIo = true;
-    }
-    SpillStore::CleanupAtStartup(storeCfg);
-    stores_.push_back(
-        std::make_unique<SpillStore>(storeCfg, config_.metrics));
-  }
-  scheduler_->Start();
-  BOLT_MEM_LOG(INFO) << "ProcessSpillService initialized with "
-                     << stores_.size() << " stores";
+  SpillStoreConfig storeCfg;
+  storeCfg.spillDir = config_.spillDir;
+  storeCfg.cleanupOnDestroy = config_.cleanupOnDestroy;
+  storeCfg.forcedKind = config_.forcedKind;
+  storeCfg.unknownFallbackKind = config_.unknownFallbackKind;
+  storeCfg.smallSpill = config_.smallSpill;
+  storeCfg.compression = config_.compression;
+  DiskProbeConfig probeConfig;
+  probeConfig.directory = storeCfg.spillDir;
+  probeConfig.duration = config_.diskProbeDuration;
+  probeConfig.forcedKind = storeCfg.forcedKind;
+  probeConfig.fallbackKind = storeCfg.unknownFallbackKind;
+  storeCfg.diskProbe = ProbeDisk(probeConfig);
+  DiskIoConfig ioConfig;
+  ioConfig.backend = DiskIoBackend::kUring;
+  ioConfig.targetP95LatencyUs = storeCfg.diskProbe.targetP95LatencyUs;
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(ioConfig);
+  SpillStore::CleanupAtStartup(storeCfg);
+  store_ = std::make_unique<SpillStore>(storeCfg, config_.metrics);
+  StartWorkers();
+  BOLT_MEM_LOG(INFO) << "ProcessSpillService initialized at "
+                     << config_.spillDir;
 }
 
 ProcessSpillService::~ProcessSpillService() {
-  scheduler_->Stop();
-  scheduler_.reset();
-  stores_.clear();
+  StopWorkers();
+  store_.reset();
 }
 
 ProcessSpillService& ProcessSpillService::Instance() {
@@ -109,8 +101,8 @@ void ProcessSpillService::ConfigureDefault(ProcessSpillServiceConfig config) {
       !state.configured && state.instance == nullptr,
       "ProcessSpillService::ConfigureDefault may be called only once");
   BOLT_USER_CHECK(
-      !config.dirs.empty(),
-      "ProcessSpillServiceConfig.dirs must not be empty");
+      !config.spillDir.empty(),
+      "ProcessSpillServiceConfig.spillDir must not be empty");
   state.pendingConfig = std::move(config);
   state.configured = true;
 }
@@ -120,15 +112,6 @@ void ProcessSpillService::ResetForTesting() {
   std::unique_ptr<ProcessSpillService> dying;
   {
     std::lock_guard<std::mutex> l(state.mutex);
-    if (state.instance != nullptr) {
-      std::lock_guard<std::mutex> cl(state.instance->clientsMutex_);
-      for (const auto& [id, weak] : state.instance->clients_) {
-        BOLT_USER_CHECK(
-            weak.expired(),
-            "ResetForTesting called while SpillClient {} is still live",
-            id);
-      }
-    }
     dying = std::move(state.instance);
     state.configured = false;
     state.pendingConfig = ProcessSpillServiceConfig{};
@@ -143,125 +126,174 @@ std::unique_ptr<ProcessSpillService> ProcessSpillService::CreateForTesting(
       new ProcessSpillService(std::move(config)));
 }
 
-std::shared_ptr<SpillClient> ProcessSpillService::CreateClient(
-    SpillClientConfig config) {
-  const auto schedulerId =
-      scheduler_->RegisterClient(config.fairnessWeight);
-  std::shared_ptr<SpillClient> client(
-      new SpillClient(this, schedulerId, std::move(config)));
-  std::lock_guard<std::mutex> l(clientsMutex_);
-  clients_[schedulerId] = client;
-  return client;
-}
-
-SpillStore& ProcessSpillService::PickStore() {
-  // Round-robin among configured stores. The set is fixed at init so we
-  // never need a lock here.
-  return PickStoreForWrite().second;
-}
-
-std::pair<uint64_t, SpillStore&> ProcessSpillService::PickStoreForWrite() {
-  const auto idx =
-      storeRobinCursor_.fetch_add(1, std::memory_order_relaxed) %
-      stores_.size();
-  return {idx, *stores_[idx]};
-}
-
-SpillStore& ProcessSpillService::StoreFor(const SpillLocation& location) {
-  BOLT_USER_CHECK(location.Valid(), "Invalid spill location");
-  BOLT_USER_CHECK_LT(
-      location.storeIndex,
-      stores_.size(),
-      "Invalid spill store index {} for {} stores",
-      location.storeIndex,
-      stores_.size());
-  return *stores_[location.storeIndex];
-}
-
-void ProcessSpillService::ChargeQuota(SpillClient& client, ByteCount bytes) {
-  if (config_.processDiskQuotaBytes != 0) {
-    auto current = usedDiskBytes_.load(std::memory_order_relaxed);
-    while (true) {
-      BOLT_USER_CHECK(
-          current <= config_.processDiskQuotaBytes &&
-              bytes <= config_.processDiskQuotaBytes - current,
-          "ProcessSpillService disk quota exceeded: used={} request={} limit={}",
-          current,
-          bytes,
-          config_.processDiskQuotaBytes);
-      if (usedDiskBytes_.compare_exchange_weak(
-              current,
-              current + bytes,
-              std::memory_order_relaxed)) {
-        break;
-      }
-    }
-  } else {
-    usedDiskBytes_.fetch_add(bytes, std::memory_order_relaxed);
+EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
+  if (node.block.expired()) {
+    return EvictResult{EvictResultKind::kSkipped, 0};
   }
-
-  if (client.config_.diskQuotaBytes != 0) {
-    auto current = client.usedDiskBytes_.load(std::memory_order_relaxed);
-    while (true) {
-      if (current > client.config_.diskQuotaBytes ||
-          bytes > client.config_.diskQuotaBytes - current) {
-        // Roll back the process-level reservation we just took.
-        usedDiskBytes_.fetch_sub(bytes, std::memory_order_relaxed);
-        BOLT_USER_FAIL(
-            "SpillClient {} disk quota exceeded: used={} request={} limit={}",
-            client.config_.tenantId,
-            current,
-            bytes,
-            client.config_.diskQuotaBytes);
-      }
-      if (client.usedDiskBytes_.compare_exchange_weak(
-              current,
-              current + bytes,
-              std::memory_order_relaxed)) {
-        break;
-      }
-    }
-  } else {
-    client.usedDiskBytes_.fetch_add(bytes, std::memory_order_relaxed);
+  if (resolveWorkerThreadCount(config_.workerThreadCount) == 0) {
+    return EvictResult{EvictResultKind::kBackpressured, 0};
   }
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (stopping_) {
+      return EvictResult{EvictResultKind::kFailed, 0};
+    }
+    ready_.push_back(std::move(node));
+  }
+  cv_.notify_one();
+  return EvictResult{EvictResultKind::kScheduled, 0};
 }
 
-void ProcessSpillService::CreditQuota(
-    SpillClient& client,
-    ByteCount bytes) noexcept {
-  if (bytes == 0) {
+bool ProcessSpillService::WaitForProgress(
+    ByteCount /*bytesNeeded*/,
+    std::chrono::milliseconds timeout) {
+  std::unique_lock<std::mutex> l(mutex_);
+  const auto startEpoch = progressEpoch_;
+  return progressCv_.wait_for(
+      l, timeout, [&] { return stopping_ || progressEpoch_ != startEpoch; });
+}
+
+SpillLocation ProcessSpillService::Write(
+    MemoryTag tag,
+    ConstDataPtr src,
+    ByteCount bytes) {
+  auto location = store_->Write(tag, src, bytes);
+  usedDiskBytes_.fetch_add(
+      location.slotBytes == 0 ? location.storedBytes : location.slotBytes,
+      std::memory_order_relaxed);
+  return location;
+}
+
+void ProcessSpillService::Read(
+    const SpillLocation& location,
+    DataPtr dst,
+    ByteCount dstCapacity) {
+  store_->Read(location, dst, dstCapacity);
+}
+
+void ProcessSpillService::Release(const SpillLocation& location) noexcept {
+  if (!location.Valid()) {
     return;
   }
+  try {
+    store_->Release(location);
+  } catch (...) {
+  }
   auto current = usedDiskBytes_.load(std::memory_order_relaxed);
+  const auto bytes =
+      location.slotBytes == 0 ? location.storedBytes : location.slotBytes;
   const auto sub = std::min(current, bytes);
   if (sub != 0) {
     usedDiskBytes_.fetch_sub(sub, std::memory_order_relaxed);
   }
-  auto clientCurrent = client.usedDiskBytes_.load(std::memory_order_relaxed);
-  const auto clientSub = std::min(clientCurrent, bytes);
-  if (clientSub != 0) {
-    client.usedDiskBytes_.fetch_sub(clientSub, std::memory_order_relaxed);
+}
+
+void ProcessSpillService::StartWorkers() {
+  std::lock_guard<std::mutex> l(mutex_);
+  if (started_) {
+    return;
+  }
+  started_ = true;
+  const auto workerCount = resolveWorkerThreadCount(config_.workerThreadCount);
+  for (uint32_t i = 0; i < workerCount; ++i) {
+    workers_.emplace_back([this] { WorkerLoop(); });
+  }
+  if (workerCount != 0) {
+    BOLT_MEM_LOG(INFO) << "ProcessSpillService started " << workerCount
+                       << " spill workers";
   }
 }
 
-void ProcessSpillService::UnregisterClient(uint64_t clientId) {
-  std::lock_guard<std::mutex> l(clientsMutex_);
-  clients_.erase(clientId);
+void ProcessSpillService::StopWorkers() {
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (stopping_) {
+      return;
+    }
+    stopping_ = true;
+    for (auto& node : ready_) {
+      if (auto base = node.block.lock()) {
+        if (auto handle = std::dynamic_pointer_cast<BlockHandle>(base)) {
+          handle->ClearSpillScheduled();
+        }
+      }
+    }
+    ready_.clear();
+  }
+  cv_.notify_all();
+  for (auto& worker : workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  workers_.clear();
+  NotifyProgress();
+}
+
+void ProcessSpillService::WorkerLoop() {
+  for (;;) {
+    EvictionNode node;
+    {
+      std::unique_lock<std::mutex> l(mutex_);
+      cv_.wait(l, [&] { return stopping_ || !ready_.empty(); });
+      if (stopping_) {
+        return;
+      }
+      node = std::move(ready_.front());
+      ready_.pop_front();
+    }
+    ExecuteSpill(std::move(node));
+    NotifyProgress();
+  }
+}
+
+void ProcessSpillService::ExecuteSpill(EvictionNode node) {
+  auto base = node.block.lock();
+  if (base == nullptr) {
+    return;
+  }
+  auto handle = std::dynamic_pointer_cast<BlockHandle>(base);
+  if (handle == nullptr) {
+    return;
+  }
+  if (handle->EvictionSequence() != node.evictionSequence ||
+      handle->IsPinned()) {
+    handle->ClearSpillScheduled();
+    return;
+  }
+  try {
+    const auto bytes = handle->SpillToDisk();
+    BOLT_MEM_LOG(INFO) << "ProcessSpillService processed block "
+                       << handle->Id() << " freed=" << bytes;
+  } catch (const std::exception& e) {
+    handle->ClearSpillScheduled();
+    BOLT_MEM_LOG(WARNING)
+        << "ProcessSpillService failed to spill block " << handle->Id()
+        << ": " << e.what();
+  }
+}
+
+void ProcessSpillService::NotifyProgress() {
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    ++progressEpoch_;
+  }
+  progressCv_.notify_all();
 }
 
 void ProcessSpillService::CleanupStaleDirsAtStartup() {
   // For each configured spill dir, scan its parent for sibling
   // bolt_spill_<pid>_* directories whose pid is no longer alive and remove
   // them. Best-effort and never throws.
-  for (const auto& dir : config_.dirs) {
+  {
     std::error_code ec;
-    std::filesystem::path path(dir.path);
+    std::filesystem::path path(config_.spillDir);
     if (path.empty()) {
-      continue;
+      return;
     }
     auto parent = path.parent_path();
     if (parent.empty() || !std::filesystem::exists(parent, ec)) {
-      continue;
+      return;
     }
     for (const auto& entry :
          std::filesystem::directory_iterator(parent, ec)) {

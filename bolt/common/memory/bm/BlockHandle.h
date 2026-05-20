@@ -19,9 +19,9 @@ namespace bytedance::bolt::memory::bm {
 class BufferManager;
 
 // Internal state-machine wrapper for a BufferManager block. BlockHandle owns
-// the resident memory (or compressed/spilled representation) and tracks the
-// lifecycle a block goes through: kAllocating -> kLoaded -> {kCompressed,
-// kSpilled} and back to kLoaded on Pin reload. Multiple BufferHandle pins may
+// the resident memory (or spilled representation) and tracks the lifecycle a
+// block goes through: kAllocating -> kLoaded -> kSpilled and back to kLoaded
+// on Pin reload. Multiple BufferHandle pins may
 // reference the same BlockHandle; the block is evictable iff pinCount_ == 0.
 //
 // Threading: BlockHandle is fully thread-safe. All public methods take
@@ -42,8 +42,8 @@ class BlockHandle : public BlockHandleBase,
   // drives the eviction policy and recovery callback.
   BlockHandle(BufferManager* manager, AllocateOptions options);
 
-  // Releases any resident memory, compressed payload, and spilled file the
-  // block still owns. Marks the block invalid. Never throws.
+  // Releases any resident memory and spilled file the block still owns.
+  // Marks the block invalid. Never throws.
   ~BlockHandle();
 
   // Returns the current eviction sequence number. Each time the block's
@@ -53,13 +53,11 @@ class BlockHandle : public BlockHandleBase,
   // See design doc §7.1 and §9.1.
   uint64_t EvictionSequence() const override;
 
-  // Acquires a read pin on the block, reloading from compressed/spilled
-  // state if necessary. Returns a non-initial-write BufferHandle on success.
+  // Acquires a read pin on the block, reloading from spilled state if
+  // necessary. Returns a non-initial-write BufferHandle on success.
   //
   // Behavior by current State():
   //   kLoaded                -> increments pinCount_, returns immediately.
-  //   kCompressed            -> decompresses into a fresh BufferPool
-  //                              reservation, transitions to kLoaded.
   //   kSpilled               -> reads back from SpillStore via the
   //                              registered recovery path.
   //   kAllocating / kInvalid -> throws BoltUserError.
@@ -79,23 +77,25 @@ class BlockHandle : public BlockHandleBase,
   // surface as BoltUserError.
   ByteCount TryEvict(ByteCount targetBytes);
 
-  // Compresses an in-memory kCompressThenSpill block into 'compressed_',
-  // releasing the live BlockBuffer reservation. Returns the bytes released
-  // (resident_size - compressed_size, never negative). No-op if the block
-  // is pinned, already kCompressed, or not under kCompressThenSpill.
-  ByteCount CompressInPlace();
-
   // Writes the immutable block to spill storage and frees resident memory
-  // and any compressed payload. Returns the bytes released (i.e. the
-  // resident size that disappeared from the BufferPool). Bumps
-  // evictionSequence_. Throws on I/O failure with the block restored to
-  // its pre-spill state (kLoaded or kCompressed).
+  // Returns the bytes released (i.e. the resident size that disappeared from
+  // the BufferPool). Bumps evictionSequence_. Throws on I/O failure with the
+  // block restored to kLoaded.
   ByteCount SpillToDisk();
 
   // Marks the block kInvalid and releases its accounted memory and spill
   // file. Used by BufferManager during shutdown so dangling BufferHandle
   // pins observe predictable failures rather than a use-after-free.
   void InvalidateForManagerDestruction() noexcept;
+
+  // Marks a spill-policy block as already submitted to async spill.
+  // Returns false when the candidate is stale, pinned, already
+  // scheduled, or not in a spillable resident state.
+  bool TryMarkSpillScheduled(uint64_t expectedSequence);
+
+  // Clears the async-scheduled marker after a service rejection, worker skip,
+  // or completed spill attempt.
+  void ClearSpillScheduled() noexcept;
 
   // Returns the current state in the lifecycle state machine.
   BlockState State() const;
@@ -136,8 +136,7 @@ class BlockHandle : public BlockHandleBase,
   void Unpin(bool initialWrite) noexcept;
 
   // Returns immutable bytes for the current resident representation.
-  // Caller MUST hold mutex_. Throws BoltUserError if the block is not in
-  // a state with resident bytes (kCompressed/kSpilled/kInvalid).
+  // Caller MUST hold mutex_. Throws BoltUserError if the block is not loaded.
   ConstDataPtr DataLocked() const;
 
   // Returns mutable bytes for the initial-write handle while the block is
@@ -152,10 +151,6 @@ class BlockHandle : public BlockHandleBase,
   std::condition_variable cv_;
   BlockState state_{BlockState::kInvalid};
   std::unique_ptr<AccountedMemory> memory_;
-  // Sole owner of compressed bytes when state_ == kCompressed. The compressed
-  // payload is a private representation (currently a passthrough copy) and is
-  // accounted as kNormal in BufferPool just like memory_.
-  std::unique_ptr<AccountedMemory> compressed_;
   SpillLocation spillLocation_;
   ByteCount size_{0};
   uint32_t pinCount_{0};
@@ -170,6 +165,7 @@ class BlockHandle : public BlockHandleBase,
   // changes (e.g. spill failure restoring kLoaded). Stale EvictionNode entries
   // referencing an older value must be skipped by the Evictor.
   uint64_t evictionSequence_{0};
+  bool spillScheduled_{false};
 };
 
 } // namespace bytedance::bolt::memory::bm

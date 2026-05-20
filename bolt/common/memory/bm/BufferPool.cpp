@@ -6,21 +6,12 @@
 #include "bolt/common/memory/bm/BufferPool.h"
 
 #include <algorithm>
-#include <limits>
-
-#include <fmt/format.h>
 
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/memory/Memory.h"
 
 namespace bytedance::bolt::memory::bm {
 namespace {
-
-constexpr ByteCount kUnlimited = std::numeric_limits<int64_t>::max();
-
-ByteCount normalizedLimit(ByteCount value) {
-  return value == 0 ? kUnlimited : value;
-}
 
 size_t tagIndex(MemoryTag tag) {
   return static_cast<size_t>(tag);
@@ -88,12 +79,7 @@ void BufferPoolReservation::Reset() noexcept {
   bytes_ = 0;
 }
 
-BufferPool::BufferPool(BufferManagerConfig config)
-    : memoryLimitBytes_(normalizedLimit(config.memoryLimitBytes)),
-      pinnedLimitBytes_(
-          config.pinnedLimitBytes == 0 ? normalizedLimit(config.memoryLimitBytes)
-                                       : config.pinnedLimitBytes),
-      emergencyScratchBytes_(config.emergencyScratchBytes) {}
+BufferPool::BufferPool(BufferManagerConfig /*config*/) {}
 
 BufferPoolReservation BufferPool::Reserve(
     MemoryTag tag,
@@ -106,38 +92,13 @@ BufferPoolReservation BufferPool::Reserve(
 
   {
     std::lock_guard<std::mutex> l(mutex_);
-    if (TryReserveLocked(tag, bytes, kind)) {
-      BOLT_MEM_LOG(INFO) << "BufferManager reserve fast path bytes=" << bytes
-                         << " tag=" << ToString(tag)
-                         << " kind=" << ToString(kind)
-                         << " used=" << usedTotalBytes_;
-      return BufferPoolReservation(this, tag, bytes, kind);
-    }
-  }
-
-  ReclaimFn reclaim;
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    reclaim = reclaim_;
-  }
-  if (reclaim != nullptr && kind != ReservationKind::kScratchEmergency) {
-    reclaim(bytes);
-  }
-
-  std::lock_guard<std::mutex> l(mutex_);
-  if (TryReserveLocked(tag, bytes, kind)) {
-    BOLT_MEM_LOG(INFO) << "BufferManager reserve slow path bytes=" << bytes
+    ReserveLocked(tag, bytes, kind);
+    BOLT_MEM_LOG(INFO) << "BufferManager reserve bytes=" << bytes
                        << " tag=" << ToString(tag)
                        << " kind=" << ToString(kind)
                        << " used=" << usedTotalBytes_;
-    return BufferPoolReservation(this, tag, bytes, kind);
   }
-  BOLT_MEM_ALLOC_ERROR(fmt::format(
-      "BufferManager reservation failed: request {} bytes, used {} bytes, "
-      "limit {} bytes",
-      bytes,
-      usedTotalBytes_,
-      memoryLimitBytes_));
+  return BufferPoolReservation(this, tag, bytes, kind);
 }
 
 void BufferPool::Release(
@@ -157,21 +118,11 @@ void BufferPool::Release(
 
 BufferPoolSnapshot BufferPool::Snapshot() const {
   std::lock_guard<std::mutex> l(mutex_);
-  const auto operatorLimit =
-      memoryLimitBytes_ > emergencyScratchBytes_
-          ? memoryLimitBytes_ - emergencyScratchBytes_
-          : 0;
   BufferPoolSnapshot snapshot;
-  snapshot.memoryLimitBytes = memoryLimitBytes_;
-  snapshot.operatorMemoryLimitBytes = operatorLimit;
-  snapshot.pinnedLimitBytes = pinnedLimitBytes_;
   snapshot.usedTotalBytes = usedTotalBytes_;
   snapshot.usedPinnedBytes = usedPinnedBytes_;
   snapshot.usedScratchBytes = usedScratchBytes_;
   snapshot.usedEmergencyScratchBytes = usedEmergencyScratchBytes_;
-  snapshot.emergencyScratchBytes = emergencyScratchBytes_;
-  snapshot.availableForOperators =
-      operatorLimit > usedTotalBytes_ ? operatorLimit - usedTotalBytes_ : 0;
   return snapshot;
 }
 
@@ -186,38 +137,10 @@ ByteCount BufferPool::GetMemoryUsage(MemoryTag tag) const {
   return usedByTag_[tagIndex(tag)];
 }
 
-ByteCount BufferPool::MemoryLimit() const {
-  return memoryLimitBytes_;
-}
-
-void BufferPool::SetReclaimer(ReclaimFn reclaim) {
-  std::lock_guard<std::mutex> l(mutex_);
-  reclaim_ = std::move(reclaim);
-}
-
-bool BufferPool::TryReserveLocked(
+void BufferPool::ReserveLocked(
     MemoryTag tag,
     ByteCount bytes,
     ReservationKind kind) {
-  if (kind == ReservationKind::kPinned &&
-      (usedPinnedBytes_ > pinnedLimitBytes_ ||
-       bytes > pinnedLimitBytes_ - usedPinnedBytes_)) {
-    return false;
-  }
-  if (kind == ReservationKind::kScratchEmergency &&
-      (emergencyScratchBytes_ == 0 ||
-       usedEmergencyScratchBytes_ > emergencyScratchBytes_ ||
-       bytes > emergencyScratchBytes_ - usedEmergencyScratchBytes_)) {
-    return false;
-  }
-  const auto limit = kind == ReservationKind::kScratchEmergency
-      ? memoryLimitBytes_
-      : (memoryLimitBytes_ > emergencyScratchBytes_
-             ? memoryLimitBytes_ - emergencyScratchBytes_
-             : memoryLimitBytes_);
-  if (usedTotalBytes_ > limit || bytes > limit - usedTotalBytes_) {
-    return false;
-  }
   usedTotalBytes_ += bytes;
   usedByTag_[tagIndex(tag)] += bytes;
   if (kind == ReservationKind::kPinned) {
@@ -230,7 +153,6 @@ bool BufferPool::TryReserveLocked(
   if (kind == ReservationKind::kScratchEmergency) {
     usedEmergencyScratchBytes_ += bytes;
   }
-  return true;
 }
 
 void BufferPool::ReleaseLocked(

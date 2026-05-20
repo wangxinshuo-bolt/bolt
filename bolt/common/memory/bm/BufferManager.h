@@ -16,7 +16,6 @@
 #include "bolt/common/memory/bm/BufferPool.h"
 #include "bolt/common/memory/bm/Evictor.h"
 #include "bolt/common/memory/bm/ProcessSpillService.h"
-#include "bolt/common/memory/bm/TemporaryMemoryManager.h"
 
 namespace bytedance::bolt::memory {
 class MemoryManager;
@@ -25,14 +24,11 @@ class MemoryReclaimer;
 
 namespace bytedance::bolt::memory::bm {
 
-// Top-level entry point for BufferManager. One BufferManager corresponds to
-// one tenant (a single SQL session, query, or other unit that should be
-// charged together). It owns:
+// Top-level entry point for BufferManager. It owns:
 //   * a dedicated subtree of Bolt's MemoryPool for physical bytes
-//   * a BufferPool that tracks logical quota
+//   * a BufferPool that tracks logical usage
 //   * a BufferAllocator pairing the two
-//   * a BlockEvictor wired to the per-tenant SpillClient
-//   * a TemporaryMemoryManager for advisory operator budgets
+//   * a BlockEvictor wired to the process-wide spill service when needed
 //
 // All lookups (Allocate / Pin / Reclaim / Snapshot) are thread-safe.
 // BufferManager must outlive every BufferHandle and BlockHandle it produces;
@@ -41,16 +37,12 @@ namespace bytedance::bolt::memory::bm {
 class BufferManager {
  public:
   // Creates a BufferManager backed by a dedicated Bolt MemoryPool subtree.
-  // The constructor:
-  //   * registers the pool subtree under 'memoryManager'
-  //   * registers a SpillClient against ProcessSpillService::Instance()
-  //     unless config.spillClient.enableSpill is false
-  //   * installs the slow-path reclaimer on BufferPool
+  // The constructor registers the pool subtree under 'memoryManager'.
   // Throws BoltUserError on invalid config (see BufferManagerConfig docs).
   BufferManager(MemoryManager& memoryManager, BufferManagerConfig config);
 
-  // Stops background work, invalidates live blocks, releases the SpillClient,
-  // and tears down owned pools. After the destructor returns, any still-live
+  // Stops background work, invalidates live blocks, and tears down owned
+  // pools. After the destructor returns, any still-live
   // BufferHandle observes an invalidated block (operations throw rather than
   // crash). Never throws.
   ~BufferManager();
@@ -58,7 +50,6 @@ class BufferManager {
   // Allocates a new mutable block of size options.size and returns the
   // initial-write pin. The caller must populate the bytes through
   // BufferHandle::MutableData and then drop the handle to seal the block.
-  // Throws BoltMemAllocError on quota exhaustion (after running reclaim).
   // Throws BoltUserError on out-of-range tag or bytes.
   BufferHandle Allocate(AllocateOptions options);
 
@@ -78,7 +69,7 @@ class BufferManager {
   BufferHandle Pin(const std::shared_ptr<BlockHandle>& block);
 
   // Allocates raw accounted memory for callers that do not need block-handle
-  // semantics (e.g. operator scratch). Charges quota under (tag, kind),
+  // semantics (e.g. operator scratch). Records usage under (tag, kind),
   // allocates physical bytes from the BufferManager's MemoryPool, and
   // returns an RAII wrapper that releases both on destruction.
   std::unique_ptr<AccountedMemory> AllocateMemory(
@@ -86,10 +77,9 @@ class BufferManager {
       ByteCount bytes,
       ReservationKind kind = ReservationKind::kNormal);
 
-  // Reserves logical BufferPool quota without allocating physical bytes.
+  // Reserves logical BufferPool usage without allocating physical bytes.
   // Useful when callers want to reserve up front, then materialize bytes
-  // later through Bolt's MemoryPool. See BufferPool::Reserve for the
-  // throwing/reclaim contract.
+  // later through Bolt's MemoryPool.
   BufferPoolReservation ReserveMemory(
       MemoryTag tag,
       ByteCount bytes,
@@ -124,22 +114,10 @@ class BufferManager {
     return allocator_;
   }
 
-  // Exposes the per-tenant SpillClient view used by BlockHandle for spill
-  // and reload I/O. Returns nullptr when spilling is disabled
-  // (config.spillClient.enableSpill==false).
-  const std::shared_ptr<SpillClient>& Spill() const {
-    return spillClient_;
-  }
-
-  // Returns the advisory temporary memory budget manager. Operators call
-  // TemporaryMemory().Register(...) to obtain reservation guidance.
-  TemporaryMemoryManager& TemporaryMemory() {
-    return tempMemoryManager_;
-  }
-
-  // Compatibility alias for TemporaryMemory().
-  TemporaryMemoryManager& TempMemory() {
-    return tempMemoryManager_;
+  // Exposes the process-wide spill service used by BlockHandle for spill and
+  // reload I/O. Returns nullptr until a spill policy allocation wires it.
+  ProcessSpillService* Spill() const {
+    return spillService_;
   }
 
   // Exposes the eviction queue (design doc §7) for diagnostics and tests.
@@ -172,16 +150,16 @@ class BufferManager {
   // during construction.
   std::unique_ptr<MemoryReclaimer> CreateReclaimer();
 
+  void EnsureSpillService();
+
   MemoryManager& memoryManager_;
   BufferManagerConfig config_;
   std::shared_ptr<MemoryPool> rootPool_;
   std::shared_ptr<MemoryPool> leafPool_;
   BufferPool pool_;
   BufferAllocator allocator_;
-  // Null when SpillClientConfig::enableSpill is false.
-  std::shared_ptr<SpillClient> spillClient_;
+  ProcessSpillService* spillService_{nullptr};
   BlockEvictor evictor_;
-  TemporaryMemoryManager tempMemoryManager_;
   mutable std::mutex mutex_;
   bool shuttingDown_{false};
   std::vector<std::weak_ptr<BlockHandle>> blocks_;

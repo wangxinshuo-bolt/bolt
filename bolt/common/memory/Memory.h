@@ -210,9 +210,6 @@ class MemoryManager {
     /// behavior unchanged.
     bool enableBufferManager{false};
 
-    /// Capacity in bytes of the optional BufferManager root pool. 0 means use
-    /// the memory manager's allocator capacity.
-    int64_t bufferManagerCapacity{0};
   };
 
   explicit MemoryManager(const Options& options = Options{});

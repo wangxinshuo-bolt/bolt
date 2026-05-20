@@ -36,18 +36,11 @@ enum class MemoryTag : uint8_t {
   kNumTags,
 };
 
-// Reservation class observed by BufferPool when granting quota.
-//   kNormal           – default body memory; counted against
-//                       (memoryLimit - emergencyScratch).
-//   kPinned           – memory that may never be evicted; additionally counted
-//                       against pinnedLimit and rejected when it would push
-//                       the pinned counter past pinnedLimit.
-//   kScratch          – short-lived workspace bytes; counted into the scratch
-//                       counter and the same shared (memoryLimit -
-//                       emergencyScratch) pool as kNormal.
-//   kScratchEmergency – may dip into the reserved emergency headroom; the
-//                       slow-path reclaimer is intentionally NOT triggered
-//                       for this kind so it can succeed during reclaim.
+// Reservation class observed by BufferPool for usage accounting.
+//   kNormal           – default body memory.
+//   kPinned           – memory that may never be evicted.
+//   kScratch          – short-lived workspace bytes.
+//   kScratchEmergency – scratch used by reclaim/spill paths.
 enum class ReservationKind : uint8_t {
   kNormal,
   kPinned,
@@ -57,21 +50,18 @@ enum class ReservationKind : uint8_t {
 
 // Per-block externalization strategy selected at Allocate() time:
 //   kSpillToDisk        – evictable: body bytes are written through
-//                         SpillClient and reloaded on Pin().
+//                         ProcessSpillService and reloaded on Pin().
 //   kDiscard            – evictable: body bytes are dropped permanently;
 //                         further Pin() returns an invalid BufferHandle.
 //   kRecompute          – evictable: body bytes are dropped and reproduced
 //                         on next Pin() via AllocateOptions::recoveryFn
 //                         (recoveryFn must be non-null).
-//   kCompressThenSpill  – two-stage evictable: compress in place first,
-//                         spill the compressed payload later.
 //   kPinnedForever      – never evictable; never enters the eviction queue;
 //                         body bytes are accounted as kPinned.
 enum class EvictPolicy : uint8_t {
   kSpillToDisk,
   kDiscard,
   kRecompute,
-  kCompressThenSpill,
   kPinnedForever,
 };
 
@@ -92,7 +82,7 @@ const char* ToString(MemoryTag tag);
 // "pinned", "scratch", "scratch_emergency"). Never throws.
 const char* ToString(ReservationKind kind);
 // Returns a stable lower-case debug string for 'policy' (e.g. "spill_to_disk",
-// "discard", "recompute", "compress_then_spill", "pinned_forever").
+// "discard", "recompute", "pinned_forever").
 const char* ToString(EvictPolicy policy);
 
 // Maps a block eviction policy to the reservation kind used for its body
@@ -100,10 +90,9 @@ const char* ToString(EvictPolicy policy);
 // kNormal.
 ReservationKind BodyReservationKind(EvictPolicy policy);
 
-// Returns true iff 'policy' can externalize block bytes to spill storage,
-// i.e. kSpillToDisk or kCompressThenSpill. Pure function; matches the set
-// of policies that BufferManager rejects when SpillClientConfig::enableSpill
-// is false.
+// Returns true iff 'policy' can externalize block bytes to spill storage.
+// Pure function; matches the set of policies that require
+// ProcessSpillService to be configured.
 bool IsSpillPolicy(EvictPolicy policy);
 
 } // namespace bytedance::bolt::memory::bm

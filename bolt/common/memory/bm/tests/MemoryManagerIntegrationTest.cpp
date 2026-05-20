@@ -13,7 +13,6 @@ namespace bytedance::bolt::memory::bm {
 TEST(MemoryManagerIntegrationTest, ownsOptionalBufferManager) {
   memory::MemoryManager::Options options;
   options.enableBufferManager = true;
-  options.bufferManagerCapacity = 1 << 20;
   memory::MemoryManager memoryManager(options);
 
   ASSERT_NE(memoryManager.bufferManager(), nullptr);

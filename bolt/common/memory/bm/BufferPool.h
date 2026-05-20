@@ -113,46 +113,20 @@ class QuotaSink {
       ReservationKind kind) noexcept = 0;
 };
 
-// Logical quota pool used by BufferManager. BufferPool tracks how many bytes
-// have been charged under each MemoryTag and ReservationKind, but never owns
-// any physical memory itself. Physical allocation/free still goes through
-// AccountedMemory / BufferAllocator. The pool is thread-safe; all public
-// methods take an internal mutex and may be called from any thread.
-//
-// The pool enforces three independent limits:
-//   * memoryLimitBytes -- total bytes across all kinds and tags
-//   * pinnedLimitBytes -- additional cap on ReservationKind::kPinned
-//   * emergencyScratchBytes -- a reserved tail of memoryLimitBytes that only
-//     ReservationKind::kScratchEmergency may draw from. Non-emergency
-//     reservations effectively see (memoryLimitBytes - emergencyScratchBytes).
-//
-// On the slow path Reserve() invokes the registered ReclaimFn (set by
-// BufferManager) to try to free bytes via eviction/spill, then retries once.
-// kScratchEmergency requests skip reclaim because they exist precisely for the
-// reclaim path itself.
+// Usage accounting pool used by BufferManager. BufferPool tracks how many
+// bytes have been charged under each MemoryTag and ReservationKind, but never
+// owns physical memory and never enforces quota. Physical allocation/free
+// still goes through AccountedMemory / BufferAllocator. The pool is
+// thread-safe; all public methods take an internal mutex.
 class BufferPool : public QuotaSink {
  public:
-  // Reclaim callback installed by BufferManager. Called on slow-path Reserve
-  // when usage would exceed a limit. Must attempt to free at least
-  // 'targetBytes' synchronously and return the actual bytes freed (may be 0).
-  // Implementations are forbidden from calling back into BufferPool::Reserve.
-  using ReclaimFn = std::function<ByteCount(ByteCount targetBytes)>;
-
-  // Creates a logical quota pool from BufferManager configuration limits.
-  // memoryLimitBytes==0 in the config is interpreted as "unlimited"
-  // (int64 max). pinnedLimitBytes==0 falls back to memoryLimitBytes.
-  // No reclaimer is installed; call SetReclaimer() afterwards.
-  explicit BufferPool(BufferManagerConfig config);
+  explicit BufferPool(BufferManagerConfig config = {});
 
   // Reserves logical quota for 'bytes' under (tag, kind). On success returns
   // a non-empty BufferPoolReservation that releases the charge on destruction
   // or Reset(). bytes==0 succeeds without charging anything but still returns
   // a handle bound to this pool. tag must be < MemoryTag::kNumTags.
   //
-  // Fast path: try to reserve under the lock, succeed and return.
-  // Slow path: drop the lock, invoke the reclaimer (if any and kind !=
-  //   kScratchEmergency), reacquire the lock, retry exactly once. If the
-  //   retry still cannot satisfy the request, throws BoltMemAllocError.
   // Throws BoltUserError if tag is out of range.
   BufferPoolReservation Reserve(
       MemoryTag tag,
@@ -169,8 +143,8 @@ class BufferPool : public QuotaSink {
       ReservationKind kind) noexcept override;
 
   // Returns a consistent point-in-time snapshot of all counters. Intended for
-  // diagnostics, metrics, and the TemporaryMemoryManager budgeting math. The
-  // snapshot satisfies the invariants documented on BufferPoolSnapshot.
+  // diagnostics and metrics. The snapshot satisfies the invariants documented
+  // on BufferPoolSnapshot.
   BufferPoolSnapshot Snapshot() const;
 
   // Returns total logical bytes currently charged across all tags/kinds.
@@ -181,29 +155,16 @@ class BufferPool : public QuotaSink {
   // ReservationKinds). Throws BoltUserError if tag is out of range.
   ByteCount GetMemoryUsage(MemoryTag tag) const;
 
-  // Returns the configured logical memory limit. If the configuration set
-  // memoryLimitBytes==0 (unlimited), this returns int64 max.
-  ByteCount MemoryLimit() const;
-
-  // Installs the slow-path reclaim callback. May be called multiple times;
-  // the latest callback wins. Pass an empty std::function to disable
-  // reclaim (the slow path then becomes "retry once and fail").
-  void SetReclaimer(ReclaimFn reclaim);
-
  private:
-  bool TryReserveLocked(MemoryTag tag, ByteCount bytes, ReservationKind kind);
+  void ReserveLocked(MemoryTag tag, ByteCount bytes, ReservationKind kind);
   void ReleaseLocked(MemoryTag tag, ByteCount bytes, ReservationKind kind);
 
-  const ByteCount memoryLimitBytes_;
-  const ByteCount pinnedLimitBytes_;
-  const ByteCount emergencyScratchBytes_;
   mutable std::mutex mutex_;
   ByteCount usedTotalBytes_{0};
   ByteCount usedPinnedBytes_{0};
   ByteCount usedScratchBytes_{0};
   ByteCount usedEmergencyScratchBytes_{0};
   std::array<ByteCount, static_cast<size_t>(MemoryTag::kNumTags)> usedByTag_{};
-  ReclaimFn reclaim_;
 };
 
 // RAII wrapper that pairs a BufferPoolReservation (logical quota) with a
@@ -298,9 +259,7 @@ class BufferAllocator {
       ByteCount bytes);
 
   // Shortcut for Allocate(tag, bytes, ReservationKind::kScratchEmergency).
-  // Draws from the configured emergency-scratch headroom and bypasses the
-  // reclaimer. Use only from spill/eviction paths to avoid recursive reclaim.
-  // Throws BoltMemAllocError if emergencyScratchBytes is exhausted (or zero).
+  // Counts as emergency scratch for observability only.
   std::unique_ptr<AccountedMemory> AllocateEmergencyScratch(
       MemoryTag tag,
       ByteCount bytes);

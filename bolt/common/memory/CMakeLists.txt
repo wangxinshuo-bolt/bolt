@@ -50,10 +50,15 @@ bolt_add_library(
   bm/BufferPool.cpp
   bm/DiskIo.cpp
   bm/DiskProbe.cpp
+  bm/EvictionTypes.cpp
   bm/Evictor.cpp
+  bm/MemoryTypes.cpp
+  bm/Metrics.cpp
   bm/ProcessSpillService.cpp
+  bm/SmallSpillAllocator.cpp
+  bm/SpillCompression.cpp
   bm/SpillStore.cpp
-  bm/Types.cpp
+  bm/SpillTypes.cpp
   MemoryPool.cpp
   MemoryPoolForGluten.cpp
   MemoryUtils.cpp

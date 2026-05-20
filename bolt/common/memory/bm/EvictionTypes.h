@@ -43,7 +43,7 @@ enum class BlockState : uint8_t {
   kEvictedRecomputable,
 };
 
-// Outcome of a single eviction attempt as defined in design doc §4.
+// Outcome of a single eviction attempt.
 //   kFreed         memory was actually released back to BufferPool; freedBytes
 //                  is the number of bytes the caller may treat as reclaimed.
 //   kScheduled     spill submitted to the spill service; freedBytes is 0
@@ -85,11 +85,10 @@ class BlockHandleBase {
   virtual uint64_t EvictionSequence() const = 0;
 };
 
-// Append-only candidate placed on the eviction queue (design doc §7.1).
-// Stale nodes are tolerated: async spill re-validates evictionSequence
-// before acting on a node, so a slot may safely be re-enqueued without
-// purging earlier entries. Callers are expected to populate every field
-// before Enqueue:
+// Append-only candidate placed on the eviction queue. Stale nodes are
+// tolerated: async spill re-validates evictionSequence before acting on a
+// node, so a slot may safely be re-enqueued without purging earlier entries.
+// Callers are expected to populate every field before Enqueue:
 //   block            – weak ref to the candidate block
 //   evictionSequence – snapshot of block->EvictionSequence() at enqueue time
 //   cost             – EvictionCostFor(policy, state) at enqueue time

@@ -9,7 +9,7 @@
 #include <cstdint>
 #include <string>
 
-#include "bolt/common/memory/bm/Types.h"
+#include "bolt/common/memory/bm/SpillTypes.h"
 
 namespace bytedance::bolt::memory::bm {
 

@@ -25,7 +25,8 @@ TEST(BlockHandleTest, blockSealPinAndDiscardReclaim) {
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
                       .size = 128,
-                      .policy = EvictPolicy::kDiscard});
+                      .policy = EvictPolicy::kDiscard,
+                      .recoveryFn = nullptr});
   std::memset(handle.MutableData(), 7, handle.Size());
   auto block = handle.Block();
   handle = BufferHandle();
@@ -52,7 +53,8 @@ TEST(BlockHandleTest, discardReclaimReturnsActualFreedBytes) {
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kScanCache,
                       .size = 256,
-                      .policy = EvictPolicy::kDiscard},
+                      .policy = EvictPolicy::kDiscard,
+                      .recoveryFn = nullptr},
       [](DataPtr data, ByteCount bytes) { std::memset(data, 7, bytes); });
 
   ASSERT_EQ(manager.Reclaim(128), 256);
@@ -95,7 +97,8 @@ TEST(BlockHandleTest, pinnedHandlePreventsDiscardReclaim) {
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
                       .size = 128,
-                      .policy = EvictPolicy::kDiscard});
+                      .policy = EvictPolicy::kDiscard,
+                      .recoveryFn = nullptr});
   auto block = handle.Block();
 
   ASSERT_TRUE(block->IsPinned());
@@ -113,7 +116,8 @@ TEST(BlockHandleTest, pinnedForeverBlockIsNeverReclaimed) {
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kInternal,
                       .size = 256,
-                      .policy = EvictPolicy::kPinnedForever},
+                      .policy = EvictPolicy::kPinnedForever,
+                      .recoveryFn = nullptr},
       [](DataPtr data, ByteCount bytes) { std::memset(data, 3, bytes); });
 
   ASSERT_FALSE(block->IsPinned());
@@ -122,10 +126,9 @@ TEST(BlockHandleTest, pinnedForeverBlockIsNeverReclaimed) {
   ASSERT_EQ(block->State(), BlockState::kLoaded);
 }
 
-// Per design doc §8.6 / §19.2: a single failed reload must propagate the same
-// error to all concurrent waiters instead of letting each thread retry on its
-// own (thundering herd). This drives recoveryFn to throw exactly once and then
-// counts how many times it actually ran.
+// A failed reload must propagate the same error to concurrent waiters instead
+// of letting each thread run its own retry. This drives recoveryFn to throw
+// exactly once and then counts how many times it actually ran.
 TEST(BlockHandleTest, reloadFailurePropagatesAndDoesNotThunder) {
   memory::MemoryManager memoryManager;
   BufferManager manager(
@@ -177,9 +180,9 @@ TEST(BlockHandleTest, reloadFailurePropagatesAndDoesNotThunder) {
   EXPECT_GT(failures.load(), 0);
 }
 
-// Per design doc §14.3: BufferManager destruction must wake any in-flight
-// SpillToDisk worker without dereferencing the torn-down manager_. This races
-// the destructor with a manual SpillToDisk and asserts there is no crash.
+// BufferManager destruction must wake any in-flight SpillToDisk worker without
+// dereferencing the torn-down manager_. This races the destructor with a
+// manual SpillToDisk and asserts there is no crash.
 TEST(BlockHandleTest, destroyManagerDuringSpillDoesNotCrash) {
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
@@ -190,7 +193,8 @@ TEST(BlockHandleTest, destroyManagerDuringSpillDoesNotCrash) {
   auto block = bm->AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,
                       .size = 1 << 16,
-                      .policy = EvictPolicy::kSpillToDisk},
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
       [](DataPtr p, ByteCount n) { std::memset(p, 7, n); });
 
   std::thread t([block] { (void)block->SpillToDisk(); });

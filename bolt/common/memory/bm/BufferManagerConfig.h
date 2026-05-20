@@ -21,8 +21,6 @@ namespace bytedance::bolt::memory::bm {
 struct BufferPoolSnapshot {
   ByteCount usedTotalBytes{0};
   ByteCount usedPinnedBytes{0};
-  ByteCount usedScratchBytes{0};
-  ByteCount usedEmergencyScratchBytes{0};
   ByteCount usedLoadedBytes{0};
   ByteCount usedSpilledBytes{0};
 };

@@ -12,15 +12,15 @@
 #include <memory>
 #include <mutex>
 
-#include "bolt/common/memory/bm/Types.h"
+#include "bolt/common/memory/bm/EvictionTypes.h"
 
 namespace bytedance::bolt::memory::bm {
 
 class BlockHandle;
 class BufferManager;
 
-// Eviction queue interface (design doc §7.3). BufferPool's slow-path
-// reclaimer pops candidates from this object and feeds them through one of
+// Eviction queue interface. BufferManager's reclaimer pops candidates from
+// this object and feeds them through one of
 // the Try*Evict variants to convert pinned-but-evictable blocks into freed
 // bytes.
 //
@@ -80,16 +80,15 @@ class Evictor {
       std::chrono::milliseconds timeout) = 0;
 };
 
-// Concrete Evictor backed by per-cost / per-priority FIFO queues
-// (design doc §7.2). One process-local instance is owned by BufferManager.
-// Sync eviction is fully handled in-process; spill goes through the process
-// spill service via the SpillRequester interface.
+// Concrete Evictor backed by per-cost / per-priority FIFO queues. Sync
+// eviction is fully handled in-process; spill goes through the process spill
+// service via the SpillRequester interface.
 class BlockEvictor : public Evictor {
  public:
   // Builds an evictor without a spill requester. Call SetSpillRequester
   // before the first TryScheduleEvict / WaitForProgress invocation
-  // (design doc §11 teardown ordering). 'manager' must outlive this
-  // evictor; only used for diagnostic context, no callbacks are stored.
+  // 'manager' must outlive this evictor; only used for diagnostic context,
+  // no callbacks are stored.
   explicit BlockEvictor(BufferManager& manager);
 
   ~BlockEvictor() override = default;
@@ -129,16 +128,15 @@ class BlockEvictor : public Evictor {
   static constexpr size_t kCostClassCount = 2;
   static constexpr size_t kPriorityCount = 4;
 
-  // Validates a node against its block (design doc §9.1) and returns the
-  // locked block if it remains a valid victim. The returned shared_ptr is
-  // empty when the node should be reported as kSkipped (block destroyed,
-  // wrong concrete type, sequence mismatch, or currently pinned).
+  // Validates a node against its block and returns the locked block if it
+  // remains a valid victim. Empty means kSkipped: destroyed block, wrong
+  // concrete type, sequence mismatch, or currently pinned.
   std::shared_ptr<BlockHandle> ValidateNode(const EvictionNode& node) const;
 
   BufferManager& manager_;
   std::atomic<SpillRequester*> spillRequester_{nullptr};
   mutable std::mutex mutex_;
-  // queues_[cost][priority] FIFO buckets per design doc §7.2.
+  // FIFO buckets indexed by eviction cost and priority.
   std::deque<EvictionNode> queues_[kCostClassCount][kPriorityCount];
 };
 

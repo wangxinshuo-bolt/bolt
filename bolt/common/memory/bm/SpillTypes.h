@@ -12,11 +12,10 @@
 
 namespace bytedance::bolt::memory::bm {
 
-// Coarse storage disk classification used to select per-directory spill
-// profiles (concentration of disk-aware logic is contained in SpillStore,
-// per design doc §10.2). kUnknown only appears as an intermediate value:
-// after SpillStore construction, Disk() always returns one of the
-// concrete kinds (forced > probed > config.unknownFallbackKind).
+// Coarse storage disk classification used to select spill defaults.
+// kUnknown only appears as an intermediate value; after SpillStore
+// construction, Disk() returns a concrete kind selected from forced, probed,
+// or fallback configuration.
 enum class DiskKind : uint8_t {
   kUnknown,
   kHdd,

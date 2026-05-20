@@ -121,8 +121,6 @@ BufferPoolSnapshot BufferPool::Snapshot() const {
   BufferPoolSnapshot snapshot;
   snapshot.usedTotalBytes = usedTotalBytes_;
   snapshot.usedPinnedBytes = usedPinnedBytes_;
-  snapshot.usedScratchBytes = usedScratchBytes_;
-  snapshot.usedEmergencyScratchBytes = usedEmergencyScratchBytes_;
   return snapshot;
 }
 
@@ -146,13 +144,6 @@ void BufferPool::ReserveLocked(
   if (kind == ReservationKind::kPinned) {
     usedPinnedBytes_ += bytes;
   }
-  if (kind == ReservationKind::kScratch ||
-      kind == ReservationKind::kScratchEmergency) {
-    usedScratchBytes_ += bytes;
-  }
-  if (kind == ReservationKind::kScratchEmergency) {
-    usedEmergencyScratchBytes_ += bytes;
-  }
 }
 
 void BufferPool::ReleaseLocked(
@@ -164,14 +155,6 @@ void BufferPool::ReleaseLocked(
   tagBytes -= std::min(tagBytes, bytes);
   if (kind == ReservationKind::kPinned) {
     usedPinnedBytes_ -= std::min(usedPinnedBytes_, bytes);
-  }
-  if (kind == ReservationKind::kScratch ||
-      kind == ReservationKind::kScratchEmergency) {
-    usedScratchBytes_ -= std::min(usedScratchBytes_, bytes);
-  }
-  if (kind == ReservationKind::kScratchEmergency) {
-    usedEmergencyScratchBytes_ -=
-        std::min(usedEmergencyScratchBytes_, bytes);
   }
 }
 
@@ -219,18 +202,6 @@ std::unique_ptr<AccountedMemory> BufferAllocator::Allocate(
     ByteCount bytes,
     ReservationKind kind) {
   return AccountedMemory::Make(pool_, memoryPool_, tag, bytes, kind);
-}
-
-std::unique_ptr<AccountedMemory> BufferAllocator::AllocateScratch(
-    MemoryTag tag,
-    ByteCount bytes) {
-  return Allocate(tag, bytes, ReservationKind::kScratch);
-}
-
-std::unique_ptr<AccountedMemory> BufferAllocator::AllocateEmergencyScratch(
-    MemoryTag tag,
-    ByteCount bytes) {
-  return Allocate(tag, bytes, ReservationKind::kScratchEmergency);
 }
 
 } // namespace bytedance::bolt::memory::bm

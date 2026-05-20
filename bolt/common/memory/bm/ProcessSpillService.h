@@ -15,8 +15,9 @@
 #include <thread>
 #include <vector>
 
+#include "bolt/common/memory/bm/EvictionTypes.h"
+#include "bolt/common/memory/bm/Metrics.h"
 #include "bolt/common/memory/bm/SpillStore.h"
-#include "bolt/common/memory/bm/Types.h"
 
 namespace bytedance::bolt::memory::bm {
 
@@ -24,8 +25,8 @@ namespace bytedance::bolt::memory::bm {
 // before the first Instance() call. ConfigureDefault() must be called
 // exactly once: any subsequent call (including a re-call after
 // ResetForTesting) throws BoltUserError. Instance() also throws if no
-// ConfigureDefault has been issued, mirroring the design doc rule that
-// the service has no implicit defaults.
+// ConfigureDefault has been issued, because the service has no implicit
+// process defaults.
 struct ProcessSpillServiceConfig {
   // Single spill directory. Must be non-empty.
   std::string spillDir;

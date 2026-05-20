@@ -66,7 +66,7 @@ BufferHandle BlockHandle::Pin() {
       if (state_ == BlockState::kSpilling || state_ == BlockState::kLoading) {
         // Snapshot the generation we are observing so that, if loading fails,
         // we propagate the same error to all waiters instead of each thread
-        // spinning back into Loading themselves (per design doc §8.6).
+        // starting its own reload.
         const uint64_t observedGeneration =
             state_ == BlockState::kLoading ? loadGeneration_ : 0;
         cv_.wait(l);
@@ -209,9 +209,8 @@ ByteCount BlockHandle::SpillToDisk() {
       memory_ = std::move(spillingMemory);
       state_ = BlockState::kLoaded;
       spillScheduled_ = false;
-      // Spill failure changes candidate identity: any in-flight EvictionNode
-      // that points at this block becomes stale and must be skipped before
-      // a fresh node is enqueued (design doc §8.5, §9.2).
+      // Spill failure changes candidate identity, so in-flight EvictionNode
+      // snapshots must become stale before a fresh node is enqueued.
       ++evictionSequence_;
     }
     cv_.notify_all();

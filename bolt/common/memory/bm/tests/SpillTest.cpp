@@ -43,7 +43,8 @@ TEST(SpillTest, spillBlockCanBeReloaded) {
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
                       .size = 256,
-                      .policy = EvictPolicy::kSpillToDisk});
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr});
   std::memset(handle.MutableData(), 11, handle.Size());
   auto block = handle.Block();
   handle = BufferHandle();
@@ -68,7 +69,8 @@ TEST(SpillTest, synchronousSpillWorksWhenWorkersDisabled) {
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,
                       .size = 512,
-                      .policy = EvictPolicy::kSpillToDisk},
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
       [](DataPtr data, ByteCount bytes) { std::memset(data, 19, bytes); });
 
   ASSERT_EQ(manager.Reclaim(512), 512);
@@ -90,7 +92,8 @@ TEST(SpillTest, pinnedSpillBlockIsNotReclaimed) {
   auto handle = manager.Allocate(
       AllocateOptions{.tag = MemoryTag::kScanCache,
                       .size = 128,
-                      .policy = EvictPolicy::kSpillToDisk});
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr});
   auto block = handle.Block();
 
   ASSERT_EQ(manager.Reclaim(128), 0);
@@ -108,12 +111,14 @@ TEST(SpillTest, reclaimUsesEvictionQueueCostOrder) {
   auto spillBlock = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,
                       .size = 128,
-                      .policy = EvictPolicy::kSpillToDisk},
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
       [](DataPtr data, ByteCount bytes) { std::memset(data, 1, bytes); });
   auto discardBlock = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kScanCache,
                       .size = 64,
-                      .policy = EvictPolicy::kDiscard},
+                      .policy = EvictPolicy::kDiscard,
+                      .recoveryFn = nullptr},
       [](DataPtr data, ByteCount bytes) { std::memset(data, 2, bytes); });
 
   ASSERT_EQ(manager.Reclaim(64), 64);
@@ -132,7 +137,8 @@ TEST(SpillTest, spillCandidateIsNotSubmittedTwiceWhileScheduled) {
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,
                       .size = 128,
-                      .policy = EvictPolicy::kSpillToDisk},
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
       [](DataPtr data, ByteCount bytes) { std::memset(data, 3, bytes); });
   CountingSpillRequester requester;
   dynamic_cast<BlockEvictor&>(manager.EvictionQueue())
@@ -183,7 +189,8 @@ TEST(SpillTest, spillPoliciesUseConfiguredProcessService) {
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kHashTable,
                       .size = 1024,
-                      .policy = EvictPolicy::kSpillToDisk},
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
       [](DataPtr data, ByteCount bytes) { std::memset(data, 55, bytes); });
   ASSERT_EQ(manager.Reclaim(1024), 1024);
   ASSERT_EQ(block->State(), BlockState::kSpilled);

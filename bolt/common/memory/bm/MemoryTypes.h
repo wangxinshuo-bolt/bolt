@@ -37,15 +37,11 @@ enum class MemoryTag : uint8_t {
 };
 
 // Reservation class observed by BufferPool for usage accounting.
-//   kNormal           – default body memory.
-//   kPinned           – memory that may never be evicted.
-//   kScratch          – short-lived workspace bytes.
-//   kScratchEmergency – scratch used by reclaim/spill paths.
+//   kNormal - default body memory.
+//   kPinned - memory that may never be evicted.
 enum class ReservationKind : uint8_t {
   kNormal,
   kPinned,
-  kScratch,
-  kScratchEmergency,
 };
 
 // Per-block externalization strategy selected at Allocate() time:

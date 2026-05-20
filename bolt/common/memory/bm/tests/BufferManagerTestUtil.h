@@ -12,7 +12,6 @@
 #include <string>
 
 #include "bolt/common/memory/bm/ProcessSpillService.h"
-#include "bolt/common/memory/bm/Types.h"
 
 namespace bytedance::bolt::memory::bm::test {
 
@@ -28,8 +27,8 @@ inline std::string testSpillDir(const std::string& name) {
 // Test fixture helper: lazily install the ProcessSpillService singleton with
 // a single root directory the suite can extend per BufferManager. Subsequent
 // callers reuse the same configuration so the tests stay isolated from each
-// other but still respect the "ConfigureDefault may be called only once"
-// rule (design doc §11). Returns the root directory the suite is rooted in.
+// other while respecting the "ConfigureDefault may be called only once"
+// contract. Returns the root directory the suite is rooted in.
 inline std::string ensureTestSpillService() {
   static std::once_flag flag;
   static std::string root;

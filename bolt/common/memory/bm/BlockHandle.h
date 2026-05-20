@@ -11,7 +11,9 @@
 #include <mutex>
 
 #include "bolt/common/memory/bm/BufferHandle.h"
+#include "bolt/common/memory/bm/BufferManagerConfig.h"
 #include "bolt/common/memory/bm/BufferPool.h"
+#include "bolt/common/memory/bm/EvictionTypes.h"
 #include "bolt/common/memory/bm/SpillStore.h"
 
 namespace bytedance::bolt::memory::bm {
@@ -50,7 +52,6 @@ class BlockHandle : public BlockHandleBase,
   // identity-as-eviction-candidate changes (e.g. a spill failure restores
   // kLoaded, or a Pin reload bumps the generation) this counter is
   // incremented so that stale EvictionNode entries can be detected.
-  // See design doc §7.1 and §9.1.
   uint64_t EvictionSequence() const override;
 
   // Acquires a read pin on the block, reloading from spilled state if
@@ -161,9 +162,8 @@ class BlockHandle : public BlockHandleBase,
   // Captured exception from the most recent failed reload of loadGeneration_.
   // Cleared whenever a new load attempt succeeds or starts.
   std::exception_ptr lastLoadError_;
-  // Per design doc §7.1: incremented whenever the eviction candidate identity
-  // changes (e.g. spill failure restoring kLoaded). Stale EvictionNode entries
-  // referencing an older value must be skipped by the Evictor.
+  // Incremented whenever the eviction candidate identity changes. Stale
+  // EvictionNode entries referencing an older value must be skipped.
   uint64_t evictionSequence_{0};
   bool spillScheduled_{false};
 };

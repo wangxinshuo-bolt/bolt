@@ -35,8 +35,6 @@ void BlockEvictor::SetSpillRequester(SpillRequester* requester) {
 }
 
 void BlockEvictor::Enqueue(EvictionNode node) {
-  // kPinnedForever blocks must never enter the queue (design doc §9.3).
-  // Callers screen the policy themselves but we double-check here.
   const auto cost = costIndex(node.cost);
   const auto priority = priorityIndex(node.priority);
   if (cost >= kCostClassCount || priority >= kPriorityCount) {
@@ -48,8 +46,7 @@ void BlockEvictor::Enqueue(EvictionNode node) {
 
 bool BlockEvictor::TryPopAnyCandidate(EvictionNode& out) {
   // Cheap-first scan order: kFreeOrCheap -> kSpill, and within
-  // each cost class kLow -> kCritical (design doc §7.2). We sacrifice the
-  // cheapest, lowest-priority candidate first.
+  // each cost class kLow -> kCritical.
   std::lock_guard<std::mutex> l(mutex_);
   for (size_t cost = 0; cost < kCostClassCount; ++cost) {
     for (size_t priority = 0; priority < kPriorityCount; ++priority) {
@@ -66,7 +63,6 @@ bool BlockEvictor::TryPopAnyCandidate(EvictionNode& out) {
 
 std::shared_ptr<BlockHandle> BlockEvictor::ValidateNode(
     const EvictionNode& node) const {
-  // Design doc §9.1 validation steps.
   auto base = node.block.lock();
   if (base == nullptr) {
     return nullptr;
@@ -90,7 +86,7 @@ EvictResult BlockEvictor::TryEvictNodeSync(const EvictionNode& node) {
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
   // Sync path is reserved for cheap policies only; spill must go through
-  // TryScheduleEvict (design doc §7.4).
+  // TryScheduleEvict.
   const auto policy = block->options_.policy;
   if (policy == EvictPolicy::kPinnedForever) {
     return EvictResult{EvictResultKind::kSkipped, 0};

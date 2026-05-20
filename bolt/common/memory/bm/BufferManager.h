@@ -13,6 +13,7 @@
 
 #include "bolt/common/memory/MemoryPool.h"
 #include "bolt/common/memory/bm/BlockHandle.h"
+#include "bolt/common/memory/bm/BufferManagerConfig.h"
 #include "bolt/common/memory/bm/BufferPool.h"
 #include "bolt/common/memory/bm/Evictor.h"
 #include "bolt/common/memory/bm/ProcessSpillService.h"
@@ -120,8 +121,8 @@ class BufferManager {
     return spillService_;
   }
 
-  // Exposes the eviction queue (design doc §7) for diagnostics and tests.
-  // Production code should not enqueue directly -- BufferManager does so
+  // Exposes the eviction queue for diagnostics and tests. Production code
+  // should not enqueue directly -- BufferManager does so
   // automatically when a block becomes evictable.
   Evictor& EvictionQueue() {
     return evictor_;
@@ -134,9 +135,9 @@ class BufferManager {
   void RegisterBlock(const std::shared_ptr<BlockHandle>& block);
 
   // Pushes an EvictionNode for 'block' if its policy participates in
-  // eviction. Idempotent: stale nodes are tolerated by the queue per
-  // design doc §7.1. Called whenever a block transitions to an evictable
-  // state (sealed, unpinned, kLoaded).
+  // eviction. Idempotent: stale nodes are tolerated by the queue. Called
+  // whenever a block transitions to an evictable state (sealed, unpinned,
+  // kLoaded).
   void EnqueueEvictionCandidate(const std::shared_ptr<BlockHandle>& block);
 
   // Builds a fresh EvictionNode snapshot for 'block'. BlockHandle

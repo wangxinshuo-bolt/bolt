@@ -11,7 +11,9 @@
 #include <mutex>
 
 #include "bolt/common/memory/MemoryPool.h"
-#include "bolt/common/memory/bm/Types.h"
+#include "bolt/common/memory/bm/BufferManagerConfig.h"
+#include "bolt/common/memory/bm/MemoryTypes.h"
+#include "bolt/common/memory/bm/Metrics.h"
 
 namespace bytedance::bolt::memory::bm {
 
@@ -162,8 +164,6 @@ class BufferPool : public QuotaSink {
   mutable std::mutex mutex_;
   ByteCount usedTotalBytes_{0};
   ByteCount usedPinnedBytes_{0};
-  ByteCount usedScratchBytes_{0};
-  ByteCount usedEmergencyScratchBytes_{0};
   std::array<ByteCount, static_cast<size_t>(MemoryTag::kNumTags)> usedByTag_{};
 };
 
@@ -251,18 +251,6 @@ class BufferAllocator {
       MemoryTag tag,
       ByteCount bytes,
       ReservationKind kind = ReservationKind::kNormal);
-
-  // Shortcut for Allocate(tag, bytes, ReservationKind::kScratch). Counts
-  // toward usedScratchBytes in BufferPoolSnapshot.
-  std::unique_ptr<AccountedMemory> AllocateScratch(
-      MemoryTag tag,
-      ByteCount bytes);
-
-  // Shortcut for Allocate(tag, bytes, ReservationKind::kScratchEmergency).
-  // Counts as emergency scratch for observability only.
-  std::unique_ptr<AccountedMemory> AllocateEmergencyScratch(
-      MemoryTag tag,
-      ByteCount bytes);
 
  private:
   BufferPool& pool_;

@@ -7,7 +7,7 @@
 
 #include <memory>
 
-#include "bolt/common/memory/bm/Types.h"
+#include "bolt/common/memory/bm/MemoryTypes.h"
 
 namespace bytedance::bolt::memory::bm {
 
@@ -16,8 +16,7 @@ class BlockHandle;
 
 // RAII pin into a BlockHandle. Owning a valid BufferHandle guarantees the
 // referenced block is pinned and its bytes are accessible via Data() /
-// MutableData(). Move-only: copy would force shared pin semantics that the
-// design doc explicitly forbids (see §6.1).
+// MutableData(). Move-only so a pin has exactly one owning handle.
 //
 // Two flavors exist:
 //   * "initial write" handles -- returned by BufferManager::Allocate. They

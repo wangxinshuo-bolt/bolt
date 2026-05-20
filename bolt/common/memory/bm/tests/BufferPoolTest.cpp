@@ -56,18 +56,19 @@ TEST(BufferPoolTest, pinnedReservationIsUsageOnly) {
   ASSERT_EQ(manager.Snapshot().usedPinnedBytes, 256);
 }
 
-TEST(BufferPoolTest, snapshotTracksScratchUsage) {
+TEST(BufferPoolTest, snapshotTracksTotalAndPinnedUsage) {
   BufferPool pool(BufferManagerConfig{.poolName = "bm_snapshot"});
 
   auto normal = pool.Reserve(MemoryTag::kHashTable, 800, ReservationKind::kNormal);
   auto snapshot = pool.Snapshot();
   ASSERT_EQ(snapshot.usedTotalBytes, 800);
+  ASSERT_EQ(snapshot.usedPinnedBytes, 0);
 
-  auto emergency = pool.Reserve(
-      MemoryTag::kInternal, 64, ReservationKind::kScratchEmergency);
+  auto pinned = pool.Reserve(
+      MemoryTag::kInternal, 64, ReservationKind::kPinned);
   snapshot = pool.Snapshot();
-  ASSERT_EQ(snapshot.usedScratchBytes, 64);
-  ASSERT_EQ(snapshot.usedEmergencyScratchBytes, 64);
+  ASSERT_EQ(snapshot.usedTotalBytes, 864);
+  ASSERT_EQ(snapshot.usedPinnedBytes, 64);
 }
 
 } // namespace bytedance::bolt::memory::bm

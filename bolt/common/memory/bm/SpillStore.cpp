@@ -8,86 +8,22 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#include <algorithm>
 #include <filesystem>
 #include <memory>
 #include <utility>
 #include <vector>
 
 #include <fmt/format.h>
-#include <zstd.h>
 
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/memory/Memory.h"
+#include "bolt/common/memory/bm/SpillCompression.h"
 
 namespace bytedance::bolt::memory::bm {
 namespace {
 
 MetricsRegistry& effectiveRegistry(MetricsRegistry* metrics) {
   return metrics == nullptr ? NoOpMetricsRegistry() : *metrics;
-}
-
-SmallSpillConfig defaultSmallSpillConfig(DiskKind disk) {
-  SmallSpillConfig config;
-  config.enabled = true;
-  config.dedicatedFileThresholdBytes = 4 << 20;
-  switch (disk) {
-    case DiskKind::kNvme:
-      config.slabFileBytes = 256 << 20;
-      break;
-    case DiskKind::kSsd:
-      config.slabFileBytes = 128 << 20;
-      break;
-    case DiskKind::kHdd:
-    case DiskKind::kNetworkFs:
-    case DiskKind::kUnknown:
-      config.slabFileBytes = 64 << 20;
-      break;
-  }
-  config.sizeClasses = {
-      4 << 10,
-      8 << 10,
-      16 << 10,
-      32 << 10,
-      64 << 10,
-      128 << 10,
-      256 << 10,
-      512 << 10,
-      1 << 20,
-      2 << 20,
-      4 << 20};
-  return config;
-}
-
-SmallSpillConfig normalizeSmallSpillConfig(
-    SmallSpillConfig config,
-    DiskKind disk) {
-  auto defaults = defaultSmallSpillConfig(disk);
-  if (config.dedicatedFileThresholdBytes == 0) {
-    config.dedicatedFileThresholdBytes = defaults.dedicatedFileThresholdBytes;
-  }
-  if (config.slabFileBytes == 0) {
-    config.slabFileBytes = defaults.slabFileBytes;
-  }
-  if (config.sizeClasses.empty()) {
-    config.sizeClasses = std::move(defaults.sizeClasses);
-  }
-  std::sort(config.sizeClasses.begin(), config.sizeClasses.end());
-  config.sizeClasses.erase(
-      std::unique(config.sizeClasses.begin(), config.sizeClasses.end()),
-      config.sizeClasses.end());
-  config.sizeClasses.erase(
-      std::remove(config.sizeClasses.begin(), config.sizeClasses.end(), 0),
-      config.sizeClasses.end());
-  config.sizeClasses.erase(
-      std::remove_if(
-          config.sizeClasses.begin(),
-          config.sizeClasses.end(),
-          [&](ByteCount slotBytes) {
-            return slotBytes > config.dedicatedFileThresholdBytes;
-          }),
-      config.sizeClasses.end());
-  return config;
 }
 
 class ScopedFd {
@@ -136,9 +72,7 @@ SpillWriteSession& SpillWriteSession::operator=(
 }
 
 SpillWriteSession::~SpillWriteSession() noexcept {
-  // Per design doc §10.1, the destructor never performs I/O and never throws.
-  // Nothing to do: Write() either committed (consumed_=true) or already
-  // cleaned up its partial file via SpillStore::ForgetLiveFile.
+  // Nothing to do: Write() either committed or cleaned up partial state.
 }
 
 SpillLocation SpillWriteSession::Write(
@@ -150,18 +84,31 @@ SpillLocation SpillWriteSession::Write(
   BOLT_USER_CHECK_NOT_NULL(src, "Cannot spill a null buffer");
   consumed_ = true;
 
-  auto payload = store_->PreparePayload(src, bytes);
-  auto location = store_->AllocateSmallSlot(
-      tag, bytes, payload.storedBytes, payload.codec);
+  auto payload = PrepareSpillPayload(store_->compressionConfig_, src, bytes);
+  auto location = store_->smallAllocator_.Allocate(
+      bytes, payload.storedBytes, payload.codec, store_->disk_);
   if (!location.Valid()) {
     location = store_->AllocateDedicated(
         tag, bytes, payload.storedBytes, payload.codec);
+  } else {
+    store_->RegisterLiveFile(location.path);
+    std::lock_guard<std::mutex> l(store_->mutex_);
+    store_->liveLocations_.insert(store_->LocationKey(location));
   }
   try {
     store_->WriteToLocation(location, payload.data);
   } catch (...) {
     if (location.smallSlot) {
-      store_->RollbackSmallSlot(location);
+      const bool removeFile = store_->smallAllocator_.Rollback(location);
+      {
+        std::lock_guard<std::mutex> l(store_->mutex_);
+        store_->liveLocations_.erase(store_->LocationKey(location));
+      }
+      store_->ForgetLiveFile(location.path);
+      if (removeFile) {
+        std::error_code ec;
+        std::filesystem::remove(location.path, ec);
+      }
     } else {
       store_->ForgetLiveFile(location.path);
       std::error_code ec;
@@ -200,8 +147,8 @@ SpillStore::SpillStore(
                            TargetP95LatencyForDisk(config_.unknownFallbackKind),
                            false}
                      : config_.diskProbe),
-      smallConfig_(normalizeSmallSpillConfig(config_.smallSpill, diskProbe_.kind)),
       compressionConfig_(config_.compression),
+      smallAllocator_(config_.smallSpill, diskProbe_.kind, config_.spillDir),
       bytesWrittenCounter_(metrics_.GetCounter(
           "bm_spill_bytes_written",
           fmt::format("disk={}", ToString(diskProbe_.kind)))),
@@ -216,24 +163,14 @@ SpillStore::SpillStore(
           fmt::format("disk={}", ToString(diskProbe_.kind)))),
       disk_(diskProbe_.kind) {
   std::filesystem::create_directories(config_.spillDir);
-  if (smallConfig_.enabled) {
-    for (const auto slotBytes : smallConfig_.sizeClasses) {
-      if (slotBytes == 0 || slotBytes > smallConfig_.dedicatedFileThresholdBytes) {
-        continue;
-      }
-      smallClasses_.push_back(SmallSizeClass{
-          slotBytes,
-          std::max<ByteCount>(slotBytes, smallConfig_.slabFileBytes),
-          {}});
-    }
-  }
+  const auto& smallConfig = smallAllocator_.Config();
   BOLT_MEM_LOG(INFO) << "BufferManager SpillStore created at "
                      << config_.spillDir
                      << " disk=" << ToString(disk_)
-                     << " small_spill=" << smallConfig_.enabled
+                     << " small_spill=" << smallConfig.enabled
                      << " dedicated_threshold="
-                     << smallConfig_.dedicatedFileThresholdBytes
-                     << " slab_file_bytes=" << smallConfig_.slabFileBytes
+                     << smallConfig.dedicatedFileThresholdBytes
+                     << " slab_file_bytes=" << smallConfig.slabFileBytes
                      << " write_iops=" << diskProbe_.writeIops
                      << " read_iops=" << diskProbe_.readIops
                      << " active_probe=" << diskProbe_.activeProbeRan
@@ -333,23 +270,7 @@ void SpillStore::Read(
       readDone.result,
       location.storedBytes);
   if (location.compressionCodec == SpillCompressionCodec::kZstd) {
-    const auto decompressed = ZSTD_decompress(
-        dst,
-        static_cast<size_t>(location.logicalBytes),
-        compressed.data(),
-        static_cast<size_t>(location.storedBytes));
-    BOLT_USER_CHECK(
-        !ZSTD_isError(decompressed),
-        "Failed to decompress spill file {}: {}",
-        location.path,
-        ZSTD_getErrorName(decompressed));
-    BOLT_USER_CHECK_EQ(
-        decompressed,
-        location.logicalBytes,
-        "Decompressed spill size mismatch for {}: got {}, expected {}",
-        location.path,
-        decompressed,
-        location.logicalBytes);
+    DecompressSpillPayload(location, compressed.data(), dst);
   } else {
     BOLT_USER_CHECK_EQ(
         location.storedBytes,
@@ -376,32 +297,15 @@ void SpillStore::Release(const SpillLocation& location) {
       alreadyReleased = true;
     }
     if (live && location.smallSlot) {
-      const auto classIndex = SmallClassFor(location.slotBytes);
-      if (classIndex.has_value()) {
-        const auto slotIndex = location.offset / location.slotBytes;
-        auto& cls = smallClasses_[*classIndex];
-        for (auto& slab : cls.slabs) {
-          if (!slab.deleted && slab.path == location.path) {
-            if (slab.usedSlots > 0) {
-              --slab.usedSlots;
-            }
-            slab.freeSlots.push_back(slotIndex);
-            if (slab.usedSlots == 0) {
-              slab.deleted = true;
-              liveFiles_.erase(slab.path);
-              removeFile = true;
-            }
-            break;
-          }
-        }
+      removeFile = smallAllocator_.Release(location);
+      if (removeFile) {
+        liveFiles_.erase(location.path);
       }
     } else if (live) {
       removeFile = liveFiles_.erase(location.path) != 0;
     }
   }
   if (alreadyReleased) {
-    // Idempotent: design doc §10.3 says callers may release the same location
-    // more than once during recovery. Count it for visibility but don't throw.
     doubleReleaseCounter_.Add(1);
     BOLT_MEM_LOG(WARNING)
         << "BufferManager SpillStore double release of " << location.path;
@@ -430,8 +334,7 @@ void SpillStore::CleanupAtStartup(const SpillStoreConfig& cfg) {
   if (cfg.spillDir.empty() || !std::filesystem::exists(cfg.spillDir, ec)) {
     return;
   }
-  // Best-effort: walk the directory and remove any BufferManager-owned spill
-  // files. We never recurse into unknown subtrees (design doc §10.4).
+  // Best-effort cleanup only touches BufferManager-owned spill files.
   for (const auto& entry :
        std::filesystem::directory_iterator(cfg.spillDir, ec)) {
     if (ec) {
@@ -460,12 +363,6 @@ std::string SpillStore::MakeDedicatedPath(MemoryTag tag) {
       .string();
 }
 
-std::string SpillStore::MakeSmallSlabPath(ByteCount slotBytes) {
-  return (std::filesystem::path(config_.spillDir) /
-          fmt::format("bm_small_{}_{}.spill", slotBytes, nextSmallSlabId_++))
-      .string();
-}
-
 std::string SpillStore::LocationKey(const SpillLocation& location) const {
   return LocationKey(location.path, location.offset);
 }
@@ -474,116 +371,6 @@ std::string SpillStore::LocationKey(
     const std::string& path,
     uint64_t offset) const {
   return fmt::format("{}:{}", path, offset);
-}
-
-std::optional<size_t> SpillStore::SmallClassFor(ByteCount bytes) const {
-  if (!smallConfig_.enabled || bytes == 0 ||
-      bytes > smallConfig_.dedicatedFileThresholdBytes) {
-    return std::nullopt;
-  }
-  for (size_t i = 0; i < smallClasses_.size(); ++i) {
-    if (bytes <= smallClasses_[i].slotBytes) {
-      return i;
-    }
-  }
-  return std::nullopt;
-}
-
-SpillStore::PreparedPayload SpillStore::PreparePayload(
-    ConstDataPtr src,
-    ByteCount bytes) const {
-  PreparedPayload payload;
-  payload.data = src;
-  payload.storedBytes = bytes;
-  if (!compressionConfig_.enabled ||
-      compressionConfig_.codec != SpillCompressionCodec::kZstd ||
-      bytes < compressionConfig_.minBytes) {
-    return payload;
-  }
-
-  const auto bound = ZSTD_compressBound(static_cast<size_t>(bytes));
-  payload.compressed.resize(bound);
-  const auto compressedBytes = ZSTD_compress(
-      payload.compressed.data(),
-      payload.compressed.size(),
-      src,
-      static_cast<size_t>(bytes),
-      compressionConfig_.level);
-  if (ZSTD_isError(compressedBytes)) {
-    payload.compressed.clear();
-    return payload;
-  }
-  const auto requiredSavings =
-      static_cast<double>(bytes) * compressionConfig_.minSavingsRatio;
-  if (compressedBytes >= bytes ||
-      static_cast<double>(bytes - compressedBytes) < requiredSavings) {
-    payload.compressed.clear();
-    return payload;
-  }
-  payload.compressed.resize(compressedBytes);
-  payload.data = payload.compressed.data();
-  payload.storedBytes = compressedBytes;
-  payload.codec = SpillCompressionCodec::kZstd;
-  return payload;
-}
-
-SpillLocation SpillStore::AllocateSmallSlot(
-    MemoryTag /*tag*/,
-    ByteCount logicalBytes,
-    ByteCount storedBytes,
-    SpillCompressionCodec codec) {
-  const auto classIndex = SmallClassFor(storedBytes);
-  if (!classIndex.has_value()) {
-    return SpillLocation{};
-  }
-
-  std::lock_guard<std::mutex> l(mutex_);
-  auto& cls = smallClasses_[*classIndex];
-  SmallSlabFile* selected{nullptr};
-  uint64_t slotIndex = 0;
-  for (auto& slab : cls.slabs) {
-    if (slab.deleted) {
-      continue;
-    }
-    if (!slab.freeSlots.empty()) {
-      selected = &slab;
-      slotIndex = slab.freeSlots.front();
-      slab.freeSlots.pop_front();
-      break;
-    }
-    if (slab.nextSlot < slab.totalSlots) {
-      selected = &slab;
-      slotIndex = slab.nextSlot++;
-      break;
-    }
-  }
-  if (selected == nullptr) {
-    const auto slots =
-        std::max<uint64_t>(1, cls.slabFileBytes / cls.slotBytes);
-    cls.slabs.push_back(SmallSlabFile{
-        MakeSmallSlabPath(cls.slotBytes),
-        cls.slotBytes,
-        1,
-        0,
-        slots,
-        false,
-        {}});
-    selected = &cls.slabs.back();
-    slotIndex = 0;
-    liveFiles_.insert(selected->path);
-  }
-  ++selected->usedSlots;
-  SpillLocation location{
-      selected->path,
-      slotIndex * selected->slotBytes,
-      logicalBytes,
-      storedBytes,
-      selected->slotBytes,
-      true,
-      codec,
-      disk_};
-  liveLocations_.insert(LocationKey(location));
-  return location;
 }
 
 SpillLocation SpillStore::AllocateDedicated(
@@ -604,29 +391,6 @@ SpillLocation SpillStore::AllocateDedicated(
   std::lock_guard<std::mutex> l(mutex_);
   liveLocations_.insert(LocationKey(location));
   return location;
-}
-
-void SpillStore::RollbackSmallSlot(const SpillLocation& location) noexcept {
-  if (!location.smallSlot || location.slotBytes == 0) {
-    return;
-  }
-  std::lock_guard<std::mutex> l(mutex_);
-  liveLocations_.erase(LocationKey(location));
-  const auto classIndex = SmallClassFor(location.slotBytes);
-  if (!classIndex.has_value()) {
-    return;
-  }
-  const auto slotIndex = location.offset / location.slotBytes;
-  auto& cls = smallClasses_[*classIndex];
-  for (auto& slab : cls.slabs) {
-    if (!slab.deleted && slab.path == location.path) {
-      if (slab.usedSlots > 0) {
-        --slab.usedSlots;
-      }
-      slab.freeSlots.push_back(slotIndex);
-      return;
-    }
-  }
 }
 
 void SpillStore::WriteToLocation(

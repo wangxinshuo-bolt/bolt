@@ -267,7 +267,6 @@ void BufferManager::RegisterBlock(const std::shared_ptr<BlockHandle>& block) {
 
 void BufferManager::EnqueueEvictionCandidate(
     const std::shared_ptr<BlockHandle>& block) {
-  // kPinnedForever blocks never enter the queue (design doc §9.3).
   if (block == nullptr || block->options_.policy == EvictPolicy::kPinnedForever) {
     return;
   }

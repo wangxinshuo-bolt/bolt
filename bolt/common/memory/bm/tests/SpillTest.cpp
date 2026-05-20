@@ -31,6 +31,15 @@ class CountingSpillRequester final : public SpillRequester {
   int submitCount{0};
 };
 
+class FakeBlockHandleBase final : public BlockHandleBase {
+ public:
+  uint64_t EvictionSequence() const override {
+    return sequence;
+  }
+
+  uint64_t sequence{0};
+};
+
 } // namespace
 
 TEST(SpillTest, spillBlockCanBeReloaded) {
@@ -80,6 +89,31 @@ TEST(SpillTest, synchronousSpillWorksWhenWorkersDisabled) {
   auto pinned = manager.Pin(block);
   ASSERT_TRUE(pinned.IsValid());
   ASSERT_EQ(pinned.Data()[0], 19);
+}
+
+TEST(SpillTest, snapshotTracksLoadedAndSpilledBytes) {
+  test::ensureTestSpillService();
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_snapshot_loaded_spilled"});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 512,
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 77, bytes); });
+
+  auto snapshot = manager.Snapshot();
+  EXPECT_EQ(snapshot.usedLoadedBytes, 512);
+  EXPECT_EQ(snapshot.usedSpilledBytes, 0);
+
+  ASSERT_EQ(manager.Reclaim(512), 512);
+  snapshot = manager.Snapshot();
+  EXPECT_EQ(snapshot.usedLoadedBytes, 0);
+  EXPECT_EQ(snapshot.usedSpilledBytes, 512);
+  EXPECT_EQ(block->State(), BlockState::kSpilled);
 }
 
 TEST(SpillTest, pinnedSpillBlockIsNotReclaimed) {
@@ -177,6 +211,39 @@ TEST(SpillTest, spillLocationReleaseUsesSingleStore) {
   service->Release(location);
   ASSERT_FALSE(std::filesystem::exists(location.path));
   ASSERT_EQ(service->UsedDiskBytes(), 0);
+}
+
+TEST(SpillTest, processSpillServiceRecordsSubmitBackpressureMetrics) {
+  auto root = std::filesystem::temp_directory_path() /
+      "bolt_bm_test_process_spill_metrics";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+
+  DiskIoConfig ioConfig;
+  ioConfig.backend = DiskIoBackend::kSync;
+  ioConfig.initialQueueDepth = 4;
+  ioConfig.minQueueDepth = 1;
+  ioConfig.maxQueueDepth = 16;
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(ioConfig);
+
+  test::RecordingMetricsRegistry metrics;
+  ProcessSpillServiceConfig serviceConfig;
+  serviceConfig.spillDir = root.string();
+  serviceConfig.workerThreadCount = 0;
+  serviceConfig.cleanupOnDestroy = true;
+  serviceConfig.diskProbeDuration = std::chrono::milliseconds(0);
+  serviceConfig.metrics = &metrics;
+  auto service = ProcessSpillService::CreateForTesting(std::move(serviceConfig));
+
+  auto block = std::make_shared<FakeBlockHandleBase>();
+  EvictionNode node;
+  node.block = block;
+  node.cost = EvictionCostClass::kSpill;
+
+  ASSERT_EQ(service->SubmitSpill(node).kind, EvictResultKind::kBackpressured);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_submit_total"), 1);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_backpressured_total"), 1);
+  EXPECT_EQ(metrics.HistogramCount("bm_spill_submit_duration_us"), 1);
 }
 
 TEST(SpillTest, spillPoliciesUseConfiguredProcessService) {

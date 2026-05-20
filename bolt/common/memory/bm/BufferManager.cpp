@@ -15,6 +15,7 @@
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/MemoryArbitrator.h"
+#include "bolt/common/memory/bm/Observability.h"
 
 namespace bytedance::bolt::memory::bm {
 namespace {
@@ -70,6 +71,16 @@ BufferManager::BufferManager(
     BufferManagerConfig config)
     : memoryManager_(memoryManager),
       config_(std::move(config)),
+      metrics_(EffectiveMetricsRegistry(config_.metrics)),
+      allocateRequestsCounter_(
+          metrics_.GetCounter("bm_allocate_requests_total", "")),
+      reclaimRequestsCounter_(
+          metrics_.GetCounter("bm_reclaim_requests_total", "")),
+      reclaimBytesCounter_(metrics_.GetCounter("bm_reclaim_bytes_total", "")),
+      usedMemoryGauge_(metrics_.GetGauge("bm_used_memory_bytes", "")),
+      pinnedMemoryGauge_(metrics_.GetGauge("bm_pinned_memory_bytes", "")),
+      allocateDuration_(metrics_.GetHistogram("bm_allocate_duration_us", "")),
+      reclaimDuration_(metrics_.GetHistogram("bm_reclaim_duration_us", "")),
       rootPool_(memoryManager_.addRootPool(
           uniquePoolName(config_.poolName),
           kMaxMemory,
@@ -79,7 +90,9 @@ BufferManager::BufferManager(
       allocator_(pool_, *leafPool_),
       evictor_(*this) {
   BOLT_MEM_LOG(INFO) << "BufferManager created pool=" << config_.poolName
-                     << " spillEnabled=" << (spillService_ != nullptr);
+                     << " spillEnabled=" << (spillService_ != nullptr)
+                     << " reserveWaitTimeoutMs="
+                     << config_.reserveWaitTimeout.count();
 }
 
 BufferManager::~BufferManager() {
@@ -106,6 +119,8 @@ BufferManager::~BufferManager() {
 }
 
 BufferHandle BufferManager::Allocate(AllocateOptions options) {
+  ScopedBmTimer timer(allocateDuration_);
+  allocateRequestsCounter_.Add(1);
   BOLT_USER_CHECK_GT(options.size, 0, "Cannot allocate an empty block");
   BOLT_USER_CHECK(
       options.policy != EvictPolicy::kRecompute ||
@@ -125,9 +140,16 @@ BufferHandle BufferManager::Allocate(AllocateOptions options) {
   block->InstallMemory(std::move(memory));
   RegisterBlock(block);
   EnqueueEvictionCandidate(block);
+  const auto snapshot = pool_.Snapshot();
+  usedMemoryGauge_.Set(static_cast<int64_t>(snapshot.usedTotalBytes));
+  pinnedMemoryGauge_.Set(static_cast<int64_t>(snapshot.usedPinnedBytes));
   BOLT_MEM_LOG(INFO) << "Allocated BufferManager block id=" << block->Id()
                      << " size=" << options.size
-                     << " policy=" << ToString(options.policy);
+                     << " tag=" << ToString(options.tag)
+                     << " policy=" << ToString(options.policy)
+                     << " priority=" << static_cast<int>(options.priority)
+                     << " reservationKind="
+                     << ToString(BodyReservationKind(options.policy));
   return BufferHandle(std::move(block), true);
 }
 
@@ -177,11 +199,41 @@ ByteCount BufferManager::GetMemoryUsage(MemoryTag tag) const {
 }
 
 BufferPoolSnapshot BufferManager::Snapshot() const {
-  return pool_.Snapshot();
+  auto snapshot = pool_.Snapshot();
+  std::vector<std::shared_ptr<BlockHandle>> liveBlocks;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    liveBlocks.reserve(blocks_.size());
+    for (const auto& weak : blocks_) {
+      if (auto block = weak.lock()) {
+        liveBlocks.push_back(std::move(block));
+      }
+    }
+  }
+  for (const auto& block : liveBlocks) {
+    switch (block->State()) {
+      case BlockState::kLoaded:
+      case BlockState::kLoading:
+      case BlockState::kSpilling:
+        snapshot.usedLoadedBytes += block->Size();
+        break;
+      case BlockState::kSpilled:
+        snapshot.usedSpilledBytes += block->Size();
+        break;
+      case BlockState::kInvalid:
+      case BlockState::kDiscarded:
+      case BlockState::kEvictedRecomputable:
+        break;
+    }
+  }
+  return snapshot;
 }
 
 ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
+  ScopedBmTimer timer(reclaimDuration_);
+  reclaimRequestsCounter_.Add(1);
   const auto before = GetMemoryUsage();
+  const auto reclaimableBefore = ReclaimableBytes();
   {
     std::lock_guard<std::mutex> l(mutex_);
     for (auto it = blocks_.begin(); it != blocks_.end();) {
@@ -204,6 +256,12 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
 
     if (node.cost == EvictionCostClass::kSpill) {
       auto submit = evictor_.TryScheduleEvict(node);
+      BOLT_MEM_LOG(INFO) << "BufferManager reclaim spill candidate"
+                         << " target=" << targetBytes
+                         << " result=" << ToString(submit.kind)
+                         << " freed=" << submit.freedBytes
+                         << " cost=" << ToString(node.cost)
+                         << " priority=" << static_cast<int>(node.priority);
       if (submit.kind == EvictResultKind::kScheduled) {
         scheduledSpill = true;
         continue;
@@ -217,6 +275,12 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
     }
 
     auto result = evictor_.TryEvictNodeSync(node);
+    BOLT_MEM_LOG(INFO) << "BufferManager reclaim sync candidate"
+                       << " target=" << targetBytes
+                       << " result=" << ToString(result.kind)
+                       << " freed=" << result.freedBytes
+                       << " cost=" << ToString(node.cost)
+                       << " priority=" << static_cast<int>(node.priority);
     reclaimed += result.freedBytes;
   }
 
@@ -231,10 +295,16 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
     const auto after = GetMemoryUsage();
     reclaimed = std::max(reclaimed, before > after ? before - after : 0);
   }
+  reclaimBytesCounter_.Add(reclaimed);
+  const auto snapshot = pool_.Snapshot();
+  usedMemoryGauge_.Set(static_cast<int64_t>(snapshot.usedTotalBytes));
+  pinnedMemoryGauge_.Set(static_cast<int64_t>(snapshot.usedPinnedBytes));
   BOLT_MEM_LOG(INFO) << "BufferManager reclaim target=" << targetBytes
                      << " reclaimed=" << reclaimed
                      << " usageBefore=" << before
-                     << " usageAfter=" << GetMemoryUsage();
+                     << " usageAfter=" << snapshot.usedTotalBytes
+                     << " reclaimableBefore=" << reclaimableBefore
+                     << " scheduledSpill=" << scheduledSpill;
   return reclaimed;
 }
 
@@ -270,7 +340,14 @@ void BufferManager::EnqueueEvictionCandidate(
   if (block == nullptr || block->options_.policy == EvictPolicy::kPinnedForever) {
     return;
   }
-  evictor_.Enqueue(MakeEvictionNode(block));
+  auto node = MakeEvictionNode(block);
+  BOLT_MEM_LOG(INFO) << "BufferManager enqueue eviction candidate"
+                     << " block_id=" << block->Id()
+                     << " cost=" << ToString(node.cost)
+                     << " priority=" << static_cast<int>(node.priority)
+                     << " sequence=" << node.evictionSequence
+                     << " policy=" << ToString(block->options_.policy);
+  evictor_.Enqueue(std::move(node));
 }
 
 EvictionNode BufferManager::MakeEvictionNode(

@@ -155,6 +155,14 @@ class BufferManager {
 
   MemoryManager& memoryManager_;
   BufferManagerConfig config_;
+  MetricsRegistry& metrics_;
+  Counter& allocateRequestsCounter_;
+  Counter& reclaimRequestsCounter_;
+  Counter& reclaimBytesCounter_;
+  Gauge& usedMemoryGauge_;
+  Gauge& pinnedMemoryGauge_;
+  Histogram& allocateDuration_;
+  Histogram& reclaimDuration_;
   std::shared_ptr<MemoryPool> rootPool_;
   std::shared_ptr<MemoryPool> leafPool_;
   BufferPool pool_;

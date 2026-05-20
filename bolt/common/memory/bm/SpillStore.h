@@ -102,15 +102,26 @@ class SpillStore {
   bool ForgetLiveFile(const std::string& path) noexcept;
 
   const SpillStoreConfig config_;
-  MetricsRegistry& metrics_;
-  DiskIoScheduler* ioScheduler_;
   const DiskProbeResult diskProbe_;
   const SpillCompressionConfig compressionConfig_;
   SmallSpillAllocator smallAllocator_;
+  const std::string metricLabels_;
+  MetricsRegistry& metrics_;
+  DiskIoScheduler* ioScheduler_;
   Counter& bytesWrittenCounter_;
+  Counter& bytesStoredCounter_;
   Counter& bytesReadCounter_;
+  Counter& releaseCounter_;
+  Counter& smallSlotCounter_;
+  Counter& dedicatedFileCounter_;
+  Counter& compressAttemptCounter_;
+  Counter& compressSavedBytesCounter_;
+  Counter& compressFallbackRawCounter_;
   Counter& doubleReleaseCounter_;
   Counter& invalidReleaseCounter_;
+  Histogram& writeDuration_;
+  Histogram& readDuration_;
+  Histogram& releaseDuration_;
   const DiskKind disk_;
   mutable std::mutex mutex_;
   std::atomic<uint64_t> nextFileId_{0};

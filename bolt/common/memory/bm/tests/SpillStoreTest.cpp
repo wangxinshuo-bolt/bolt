@@ -11,6 +11,7 @@
 
 #include "bolt/common/memory/bm/DiskIo.h"
 #include "bolt/common/memory/bm/SpillStore.h"
+#include "bolt/common/memory/bm/tests/BufferManagerTestUtil.h"
 
 namespace bytedance::bolt::memory::bm {
 namespace {
@@ -270,6 +271,60 @@ TEST(SpillStoreTest, fallsBackToRawWhenCompressionDoesNotSaveSpace) {
   EXPECT_EQ(readBack, payload);
 
   store.Release(location);
+}
+
+TEST(SpillStoreTest, recordsMetricsForWriteReadReleaseAndCompressionPath) {
+  auto root = std::filesystem::temp_directory_path() /
+      "bolt_bm_spill_store_metrics_test";
+  std::filesystem::remove_all(root);
+
+  test::RecordingMetricsRegistry metrics;
+  SmallSpillConfig small;
+  small.enabled = true;
+  small.dedicatedFileThresholdBytes = 128 << 10;
+  small.slabFileBytes = 64 << 10;
+  small.sizeClasses = {4 << 10, 8 << 10};
+  auto engine = std::make_unique<RecordingDiskIoEngine>();
+  DiskIoScheduler scheduler(std::move(engine), syncConfig());
+
+  SpillStore store(
+      SpillStoreConfig{.spillDir = root.string(),
+                       .cleanupOnDestroy = true,
+                       .diskProbe = ssdProbe(),
+                       .smallSpill = small,
+                       .compression = SpillCompressionConfig{}},
+      &metrics,
+      &scheduler);
+
+  std::vector<uint8_t> payload(32 << 10, 7);
+  auto location =
+      store.Write(MemoryTag::kShuffle, payload.data(), payload.size());
+  ASSERT_TRUE(location.Valid());
+  ASSERT_TRUE(location.smallSlot);
+  ASSERT_LT(location.storedBytes, location.logicalBytes);
+
+  std::vector<uint8_t> readBack(payload.size());
+  store.Read(location, readBack.data(), readBack.size());
+  store.Release(location);
+
+  EXPECT_EQ(metrics.CounterValue("bm_spill_bytes_written", "disk=ssd"),
+            payload.size());
+  EXPECT_EQ(metrics.CounterValue("bm_spill_bytes_stored", "disk=ssd"),
+            location.storedBytes);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_small_slot_total", "disk=ssd"), 1);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_compress_attempt_total", "disk=ssd"),
+            1);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_compress_saved_bytes", "disk=ssd"),
+            location.logicalBytes - location.storedBytes);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_bytes_read", "disk=ssd"),
+            payload.size());
+  EXPECT_EQ(metrics.CounterValue("bm_spill_release_total", "disk=ssd"), 1);
+  EXPECT_EQ(metrics.HistogramCount("bm_spill_write_duration_us", "disk=ssd"),
+            1);
+  EXPECT_EQ(metrics.HistogramCount("bm_spill_read_duration_us", "disk=ssd"),
+            1);
+  EXPECT_EQ(metrics.HistogramCount("bm_spill_release_duration_us", "disk=ssd"),
+            1);
 }
 
 } // namespace

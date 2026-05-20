@@ -133,6 +133,17 @@ class ProcessSpillService : public SpillRequester {
 
   ProcessSpillServiceConfig config_;
   MetricsRegistry& metrics_;
+  Counter& submitCounter_;
+  Counter& scheduledCounter_;
+  Counter& backpressuredCounter_;
+  Counter& skippedCounter_;
+  Counter& failedCounter_;
+  Counter& executedCounter_;
+  Counter& freedBytesCounter_;
+  Gauge& queueDepthGauge_;
+  Histogram& submitDuration_;
+  Histogram& executeDuration_;
+  Histogram& waitForProgressDuration_;
   std::unique_ptr<SpillStore> store_;
   std::atomic<ByteCount> usedDiskBytes_{0};
 

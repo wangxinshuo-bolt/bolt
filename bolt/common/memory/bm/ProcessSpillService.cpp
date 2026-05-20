@@ -17,6 +17,7 @@
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/bm/BlockHandle.h"
 #include "bolt/common/memory/bm/DiskProbe.h"
+#include "bolt/common/memory/bm/Observability.h"
 
 namespace bytedance::bolt::memory::bm {
 namespace {
@@ -38,15 +39,25 @@ uint32_t resolveWorkerThreadCount(uint32_t configured) {
   return configured;
 }
 
-MetricsRegistry& effectiveRegistry(MetricsRegistry* metrics) {
-  return metrics == nullptr ? NoOpMetricsRegistry() : *metrics;
-}
-
 } // namespace
 
 ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
     : config_(std::move(config)),
-      metrics_(effectiveRegistry(config_.metrics)) {
+      metrics_(EffectiveMetricsRegistry(config_.metrics)),
+      submitCounter_(metrics_.GetCounter("bm_spill_submit_total", "")),
+      scheduledCounter_(metrics_.GetCounter("bm_spill_scheduled_total", "")),
+      backpressuredCounter_(
+          metrics_.GetCounter("bm_spill_backpressured_total", "")),
+      skippedCounter_(metrics_.GetCounter("bm_spill_skipped_total", "")),
+      failedCounter_(metrics_.GetCounter("bm_spill_failed_total", "")),
+      executedCounter_(metrics_.GetCounter("bm_spill_executed_total", "")),
+      freedBytesCounter_(metrics_.GetCounter("bm_spill_freed_bytes_total", "")),
+      queueDepthGauge_(metrics_.GetGauge("bm_spill_queue_depth", "")),
+      submitDuration_(metrics_.GetHistogram("bm_spill_submit_duration_us", "")),
+      executeDuration_(
+          metrics_.GetHistogram("bm_spill_execute_duration_us", "")),
+      waitForProgressDuration_(
+          metrics_.GetHistogram("bm_wait_for_spill_progress_duration_us", "")) {
   BOLT_USER_CHECK(
       !config_.spillDir.empty(),
       "ProcessSpillService requires a spill directory");
@@ -71,8 +82,14 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
   SpillStore::CleanupAtStartup(storeCfg);
   store_ = std::make_unique<SpillStore>(storeCfg, config_.metrics);
   StartWorkers();
-  BOLT_MEM_LOG(INFO) << "ProcessSpillService initialized at "
-                     << config_.spillDir;
+  BOLT_MEM_LOG(INFO) << "ProcessSpillService initialized"
+                     << " spillDir=" << config_.spillDir
+                     << " workerThreadCount=" << config_.workerThreadCount
+                     << " cleanupOnDestroy=" << config_.cleanupOnDestroy
+                     << " diskKind=" << ToString(storeCfg.diskProbe.kind)
+                     << " probeActive=" << storeCfg.diskProbe.activeProbeRan
+                     << " writeIops=" << storeCfg.diskProbe.writeIops
+                     << " readIops=" << storeCfg.diskProbe.readIops;
 }
 
 ProcessSpillService::~ProcessSpillService() {
@@ -127,19 +144,32 @@ std::unique_ptr<ProcessSpillService> ProcessSpillService::CreateForTesting(
 }
 
 EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
+  ScopedBmTimer timer(submitDuration_);
+  submitCounter_.Add(1);
   if (node.block.expired()) {
+    skippedCounter_.Add(1);
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
   if (resolveWorkerThreadCount(config_.workerThreadCount) == 0) {
+    backpressuredCounter_.Add(1);
+    BOLT_MEM_LOG(INFO) << "ProcessSpillService backpressured spill submit"
+                       << " workerThreadCount=0";
     return EvictResult{EvictResultKind::kBackpressured, 0};
   }
+  size_t queueDepth = 0;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (stopping_) {
+      failedCounter_.Add(1);
       return EvictResult{EvictResultKind::kFailed, 0};
     }
     ready_.push_back(std::move(node));
+    queueDepth = ready_.size();
+    queueDepthGauge_.Set(static_cast<int64_t>(queueDepth));
   }
+  scheduledCounter_.Add(1);
+  BOLT_MEM_LOG(INFO) << "ProcessSpillService scheduled spill submit"
+                     << " queueDepth=" << queueDepth;
   cv_.notify_one();
   return EvictResult{EvictResultKind::kScheduled, 0};
 }
@@ -147,6 +177,7 @@ EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
 bool ProcessSpillService::WaitForProgress(
     ByteCount /*bytesNeeded*/,
     std::chrono::milliseconds timeout) {
+  ScopedBmTimer timer(waitForProgressDuration_);
   std::unique_lock<std::mutex> l(mutex_);
   const auto startEpoch = progressEpoch_;
   return progressCv_.wait_for(
@@ -198,6 +229,7 @@ void ProcessSpillService::StartWorkers() {
   for (uint32_t i = 0; i < workerCount; ++i) {
     workers_.emplace_back([this] { WorkerLoop(); });
   }
+  queueDepthGauge_.Set(0);
   if (workerCount != 0) {
     BOLT_MEM_LOG(INFO) << "ProcessSpillService started " << workerCount
                        << " spill workers";
@@ -219,6 +251,7 @@ void ProcessSpillService::StopWorkers() {
       }
     }
     ready_.clear();
+    queueDepthGauge_.Set(0);
   }
   cv_.notify_all();
   for (auto& worker : workers_) {
@@ -241,6 +274,7 @@ void ProcessSpillService::WorkerLoop() {
       }
       node = std::move(ready_.front());
       ready_.pop_front();
+      queueDepthGauge_.Set(static_cast<int64_t>(ready_.size()));
     }
     ExecuteSpill(std::move(node));
     NotifyProgress();
@@ -248,25 +282,32 @@ void ProcessSpillService::WorkerLoop() {
 }
 
 void ProcessSpillService::ExecuteSpill(EvictionNode node) {
+  ScopedBmTimer timer(executeDuration_);
   auto base = node.block.lock();
   if (base == nullptr) {
+    skippedCounter_.Add(1);
     return;
   }
   auto handle = std::dynamic_pointer_cast<BlockHandle>(base);
   if (handle == nullptr) {
+    skippedCounter_.Add(1);
     return;
   }
   if (handle->EvictionSequence() != node.evictionSequence ||
       handle->IsPinned()) {
     handle->ClearSpillScheduled();
+    skippedCounter_.Add(1);
     return;
   }
   try {
     const auto bytes = handle->SpillToDisk();
+    executedCounter_.Add(1);
+    freedBytesCounter_.Add(bytes);
     BOLT_MEM_LOG(INFO) << "ProcessSpillService processed block "
                        << handle->Id() << " freed=" << bytes;
   } catch (const std::exception& e) {
     handle->ClearSpillScheduled();
+    failedCounter_.Add(1);
     BOLT_MEM_LOG(WARNING)
         << "ProcessSpillService failed to spill block " << handle->Id()
         << ": " << e.what();

@@ -3,10 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include <cstring>
+
 #include <gtest/gtest.h>
 
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/bm/BufferManager.h"
+#include "bolt/common/memory/bm/tests/BufferManagerTestUtil.h"
 
 namespace bytedance::bolt::memory::bm {
 
@@ -69,6 +72,30 @@ TEST(BufferPoolTest, snapshotTracksTotalAndPinnedUsage) {
   snapshot = pool.Snapshot();
   ASSERT_EQ(snapshot.usedTotalBytes, 864);
   ASSERT_EQ(snapshot.usedPinnedBytes, 64);
+}
+
+TEST(BufferPoolTest, reclaimRecordsMetricsAndDuration) {
+  test::RecordingMetricsRegistry metrics;
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_reclaim_metrics",
+                          .metrics = &metrics});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kScanCache,
+                      .size = 256,
+                      .policy = EvictPolicy::kDiscard,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 1, bytes); });
+
+  ASSERT_EQ(manager.Reclaim(128), 256);
+  ASSERT_EQ(block->State(), BlockState::kDiscarded);
+  EXPECT_EQ(metrics.CounterValue("bm_allocate_requests_total"), 1);
+  EXPECT_EQ(metrics.CounterValue("bm_reclaim_requests_total"), 1);
+  EXPECT_EQ(metrics.CounterValue("bm_reclaim_bytes_total"), 256);
+  EXPECT_EQ(metrics.HistogramCount("bm_allocate_duration_us"), 1);
+  EXPECT_EQ(metrics.HistogramCount("bm_reclaim_duration_us"), 1);
 }
 
 } // namespace bytedance::bolt::memory::bm

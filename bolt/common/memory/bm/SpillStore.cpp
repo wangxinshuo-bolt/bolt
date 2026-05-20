@@ -17,14 +17,11 @@
 
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/common/memory/Memory.h"
+#include "bolt/common/memory/bm/Observability.h"
 #include "bolt/common/memory/bm/SpillCompression.h"
 
 namespace bytedance::bolt::memory::bm {
 namespace {
-
-MetricsRegistry& effectiveRegistry(MetricsRegistry* metrics) {
-  return metrics == nullptr ? NoOpMetricsRegistry() : *metrics;
-}
 
 class ScopedFd {
  public:
@@ -80,11 +77,29 @@ SpillLocation SpillWriteSession::Write(
     ConstDataPtr src,
     ByteCount bytes) {
   BOLT_USER_CHECK_NOT_NULL(store_, "SpillWriteSession has no associated store");
+  ScopedBmTimer timer(store_->writeDuration_);
   BOLT_USER_CHECK(!consumed_, "SpillWriteSession::Write may be called once");
   BOLT_USER_CHECK_NOT_NULL(src, "Cannot spill a null buffer");
   consumed_ = true;
 
+  const bool compressionAttempted =
+      store_->compressionConfig_.enabled &&
+      store_->compressionConfig_.codec == SpillCompressionCodec::kZstd &&
+      bytes >= store_->compressionConfig_.minBytes;
   auto payload = PrepareSpillPayload(store_->compressionConfig_, src, bytes);
+  if (compressionAttempted) {
+    store_->compressAttemptCounter_.Add(1);
+  }
+  if (payload.codec == SpillCompressionCodec::kZstd) {
+    store_->compressSavedBytesCounter_.Add(bytes - payload.storedBytes);
+  } else if (compressionAttempted) {
+    store_->compressFallbackRawCounter_.Add(1);
+    BOLT_MEM_LOG(INFO) << "BufferManager SpillStore compression fallback"
+                       << " logical=" << bytes
+                       << " stored=" << payload.storedBytes
+                       << " minSavingsRatio="
+                       << store_->compressionConfig_.minSavingsRatio;
+  }
   auto location = store_->smallAllocator_.Allocate(
       bytes, payload.storedBytes, payload.codec, store_->disk_);
   if (!location.Valid()) {
@@ -118,11 +133,20 @@ SpillLocation SpillWriteSession::Write(
   }
 
   store_->bytesWrittenCounter_.Add(bytes);
+  store_->bytesStoredCounter_.Add(location.storedBytes);
+  if (location.smallSlot) {
+    store_->smallSlotCounter_.Add(1);
+  } else {
+    store_->dedicatedFileCounter_.Add(1);
+  }
   BOLT_MEM_LOG(INFO) << "BufferManager SpillStore wrote " << bytes
       << " bytes to " << location.path
                      << " offset=" << location.offset
                      << " stored=" << location.storedBytes
                      << " slot=" << location.slotBytes
+                     << " path_type="
+                     << (location.smallSlot ? "small_slot"
+                                            : "dedicated_file")
                      << " codec="
                      << static_cast<int>(location.compressionCodec)
                      << " tag=" << ToString(tag)
@@ -135,10 +159,6 @@ SpillStore::SpillStore(
     MetricsRegistry* metrics,
     DiskIoScheduler* ioScheduler)
     : config_(std::move(config)),
-      metrics_(effectiveRegistry(metrics)),
-      ioScheduler_(
-          ioScheduler == nullptr ? &ProcessDiskIoService::Instance().Scheduler()
-                                 : ioScheduler),
       diskProbe_(config_.diskProbe.kind == DiskKind::kUnknown
                      ? DiskProbeResult{
                            config_.unknownFallbackKind,
@@ -149,18 +169,53 @@ SpillStore::SpillStore(
                      : config_.diskProbe),
       compressionConfig_(config_.compression),
       smallAllocator_(config_.smallSpill, diskProbe_.kind, config_.spillDir),
+      metricLabels_(fmt::format("disk={}", ToString(diskProbe_.kind))),
+      metrics_(EffectiveMetricsRegistry(metrics)),
+      ioScheduler_(
+          ioScheduler == nullptr ? &ProcessDiskIoService::Instance().Scheduler()
+                                 : ioScheduler),
       bytesWrittenCounter_(metrics_.GetCounter(
           "bm_spill_bytes_written",
-          fmt::format("disk={}", ToString(diskProbe_.kind)))),
+          metricLabels_)),
+      bytesStoredCounter_(metrics_.GetCounter(
+          "bm_spill_bytes_stored",
+          metricLabels_)),
       bytesReadCounter_(metrics_.GetCounter(
           "bm_spill_bytes_read",
-          fmt::format("disk={}", ToString(diskProbe_.kind)))),
+          metricLabels_)),
+      releaseCounter_(metrics_.GetCounter(
+          "bm_spill_release_total",
+          metricLabels_)),
+      smallSlotCounter_(metrics_.GetCounter(
+          "bm_spill_small_slot_total",
+          metricLabels_)),
+      dedicatedFileCounter_(metrics_.GetCounter(
+          "bm_spill_dedicated_file_total",
+          metricLabels_)),
+      compressAttemptCounter_(metrics_.GetCounter(
+          "bm_spill_compress_attempt_total",
+          metricLabels_)),
+      compressSavedBytesCounter_(metrics_.GetCounter(
+          "bm_spill_compress_saved_bytes",
+          metricLabels_)),
+      compressFallbackRawCounter_(metrics_.GetCounter(
+          "bm_spill_compress_fallback_raw_total",
+          metricLabels_)),
       doubleReleaseCounter_(metrics_.GetCounter(
           "bm_spill_double_release",
-          fmt::format("disk={}", ToString(diskProbe_.kind)))),
+          metricLabels_)),
       invalidReleaseCounter_(metrics_.GetCounter(
           "bm_spill_invalid_release",
-          fmt::format("disk={}", ToString(diskProbe_.kind)))),
+          metricLabels_)),
+      writeDuration_(metrics_.GetHistogram(
+          "bm_spill_write_duration_us",
+          metricLabels_)),
+      readDuration_(metrics_.GetHistogram(
+          "bm_spill_read_duration_us",
+          metricLabels_)),
+      releaseDuration_(metrics_.GetHistogram(
+          "bm_spill_release_duration_us",
+          metricLabels_)),
       disk_(diskProbe_.kind) {
   std::filesystem::create_directories(config_.spillDir);
   const auto& smallConfig = smallAllocator_.Config();
@@ -174,7 +229,13 @@ SpillStore::SpillStore(
                      << " write_iops=" << diskProbe_.writeIops
                      << " read_iops=" << diskProbe_.readIops
                      << " active_probe=" << diskProbe_.activeProbeRan
-                     << " direct_io=" << diskProbe_.directIoUsed;
+                     << " direct_io=" << diskProbe_.directIoUsed
+                     << " compression_enabled="
+                     << compressionConfig_.enabled
+                     << " compression_min_bytes="
+                     << compressionConfig_.minBytes
+                     << " compression_min_savings_ratio="
+                     << compressionConfig_.minSavingsRatio;
 }
 
 SpillStore::~SpillStore() {
@@ -220,6 +281,7 @@ void SpillStore::Read(
     const SpillLocation& location,
     DataPtr dst,
     ByteCount dstCapacity) {
+  ScopedBmTimer timer(readDuration_);
   BOLT_USER_CHECK(location.Valid(), "Invalid spill location");
   BOLT_USER_CHECK_NOT_NULL(dst, "Cannot read spill into a null buffer");
   BOLT_USER_CHECK_GE(
@@ -281,6 +343,7 @@ void SpillStore::Read(
 }
 
 void SpillStore::Release(const SpillLocation& location) {
+  ScopedBmTimer timer(releaseDuration_);
   if (!location.Valid()) {
     return;
   }
@@ -316,6 +379,7 @@ void SpillStore::Release(const SpillLocation& location) {
     BOLT_USER_FAIL(
         "BufferManager SpillStore release of unknown path {}", location.path);
   }
+  releaseCounter_.Add(1);
   if (removeFile) {
     std::error_code ec;
     std::filesystem::remove(location.path, ec);

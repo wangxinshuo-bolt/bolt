@@ -176,7 +176,7 @@ TEST(SpillTest, spillCandidateIsNotSubmittedTwiceWhileScheduled) {
       [](DataPtr data, ByteCount bytes) { std::memset(data, 3, bytes); });
   CountingSpillRequester requester;
   dynamic_cast<BlockEvictor&>(manager.EvictionQueue())
-      .SetSpillRequester(&requester);
+      .SetSpillRequester(requester);
 
   EvictionNode node;
   ASSERT_TRUE(manager.EvictionQueue().TryPopAnyCandidate(node));
@@ -186,6 +186,87 @@ TEST(SpillTest, spillCandidateIsNotSubmittedTwiceWhileScheduled) {
             EvictResultKind::kSkipped);
   ASSERT_EQ(requester.submitCount, 1);
   ASSERT_EQ(block->State(), BlockState::kLoaded);
+}
+
+TEST(SpillTest, asyncSpillWorkerWritesButOwnerCommitsCompletion) {
+  BufferManager::ResetProcessServicesForTesting();
+  BufferManagerProcessServicesConfig services;
+  services.spill.spillDir = "/tmp/bolt_bm_async_owner_commit";
+  services.spill.workerThreadCount = 1;
+  services.spill.diskProbeDuration = std::chrono::milliseconds(0);
+  services.spill.cleanupOnDestroy = true;
+  services.spill.diskIo.backend = DiskIoBackend::kSync;
+  services.spill.diskIo.initialQueueDepth = 4;
+  services.spill.diskIo.minQueueDepth = 1;
+  services.spill.diskIo.maxQueueDepth = 16;
+  BufferManager::InitializeProcessServices(std::move(services));
+
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_async_owner_commit"});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 512,
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 4, bytes); });
+
+  EvictionNode node;
+  ASSERT_TRUE(manager.EvictionQueue().TryPopAnyCandidate(node));
+  ASSERT_EQ(manager.EvictionQueue().TryScheduleEvict(node).kind,
+            EvictResultKind::kScheduled);
+  ASSERT_TRUE(ProcessSpillService::Instance().WaitForProgress(
+      0, std::chrono::seconds(5)));
+
+  ASSERT_EQ(block->State(), BlockState::kSpilling);
+  ASSERT_EQ(manager.GetMemoryUsage(), 512);
+
+  ASSERT_EQ(manager.Reclaim(512), 512);
+  ASSERT_EQ(block->State(), BlockState::kSpilled);
+  ASSERT_EQ(manager.GetMemoryUsage(), 0);
+}
+
+TEST(SpillTest, asyncSpillCompletionDoesNotKeepBlockAlive) {
+  BufferManager::ResetProcessServicesForTesting();
+  BufferManagerProcessServicesConfig services;
+  services.spill.spillDir = "/tmp/bolt_bm_async_completion_no_block_ref";
+  services.spill.workerThreadCount = 1;
+  services.spill.diskProbeDuration = std::chrono::milliseconds(0);
+  services.spill.cleanupOnDestroy = true;
+  services.spill.diskIo.backend = DiskIoBackend::kSync;
+  services.spill.diskIo.initialQueueDepth = 4;
+  services.spill.diskIo.minQueueDepth = 1;
+  services.spill.diskIo.maxQueueDepth = 16;
+  BufferManager::InitializeProcessServices(std::move(services));
+
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_async_completion_no_block_ref"});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 512,
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 5, bytes); });
+  std::weak_ptr<BlockHandle> weakBlock = block;
+
+  EvictionNode node;
+  ASSERT_TRUE(manager.EvictionQueue().TryPopAnyCandidate(node));
+  ASSERT_EQ(manager.EvictionQueue().TryScheduleEvict(node).kind,
+            EvictResultKind::kScheduled);
+  block.reset();
+
+  ASSERT_TRUE(ProcessSpillService::Instance().WaitForProgress(
+      0, std::chrono::seconds(5)));
+  ASSERT_TRUE(weakBlock.expired());
+  ASSERT_EQ(manager.GetMemoryUsage(), 512);
+
+  ASSERT_EQ(manager.Reclaim(512), 512);
+  ASSERT_EQ(manager.GetMemoryUsage(), 0);
 }
 
 TEST(SpillTest, spillLocationReleaseUsesSingleStore) {

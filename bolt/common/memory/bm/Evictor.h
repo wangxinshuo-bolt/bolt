@@ -11,6 +11,8 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <functional>
 
 #include "bolt/common/memory/bm/EvictionTypes.h"
 
@@ -93,13 +95,11 @@ class BlockEvictor : public Evictor {
 
   ~BlockEvictor() override = default;
 
-  // Installs (or detaches) the SpillRequester used by TryScheduleEvict and
-  // WaitForProgress. Storing happens with release semantics so other
-  // threads observe a fully-constructed requester. Pass nullptr during
-  // teardown to disconnect the spill service before it is destroyed; in-flight
-  // calls observe a kFailed/false response instead of dereferencing a
-  // dangling pointer.
-  void SetSpillRequester(SpillRequester* requester);
+  // Installs or detaches the SpillRequester used by TryScheduleEvict and
+  // WaitForProgress. The requester is a non-owning reference to a
+  // process-owned spill service.
+  void SetSpillRequester(SpillRequester& requester);
+  void ClearSpillRequester();
 
   // See Evictor::Enqueue. Implementation appends to queues_[cost][priority]
   // under mutex_. Out-of-range cost/priority values are dropped silently.
@@ -134,7 +134,7 @@ class BlockEvictor : public Evictor {
   std::shared_ptr<BlockHandle> ValidateNode(const EvictionNode& node) const;
 
   BufferManager& manager_;
-  std::atomic<SpillRequester*> spillRequester_{nullptr};
+  std::optional<std::reference_wrapper<SpillRequester>> spillRequester_;
   mutable std::mutex mutex_;
   // FIFO buckets indexed by eviction cost and priority.
   std::deque<EvictionNode> queues_[kCostClassCount][kPriorityCount];

@@ -7,8 +7,9 @@
 
 #include <functional>
 #include <memory>
-#include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "bolt/common/memory/MemoryPool.h"
@@ -25,13 +26,24 @@ class MemoryReclaimer;
 
 namespace bytedance::bolt::memory::bm {
 
+struct BufferManagerContext {
+  BufferAllocator& allocator;
+  std::optional<std::reference_wrapper<ProcessSpillService>> spill;
+  std::shared_ptr<SpillOwnerToken> spillOwnerToken;
+  std::thread::id ownerThreadId;
+  bool valid{true};
+};
+
 // Top-level entry point for BufferManager. It owns:
 //   * a dedicated subtree of Bolt's MemoryPool for physical bytes
 //   * a BufferPool that tracks logical usage
 //   * a BufferAllocator pairing the two
 //   * a BlockEvictor wired to the process-wide spill service when needed
 //
-// All lookups (Allocate / Pin / Reclaim / Snapshot) are thread-safe.
+// Threading: BufferManager is thread-confined. All non-static public APIs
+// except the destructor must be called from the thread that constructed the
+// BufferManager. Multiple BufferManagers may be used concurrently by different
+// threads, and process-level spill/disk services are shared and thread-safe.
 // BufferManager must outlive every BufferHandle and BlockHandle it produces;
 // the destructor invalidates outstanding blocks first to keep dangling pins
 // from triggering use-after-free.
@@ -126,12 +138,6 @@ class BufferManager {
     return allocator_;
   }
 
-  // Exposes the process-wide spill service used by BlockHandle for spill and
-  // reload I/O. Returns nullptr until a spill policy allocation wires it.
-  ProcessSpillService* Spill() const {
-    return spillService_;
-  }
-
   // Exposes the eviction queue for diagnostics and tests. Production code
   // should not enqueue directly -- BufferManager does so
   // automatically when a block becomes evictable.
@@ -140,6 +146,8 @@ class BufferManager {
   }
 
  private:
+  friend class BlockHandle;
+
   // Tracks a weak reference so reclaim can find live blocks without owning
   // them. Called by Allocate / AllocatePersistent right after a block has
   // been constructed.
@@ -162,9 +170,14 @@ class BufferManager {
   // during construction.
   std::unique_ptr<MemoryReclaimer> CreateReclaimer();
 
+  void AssertOwnerThread() const;
+  ByteCount DrainSpillCompletions(size_t* completionCount = nullptr);
+  std::shared_ptr<BlockHandle> FindBlockById(uint64_t blockId);
+
   void EnsureSpillService();
 
   MemoryManager& memoryManager_;
+  const std::thread::id ownerThreadId_;
   BufferManagerConfig config_;
   MetricsRegistry& metrics_;
   Counter& allocateRequestsCounter_;
@@ -178,9 +191,10 @@ class BufferManager {
   std::shared_ptr<MemoryPool> leafPool_;
   BufferPool pool_;
   BufferAllocator allocator_;
-  ProcessSpillService* spillService_{nullptr};
+  std::shared_ptr<SpillOwnerToken> spillOwnerToken_;
+  std::shared_ptr<BufferManagerContext> context_;
+  std::optional<std::reference_wrapper<ProcessSpillService>> spillService_;
   BlockEvictor evictor_;
-  mutable std::mutex mutex_;
   bool shuttingDown_{false};
   std::vector<std::weak_ptr<BlockHandle>> blocks_;
 };

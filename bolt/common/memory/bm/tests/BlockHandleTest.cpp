@@ -44,6 +44,25 @@ TEST(BlockHandleTest, blockSealPinAndDiscardReclaim) {
   ASSERT_FALSE(manager.Pin(block).IsValid());
 }
 
+TEST(BlockHandleTest, bufferManagerRejectsNonOwnerThreadAccess) {
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_thread_confined"});
+
+  std::atomic<bool> rejected{false};
+  std::thread thread([&] {
+    try {
+      static_cast<void>(manager.GetMemoryUsage());
+    } catch (const BoltUserError&) {
+      rejected = true;
+    }
+  });
+  thread.join();
+
+  ASSERT_TRUE(rejected);
+}
+
 TEST(BlockHandleTest, discardReclaimReturnsActualFreedBytes) {
   memory::MemoryManager memoryManager;
   BufferManager manager(
@@ -180,15 +199,11 @@ TEST(BlockHandleTest, reloadFailurePropagatesAndDoesNotThunder) {
   EXPECT_GT(failures.load(), 0);
 }
 
-// BufferManager destruction must wake any in-flight SpillToDisk worker without
-// dereferencing the torn-down manager_. This races the destructor with a
-// manual SpillToDisk and asserts there is no crash.
-TEST(BlockHandleTest, destroyManagerDuringSpillDoesNotCrash) {
+TEST(BlockHandleTest, spillToDiskRejectsNonOwnerThreadAccess) {
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   auto bm = std::make_unique<BufferManager>(
-      memoryManager,
-      BufferManagerConfig{.poolName = "bm_destroy_during_spill"});
+      memoryManager, BufferManagerConfig{.poolName = "bm_spill_thread"});
 
   auto block = bm->AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,
@@ -197,9 +212,18 @@ TEST(BlockHandleTest, destroyManagerDuringSpillDoesNotCrash) {
                       .recoveryFn = nullptr},
       [](DataPtr p, ByteCount n) { std::memset(p, 7, n); });
 
-  std::thread t([block] { (void)block->SpillToDisk(); });
-  bm.reset();
+  std::atomic<bool> rejected{false};
+  std::thread t([block, &rejected] {
+    try {
+      (void)block->SpillToDisk();
+    } catch (const BoltUserError&) {
+      rejected = true;
+    }
+  });
   t.join();
+
+  ASSERT_TRUE(rejected);
+  bm.reset();
 }
 
 } // namespace bytedance::bolt::memory::bm

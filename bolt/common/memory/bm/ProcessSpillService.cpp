@@ -153,14 +153,31 @@ EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
                        << " workerThreadCount=0";
     return EvictResult{EvictResultKind::kBackpressured, 0};
   }
+  auto base = node.block.lock();
+  if (base == nullptr) {
+    skippedCounter_.Add(1);
+    return EvictResult{EvictResultKind::kSkipped, 0};
+  }
+  auto handle = std::dynamic_pointer_cast<BlockHandle>(base);
+  if (handle == nullptr) {
+    skippedCounter_.Add(1);
+    return EvictResult{EvictResultKind::kSkipped, 0};
+  }
+  auto request = handle->PrepareAsyncSpill(node.evictionSequence);
+  if (!request.has_value()) {
+    skippedCounter_.Add(1);
+    return EvictResult{EvictResultKind::kSkipped, 0};
+  }
   size_t queueDepth = 0;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (stopping_) {
+      handle->CommitAsyncSpillFailure(
+          node.evictionSequence, std::move(request->memory));
       failedCounter_.Add(1);
       return EvictResult{EvictResultKind::kFailed, 0};
     }
-    ready_.push_back(std::move(node));
+    ready_.push_back(std::move(*request));
     queueDepth = ready_.size();
     queueDepthGauge_.Set(static_cast<int64_t>(queueDepth));
   }
@@ -179,6 +196,41 @@ bool ProcessSpillService::WaitForProgress(
   const auto startEpoch = progressEpoch_;
   return progressCv_.wait_for(
       l, timeout, [&] { return stopping_ || progressEpoch_ != startEpoch; });
+}
+
+std::vector<ProcessSpillService::SpillCompletion>
+ProcessSpillService::DrainCompletions(
+    const std::shared_ptr<SpillOwnerToken>& owner) {
+  std::vector<SpillCompletion> completions;
+  std::lock_guard<std::mutex> l(mutex_);
+  for (auto it = completed_.begin(); it != completed_.end();) {
+    if (!it->owner.owner_before(owner) && !owner.owner_before(it->owner)) {
+      completions.push_back(std::move(*it));
+      it = completed_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return completions;
+}
+
+bool ProcessSpillService::HasPendingSpills(
+    const std::shared_ptr<SpillOwnerToken>& owner) const {
+  std::lock_guard<std::mutex> l(mutex_);
+  for (const auto& request : ready_) {
+    if (!request.owner.owner_before(owner) &&
+        !owner.owner_before(request.owner)) {
+      return true;
+    }
+  }
+  for (const auto& completion : completed_) {
+    if (!completion.owner.owner_before(owner) &&
+        !owner.owner_before(completion.owner)) {
+      return true;
+    }
+  }
+  auto active = activeByOwner_.find(owner);
+  return active != activeByOwner_.end() && active->second != 0;
 }
 
 SpillLocation ProcessSpillService::Write(
@@ -240,14 +292,18 @@ void ProcessSpillService::StopWorkers() {
       return;
     }
     stopping_ = true;
-    for (auto& node : ready_) {
-      if (auto base = node.block.lock()) {
-        if (auto handle = std::dynamic_pointer_cast<BlockHandle>(base)) {
-          handle->ClearSpillScheduled();
-        }
-      }
+    while (!ready_.empty()) {
+      auto request = std::move(ready_.front());
+      ready_.pop_front();
+      completed_.push_back(SpillCompletion{
+          request.owner,
+          request.blockId,
+          request.evictionSequence,
+          request.tag,
+          std::move(request.memory),
+          SpillLocation{},
+          "ProcessSpillService stopped before write"});
     }
-    ready_.clear();
     queueDepthGauge_.Set(0);
   }
   cv_.notify_all();
@@ -262,52 +318,62 @@ void ProcessSpillService::StopWorkers() {
 
 void ProcessSpillService::WorkerLoop() {
   for (;;) {
-    EvictionNode node;
+    SpillRequest request;
     {
       std::unique_lock<std::mutex> l(mutex_);
       cv_.wait(l, [&] { return stopping_ || !ready_.empty(); });
       if (stopping_) {
         return;
       }
-      node = std::move(ready_.front());
+      request = std::move(ready_.front());
       ready_.pop_front();
+      if (auto owner = request.owner.lock()) {
+        ++activeByOwner_[owner];
+      }
       queueDepthGauge_.Set(static_cast<int64_t>(ready_.size()));
     }
-    ExecuteSpill(std::move(node));
+    ExecuteSpill(std::move(request));
     NotifyProgress();
   }
 }
 
-void ProcessSpillService::ExecuteSpill(EvictionNode node) {
+void ProcessSpillService::ExecuteSpill(SpillRequest request) {
   ScopedBmTimer timer(executeDuration_);
-  auto base = node.block.lock();
-  if (base == nullptr) {
-    skippedCounter_.Add(1);
-    return;
-  }
-  auto handle = std::dynamic_pointer_cast<BlockHandle>(base);
-  if (handle == nullptr) {
-    skippedCounter_.Add(1);
-    return;
-  }
-  if (handle->EvictionSequence() != node.evictionSequence ||
-      handle->IsPinned()) {
-    handle->ClearSpillScheduled();
-    skippedCounter_.Add(1);
-    return;
-  }
+  SpillCompletion completion;
+  completion.owner = request.owner;
+  completion.blockId = request.blockId;
+  completion.evictionSequence = request.evictionSequence;
+  completion.tag = request.tag;
+  completion.memory = std::move(request.memory);
   try {
-    const auto bytes = handle->SpillToDisk();
+    BOLT_USER_CHECK_NOT_NULL(
+        completion.memory, "Async spill request has no resident memory");
+    const auto bytes = completion.memory->Size();
+    completion.location =
+        Write(completion.tag, completion.memory->Data(), bytes);
     executedCounter_.Add(1);
     freedBytesCounter_.Add(bytes);
-    BOLT_MEM_VLOG(1) << "ProcessSpillService processed block "
-                       << handle->Id() << " freed=" << bytes;
+    BOLT_MEM_VLOG(1) << "ProcessSpillService wrote async spill bytes="
+                     << bytes;
   } catch (const std::exception& e) {
-    handle->ClearSpillScheduled();
+    completion.error = e.what();
     failedCounter_.Add(1);
-    BOLT_MEM_LOG(WARNING)
-        << "ProcessSpillService failed to spill block " << handle->Id()
-        << ": " << e.what();
+    BOLT_MEM_LOG(WARNING) << "ProcessSpillService failed async spill: "
+                          << e.what();
+  }
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (auto owner = completion.owner.lock()) {
+      auto active = activeByOwner_.find(owner);
+      if (active != activeByOwner_.end()) {
+        if (active->second <= 1) {
+          activeByOwner_.erase(active);
+        } else {
+          --active->second;
+        }
+      }
+    }
+    completed_.push_back(std::move(completion));
   }
 }
 

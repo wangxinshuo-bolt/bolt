@@ -87,6 +87,7 @@ BufferManager::BufferManager(
     MemoryManager& memoryManager,
     const BufferManagerConfig& config)
     : memoryManager_(memoryManager),
+      ownerThreadId_(std::this_thread::get_id()),
       config_(config),
       metrics_(EffectiveMetricsRegistry(config_.metrics)),
       allocateRequestsCounter_(
@@ -105,6 +106,10 @@ BufferManager::BufferManager(
       leafPool_(rootPool_->addLeafChild("blocks")),
       pool_(config_),
       allocator_(pool_, *leafPool_),
+      spillOwnerToken_(std::make_shared<SpillOwnerToken>()),
+      context_(std::make_shared<BufferManagerContext>(
+          BufferManagerContext{
+              allocator_, std::nullopt, spillOwnerToken_, ownerThreadId_})),
       evictor_(*this) {
   BOLT_MEM_LOG(INFO) << "BufferManager created pool=" << config_.poolName
                      << " spillEnabled=" << config_.spillEnabled
@@ -126,28 +131,45 @@ void BufferManager::ResetProcessServicesForTesting() {
 
 BufferManager::~BufferManager() {
   BOLT_MEM_LOG(INFO) << "Destroying BufferManager";
-  std::vector<std::shared_ptr<BlockHandle>> liveBlocks;
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    shuttingDown_ = true;
-    liveBlocks.reserve(blocks_.size());
-    for (auto& weak : blocks_) {
-      if (auto block = weak.lock()) {
-        liveBlocks.push_back(std::move(block));
+  if (spillService_.has_value()) {
+    for (;;) {
+      DrainSpillCompletions();
+      if (!spillService_->get().HasPendingSpills(spillOwnerToken_)) {
+        break;
+      }
+      if (!spillService_->get().WaitForProgress(
+              0, config_.reserveWaitTimeout)) {
+        BOLT_MEM_LOG(WARNING)
+            << "BufferManager waiting for pending async spill before destroy"
+            << " pool=" << config_.poolName;
       }
     }
-    blocks_.clear();
   }
+  std::vector<std::shared_ptr<BlockHandle>> liveBlocks;
+  shuttingDown_ = true;
+  liveBlocks.reserve(blocks_.size());
+  for (auto& weak : blocks_) {
+    if (auto block = weak.lock()) {
+      liveBlocks.push_back(std::move(block));
+    }
+  }
+  blocks_.clear();
   for (auto& block : liveBlocks) {
     block->InvalidateForManagerDestruction();
   }
-  evictor_.SetSpillRequester(nullptr);
-  spillService_ = nullptr;
+  if (context_ != nullptr) {
+    context_->valid = false;
+    context_->spill.reset();
+  }
+  evictor_.ClearSpillRequester();
+  spillService_.reset();
+  context_.reset();
   leafPool_.reset();
   rootPool_.reset();
 }
 
 BufferHandle BufferManager::Allocate(AllocateOptions options) {
+  AssertOwnerThread();
   ScopedBmTimer timer(allocateDuration_);
   allocateRequestsCounter_.Add(1);
   BOLT_USER_CHECK_GT(options.size, 0, "Cannot allocate an empty block");
@@ -158,12 +180,9 @@ BufferHandle BufferManager::Allocate(AllocateOptions options) {
   if (IsSpillPolicy(options.policy)) {
     EnsureSpillService();
   }
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    BOLT_USER_CHECK(!shuttingDown_, "BufferManager is shutting down");
-  }
+  BOLT_USER_CHECK(!shuttingDown_, "BufferManager is shutting down");
 
-  auto block = std::make_shared<BlockHandle>(this, options);
+  auto block = std::make_shared<BlockHandle>(context_, options);
   auto memory = allocator_.Allocate(
       options.tag, options.size, BodyReservationKind(options.policy));
   block->InstallMemory(std::move(memory));
@@ -185,6 +204,7 @@ BufferHandle BufferManager::Allocate(AllocateOptions options) {
 std::shared_ptr<BlockHandle> BufferManager::AllocatePersistent(
     AllocateOptions options,
     std::function<void(DataPtr, ByteCount)> init) {
+  AssertOwnerThread();
   auto handle = Allocate(std::move(options));
   init(handle.MutableData(), handle.Size());
   auto block = handle.Block();
@@ -193,6 +213,7 @@ std::shared_ptr<BlockHandle> BufferManager::AllocatePersistent(
 }
 
 BufferHandle BufferManager::Pin(const std::shared_ptr<BlockHandle>& block) {
+  AssertOwnerThread();
   if (block == nullptr) {
     return BufferHandle();
   }
@@ -203,6 +224,7 @@ std::unique_ptr<AccountedMemory> BufferManager::AllocateMemory(
     MemoryTag tag,
     ByteCount bytes,
     ReservationKind kind) {
+  AssertOwnerThread();
   BOLT_USER_CHECK(
       kind == ReservationKind::kNormal || kind == ReservationKind::kPinned,
       "Public AllocateMemory only accepts normal or pinned reservations");
@@ -213,6 +235,7 @@ BufferPoolReservation BufferManager::ReserveMemory(
     MemoryTag tag,
     ByteCount bytes,
     ReservationKind kind) {
+  AssertOwnerThread();
   BOLT_USER_CHECK(
       kind == ReservationKind::kNormal || kind == ReservationKind::kPinned,
       "Public ReserveMemory only accepts normal or pinned reservations");
@@ -220,23 +243,23 @@ BufferPoolReservation BufferManager::ReserveMemory(
 }
 
 ByteCount BufferManager::GetMemoryUsage() const {
+  AssertOwnerThread();
   return pool_.GetMemoryUsage();
 }
 
 ByteCount BufferManager::GetMemoryUsage(MemoryTag tag) const {
+  AssertOwnerThread();
   return pool_.GetMemoryUsage(tag);
 }
 
 BufferPoolSnapshot BufferManager::Snapshot() const {
+  AssertOwnerThread();
   auto snapshot = pool_.Snapshot();
   std::vector<std::shared_ptr<BlockHandle>> liveBlocks;
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    liveBlocks.reserve(blocks_.size());
-    for (const auto& weak : blocks_) {
-      if (auto block = weak.lock()) {
-        liveBlocks.push_back(std::move(block));
-      }
+  liveBlocks.reserve(blocks_.size());
+  for (const auto& weak : blocks_) {
+    if (auto block = weak.lock()) {
+      liveBlocks.push_back(std::move(block));
     }
   }
   for (const auto& block : liveBlocks) {
@@ -259,30 +282,25 @@ BufferPoolSnapshot BufferManager::Snapshot() const {
 }
 
 ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
+  AssertOwnerThread();
   ScopedBmTimer timer(reclaimDuration_);
   reclaimRequestsCounter_.Add(1);
   const auto before = GetMemoryUsage();
   const auto reclaimableBefore = ReclaimableBytes();
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    for (auto it = blocks_.begin(); it != blocks_.end();) {
-      if (auto block = it->lock()) {
-        EnqueueEvictionCandidate(block);
-        ++it;
-      } else {
-        it = blocks_.erase(it);
-      }
+  ByteCount reclaimed = DrainSpillCompletions();
+  for (auto it = blocks_.begin(); it != blocks_.end();) {
+    if (auto block = it->lock()) {
+      EnqueueEvictionCandidate(block);
+      ++it;
+    } else {
+      it = blocks_.erase(it);
     }
   }
 
-  ByteCount reclaimed = 0;
-  bool scheduledSpill = false;
+  size_t scheduledSpillCount = 0;
   EvictionNode node;
-  while (evictor_.TryPopAnyCandidate(node)) {
-    if (targetBytes != 0 && reclaimed >= targetBytes) {
-      break;
-    }
-
+  while ((targetBytes == 0 || reclaimed < targetBytes) &&
+         evictor_.TryPopAnyCandidate(node)) {
     if (node.cost == EvictionCostClass::kSpill) {
       auto submit = evictor_.TryScheduleEvict(node);
       BOLT_MEM_VLOG(1) << "BufferManager reclaim spill candidate"
@@ -292,7 +310,7 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
                          << " cost=" << ToString(node.cost)
                          << " priority=" << static_cast<int>(node.priority);
       if (submit.kind == EvictResultKind::kScheduled) {
-        scheduledSpill = true;
+        ++scheduledSpillCount;
         continue;
       }
       auto base = node.block.lock();
@@ -314,17 +332,27 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
     reclaimed += result.freedBytes;
   }
 
-  if (scheduledSpill && (targetBytes == 0 || reclaimed < targetBytes) &&
-      spillService_ != nullptr) {
-    // A scheduled spill is not freed memory. Wait for at least one progress
-    // event and then compute the actual usage delta. This mirrors the design
-    // rule that only committed spill/release can be counted as reclaimed.
-    spillService_->WaitForProgress(
-        targetBytes == 0 ? 0 : targetBytes - reclaimed,
-        config_.reserveWaitTimeout);
-    const auto after = GetMemoryUsage();
-    reclaimed = std::max(reclaimed, before > after ? before - after : 0);
+  size_t completedSpillCount = 0;
+  while (completedSpillCount < scheduledSpillCount &&
+      spillService_.has_value()) {
+    size_t drained = 0;
+    reclaimed += DrainSpillCompletions(&drained);
+    completedSpillCount += drained;
+    if (completedSpillCount >= scheduledSpillCount) {
+      break;
+    }
+    if (!spillService_->get().WaitForProgress(
+            targetBytes == 0 || reclaimed >= targetBytes
+                ? 0
+                : targetBytes - reclaimed,
+            config_.reserveWaitTimeout)) {
+      break;
+    }
+    drained = 0;
+    reclaimed += DrainSpillCompletions(&drained);
+    completedSpillCount += drained;
   }
+  reclaimed += DrainSpillCompletions();
   reclaimBytesCounter_.Add(reclaimed);
   const auto snapshot = pool_.Snapshot();
   usedMemoryGauge_.Set(static_cast<int64_t>(snapshot.usedTotalBytes));
@@ -334,19 +362,17 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
                      << " usageBefore=" << before
                      << " usageAfter=" << snapshot.usedTotalBytes
                      << " reclaimableBefore=" << reclaimableBefore
-                     << " scheduledSpill=" << scheduledSpill;
+                     << " scheduledSpill=" << scheduledSpillCount;
   return reclaimed;
 }
 
 ByteCount BufferManager::ReclaimableBytes() const {
+  AssertOwnerThread();
   std::vector<std::shared_ptr<BlockHandle>> blocks;
-  {
-    std::lock_guard<std::mutex> l(mutex_);
-    blocks.reserve(blocks_.size());
-    for (const auto& weak : blocks_) {
-      if (auto block = weak.lock()) {
-        blocks.push_back(std::move(block));
-      }
+  blocks.reserve(blocks_.size());
+  for (const auto& weak : blocks_) {
+    if (auto block = weak.lock()) {
+      blocks.push_back(std::move(block));
     }
   }
 
@@ -360,7 +386,6 @@ ByteCount BufferManager::ReclaimableBytes() const {
 }
 
 void BufferManager::RegisterBlock(const std::shared_ptr<BlockHandle>& block) {
-  std::lock_guard<std::mutex> l(mutex_);
   BOLT_USER_CHECK(!shuttingDown_, "BufferManager is shutting down");
   blocks_.push_back(block);
 }
@@ -395,15 +420,85 @@ std::unique_ptr<MemoryReclaimer> BufferManager::CreateReclaimer() {
   return std::make_unique<BufferManagerReclaimer>(*this);
 }
 
+void BufferManager::AssertOwnerThread() const {
+  BOLT_USER_CHECK(
+      std::this_thread::get_id() == ownerThreadId_,
+      "BufferManager is thread-confined: public API must be called from the "
+      "thread that constructed it");
+}
+
+ByteCount BufferManager::DrainSpillCompletions(size_t* completionCount) {
+  if (completionCount != nullptr) {
+    *completionCount = 0;
+  }
+  if (!spillService_.has_value()) {
+    return 0;
+  }
+  ByteCount reclaimed = 0;
+  auto completions =
+      spillService_->get().DrainCompletions(spillOwnerToken_);
+  if (completionCount != nullptr) {
+    *completionCount = completions.size();
+  }
+  for (auto& completion : completions) {
+    auto block = FindBlockById(completion.blockId);
+    const auto memoryBytes =
+        completion.memory == nullptr ? 0 : completion.memory->Size();
+    if (completion.error.empty() && completion.location.Valid()) {
+      if (block != nullptr) {
+        reclaimed += block->CommitAsyncSpillSuccess(
+            completion.evictionSequence,
+            std::move(completion.location),
+            std::move(completion.memory));
+      } else {
+        spillService_->get().Release(completion.location);
+        completion.memory.reset();
+        reclaimed += memoryBytes;
+        BOLT_MEM_VLOG(1)
+            << "BufferManager dropped async spill completion for dead block_id="
+            << completion.blockId << " freed=" << memoryBytes;
+      }
+    } else {
+      if (block != nullptr) {
+        block->CommitAsyncSpillFailure(
+            completion.evictionSequence, std::move(completion.memory));
+      } else {
+        completion.memory.reset();
+        reclaimed += memoryBytes;
+      }
+      BOLT_MEM_LOG(WARNING) << "BufferManager async spill failed block_id="
+                            << completion.blockId
+                            << " error=" << completion.error;
+    }
+  }
+  return reclaimed;
+}
+
+std::shared_ptr<BlockHandle> BufferManager::FindBlockById(uint64_t blockId) {
+  for (auto it = blocks_.begin(); it != blocks_.end();) {
+    auto block = it->lock();
+    if (block == nullptr) {
+      it = blocks_.erase(it);
+      continue;
+    }
+    if (block->Id() == blockId) {
+      return block;
+    }
+    ++it;
+  }
+  return nullptr;
+}
+
 void BufferManager::EnsureSpillService() {
-  if (spillService_ != nullptr) {
+  if (spillService_.has_value()) {
     return;
   }
   BOLT_USER_CHECK(
       config_.spillEnabled,
       "BufferManager spill is disabled but kSpillToDisk was requested");
-  spillService_ = &ProcessSpillService::Instance();
-  evictor_.SetSpillRequester(spillService_);
+  spillService_ = ProcessSpillService::Instance();
+  context_->spill = spillService_;
+  evictor_.SetSpillRequester(spillService_->get());
 }
 
 } // namespace bytedance::bolt::memory::bm

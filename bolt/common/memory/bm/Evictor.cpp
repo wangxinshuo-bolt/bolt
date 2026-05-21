@@ -30,8 +30,12 @@ size_t priorityIndex(Priority priority) {
 
 BlockEvictor::BlockEvictor(BufferManager& manager) : manager_(manager) {}
 
-void BlockEvictor::SetSpillRequester(SpillRequester* requester) {
-  spillRequester_.store(requester, std::memory_order_release);
+void BlockEvictor::SetSpillRequester(SpillRequester& requester) {
+  spillRequester_ = requester;
+}
+
+void BlockEvictor::ClearSpillRequester() {
+  spillRequester_.reset();
 }
 
 void BlockEvictor::Enqueue(EvictionNode node) {
@@ -112,8 +116,7 @@ EvictResult BlockEvictor::TryScheduleEvict(const EvictionNode& node) {
   if (!block->TryMarkSpillScheduled(node.evictionSequence)) {
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
-  auto* requester = spillRequester_.load(std::memory_order_acquire);
-  if (requester == nullptr) {
+  if (!spillRequester_.has_value()) {
     block->ClearSpillScheduled();
     // No requester wired (e.g. shutting down). Reserve must observe a
     // failure rather than spin: the caller will fall through to its
@@ -121,7 +124,7 @@ EvictResult BlockEvictor::TryScheduleEvict(const EvictionNode& node) {
     return EvictResult{EvictResultKind::kFailed, 0};
   }
   EvictionNode submitted = node;
-  auto result = requester->SubmitSpill(std::move(submitted));
+  auto result = spillRequester_->get().SubmitSpill(std::move(submitted));
   if (result.kind != EvictResultKind::kScheduled) {
     block->ClearSpillScheduled();
   }
@@ -131,11 +134,10 @@ EvictResult BlockEvictor::TryScheduleEvict(const EvictionNode& node) {
 bool BlockEvictor::WaitForProgress(
     ByteCount bytesNeeded,
     std::chrono::milliseconds timeout) {
-  auto* requester = spillRequester_.load(std::memory_order_acquire);
-  if (requester == nullptr) {
+  if (!spillRequester_.has_value()) {
     return false;
   }
-  return requester->WaitForProgress(bytesNeeded, timeout);
+  return spillRequester_->get().WaitForProgress(bytesNeeded, timeout);
 }
 
 } // namespace bytedance::bolt::memory::bm

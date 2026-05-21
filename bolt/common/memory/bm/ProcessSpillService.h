@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -18,9 +19,13 @@
 #include "bolt/common/memory/bm/EvictionTypes.h"
 #include "bolt/common/memory/bm/DiskIo.h"
 #include "bolt/common/memory/bm/Metrics.h"
+#include "bolt/common/memory/bm/BufferPool.h"
 #include "bolt/common/memory/bm/SpillStore.h"
 
 namespace bytedance::bolt::memory::bm {
+
+class BufferManager;
+struct SpillOwnerToken {};
 
 // Process-wide spill service configuration. Production callers install this
 // through BufferManager::InitializeProcessServices(); ConfigureDefault() is
@@ -92,6 +97,29 @@ class ProcessSpillService : public SpillRequester {
       ByteCount bytesNeeded,
       std::chrono::milliseconds timeout) override;
 
+  // Async workers exchange only immutable bytes plus a block id token with
+  // BufferManager. They must not own or mutate BlockHandle instances.
+  struct SpillRequest {
+    std::weak_ptr<SpillOwnerToken> owner;
+    uint64_t blockId{0};
+    uint64_t evictionSequence{0};
+    MemoryTag tag{MemoryTag::kInternal};
+    std::unique_ptr<AccountedMemory> memory;
+  };
+
+  struct SpillCompletion {
+    std::weak_ptr<SpillOwnerToken> owner;
+    uint64_t blockId{0};
+    uint64_t evictionSequence{0};
+    MemoryTag tag{MemoryTag::kInternal};
+    std::unique_ptr<AccountedMemory> memory;
+    SpillLocation location;
+    std::string error;
+  };
+
+  std::vector<SpillCompletion> DrainCompletions(
+      const std::shared_ptr<SpillOwnerToken>& owner);
+
   // Snapshot of total disk bytes currently held by the process spill store.
   // Updated atomically by Write/Release; safe to read from any thread.
   ByteCount UsedDiskBytes() const {
@@ -113,6 +141,7 @@ class ProcessSpillService : public SpillRequester {
   // Installs the configuration used by lazy initialization. Exposed only to
   // BufferManager so process service setup has a single public entry point.
   static void ConfigureDefault(ProcessSpillServiceConfig config);
+  bool HasPendingSpills(const std::shared_ptr<SpillOwnerToken>& owner) const;
 
   // unique_ptr<ProcessSpillService> in the singleton holder needs to invoke
   // our destructor; expose it via std::default_delete without leaking the
@@ -127,7 +156,7 @@ class ProcessSpillService : public SpillRequester {
   void StopWorkers();
   void WorkerLoop();
   void NotifyProgress();
-  void ExecuteSpill(EvictionNode node);
+  void ExecuteSpill(SpillRequest request);
 
   // Best-effort cleanup of <root>/bolt_spill_<pid>_* directories whose pid
   // is no longer alive. Called once per process at construction time. Any
@@ -153,7 +182,12 @@ class ProcessSpillService : public SpillRequester {
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::condition_variable progressCv_;
-  std::deque<EvictionNode> ready_;
+  std::deque<SpillRequest> ready_;
+  std::deque<SpillCompletion> completed_;
+  std::map<std::weak_ptr<SpillOwnerToken>,
+           size_t,
+           std::owner_less<std::weak_ptr<SpillOwnerToken>>>
+      activeByOwner_;
   bool stopping_{false};
   bool started_{false};
   uint64_t progressEpoch_{0};

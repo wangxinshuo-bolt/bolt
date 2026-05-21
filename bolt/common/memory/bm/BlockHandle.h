@@ -9,16 +9,19 @@
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 
 #include "bolt/common/memory/bm/BufferHandle.h"
 #include "bolt/common/memory/bm/BufferManagerConfig.h"
 #include "bolt/common/memory/bm/BufferPool.h"
 #include "bolt/common/memory/bm/EvictionTypes.h"
+#include "bolt/common/memory/bm/ProcessSpillService.h"
 #include "bolt/common/memory/bm/SpillStore.h"
 
 namespace bytedance::bolt::memory::bm {
 
 class BufferManager;
+struct BufferManagerContext;
 
 // Internal state-machine wrapper for a BufferManager block. BlockHandle owns
 // the resident memory (or spilled representation) and tracks the lifecycle a
@@ -42,7 +45,9 @@ class BlockHandle : public BlockHandleBase,
   // BlockHandle (BufferManager invalidates blocks on shutdown via
   // InvalidateForManagerDestruction). 'options' is captured by value and
   // drives the eviction policy and recovery callback.
-  BlockHandle(BufferManager* manager, AllocateOptions options);
+  BlockHandle(
+      std::weak_ptr<BufferManagerContext> context,
+      AllocateOptions options);
 
   // Releases any resident memory and spilled file the block still owns.
   // Marks the block invalid. Never throws.
@@ -98,6 +103,20 @@ class BlockHandle : public BlockHandleBase,
   // or completed spill attempt.
   void ClearSpillScheduled() noexcept;
 
+  // Owner-thread async spill prepare/commit path. Prepare moves resident
+  // memory into a tokenized request keyed by block id; process spill workers
+  // write bytes only and never keep this BlockHandle alive. Commit methods
+  // are called by the owning BufferManager thread after it drains completions.
+  std::optional<ProcessSpillService::SpillRequest> PrepareAsyncSpill(
+      uint64_t expectedSequence);
+  ByteCount CommitAsyncSpillSuccess(
+      uint64_t expectedSequence,
+      SpillLocation location,
+      std::unique_ptr<AccountedMemory> memory);
+  void CommitAsyncSpillFailure(
+      uint64_t expectedSequence,
+      std::unique_ptr<AccountedMemory> memory);
+
   // Returns the current state in the lifecycle state machine.
   BlockState State() const;
 
@@ -146,7 +165,7 @@ class BlockHandle : public BlockHandleBase,
   DataPtr MutableDataLocked(bool initialWrite);
 
   const uint64_t id_{0};
-  BufferManager* manager_{nullptr};
+  std::weak_ptr<BufferManagerContext> context_;
   const AllocateOptions options_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;

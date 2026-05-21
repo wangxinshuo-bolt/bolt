@@ -26,33 +26,34 @@
 #include "bolt/common/memory/Memory.h"
 #include "bolt/common/memory/bm/BufferManager.h"
 
-DEFINE_string(
-    bm_sort_benchmark_sizes_gb,
-    "10,100",
-    "Comma-separated logical data sizes in GB. Default runs 10GB and 100GB.");
-DEFINE_string(
-    bm_sort_benchmark_sizes_mb,
-    "",
-    "Comma-separated logical data sizes in MB. Overrides sizes_gb for smoke "
-    "tests.");
+DEFINE_uint64(
+    bm_sort_benchmark_size_gb,
+    0,
+    "Logical data size in GB.");
+DEFINE_uint64(
+    bm_sort_benchmark_size_mb,
+    2048,
+    "Logical data size in MB. When non-zero, overrides size_gb for smoke tests.");
 DEFINE_uint64(
     bm_sort_benchmark_memory_budget_mb,
-    4096,
-    "Resident BufferManager memory budget used to trigger Reclaim().");
-DEFINE_uint64(
-    bm_sort_benchmark_chunk_mb,
     256,
-    "Fallback sorted run block size when block_sizes_kb is empty.");
+    "Resident BufferManager memory budget used to trigger Reclaim().");
+DEFINE_uint32(
+    bm_sort_benchmark_spill_worker_threads,
+    2,
+    "ProcessSpillService worker thread count. Use 0 to benchmark the "
+    "synchronous backpressure fallback path.");
 DEFINE_string(
-    bm_sort_benchmark_block_sizes_kb,
-    "",
-    "Comma-separated fixed BufferManager block sizes in KB. If set, these "
-    "sizes are cycled and weighted_block_sizes_kb is ignored.");
+    bm_sort_benchmark_disk_kind,
+    "probe",
+    "Disk kind policy: probe, nvme, ssd, hdd, network_fs, or unknown. "
+    "Non-probe values force the spill service disk kind.");
 DEFINE_string(
     bm_sort_benchmark_weighted_block_sizes_kb,
     "1:4,4:8,16:8,64:8,256:8,1024:6,4096:4,8192:3,16384:2,32768:2,65536:1,131072:1",
     "Comma-separated weighted block-size profile in size_kb:weight format. "
-    "Used when block_sizes_kb is empty.");
+    "The benchmark expands this profile into deterministic BufferManager block "
+    "sizes.");
 DEFINE_uint64(
     bm_sort_benchmark_block_size_seed,
     0x9e3779b97f4a7c15ULL,
@@ -92,43 +93,21 @@ uint64_t splitmix64(uint64_t x) {
   return x ^ (x >> 31);
 }
 
-std::vector<uint64_t> parseSizeUnits(const std::string& csv, uint64_t unit) {
-  std::vector<uint64_t> sizes;
-  size_t start = 0;
-  while (start < csv.size()) {
-    const auto comma = csv.find(',', start);
-    const auto token = csv.substr(
-        start, comma == std::string::npos ? std::string::npos : comma - start);
-    if (!token.empty()) {
-      sizes.push_back(std::stoull(token) * unit);
-    }
-    if (comma == std::string::npos) {
-      break;
-    }
-    start = comma + 1;
+uint64_t parseBenchmarkSize() {
+  if (FLAGS_bm_sort_benchmark_size_mb != 0) {
+    return FLAGS_bm_sort_benchmark_size_mb * kMiB;
   }
-  return sizes;
+  BOLT_USER_CHECK_GT(
+      FLAGS_bm_sort_benchmark_size_gb,
+      0,
+      "bm_sort_benchmark_size_gb must be positive");
+  return FLAGS_bm_sort_benchmark_size_gb * kGiB;
 }
 
-std::vector<uint64_t> parseBenchmarkSizes() {
-  if (!FLAGS_bm_sort_benchmark_sizes_mb.empty()) {
-    return parseSizeUnits(FLAGS_bm_sort_benchmark_sizes_mb, kMiB);
-  }
-  return parseSizeUnits(FLAGS_bm_sort_benchmark_sizes_gb, kGiB);
-}
-
-std::vector<uint64_t> parseBlockSizes(uint64_t fallbackBytes) {
-  if (!FLAGS_bm_sort_benchmark_block_sizes_kb.empty()) {
-    auto sizes = parseSizeUnits(FLAGS_bm_sort_benchmark_block_sizes_kb, 1024);
-    BOLT_USER_CHECK(!sizes.empty(), "block_sizes_kb must not be empty");
-    for (const auto bytes : sizes) {
-      BOLT_USER_CHECK_GT(bytes, 0, "block_sizes_kb values must be positive");
-    }
-    return sizes;
-  }
-  if (FLAGS_bm_sort_benchmark_weighted_block_sizes_kb.empty()) {
-    return {fallbackBytes};
-  }
+std::vector<uint64_t> parseBlockSizeProfile() {
+  BOLT_USER_CHECK(
+      !FLAGS_bm_sort_benchmark_weighted_block_sizes_kb.empty(),
+      "bm_sort_benchmark_weighted_block_sizes_kb must not be empty");
   std::vector<std::pair<uint64_t, uint64_t>> weighted;
   uint64_t totalWeight = 0;
   size_t start = 0;
@@ -176,6 +155,30 @@ std::vector<uint64_t> parseBlockSizes(uint64_t fallbackBytes) {
   return sizes;
 }
 
+DiskKind parseDiskKind() {
+  const auto& value = FLAGS_bm_sort_benchmark_disk_kind;
+  if (value == "probe" || value == "unknown") {
+    return DiskKind::kUnknown;
+  }
+  if (value == "nvme") {
+    return DiskKind::kNvme;
+  }
+  if (value == "ssd") {
+    return DiskKind::kSsd;
+  }
+  if (value == "hdd") {
+    return DiskKind::kHdd;
+  }
+  if (value == "network_fs") {
+    return DiskKind::kNetworkFs;
+  }
+  BOLT_USER_FAIL(
+      "Unsupported bm_sort_benchmark_disk_kind '{}'. Expected probe, nvme, "
+      "ssd, hdd, network_fs, or unknown",
+      value);
+  return DiskKind::kUnknown;
+}
+
 std::string formatBytes(uint64_t bytes) {
   if (bytes % kGiB == 0) {
     return fmt::format("{}GiB", bytes / kGiB);
@@ -184,17 +187,6 @@ std::string formatBytes(uint64_t bytes) {
     return fmt::format("{}MiB", bytes / kMiB);
   }
   return fmt::format("{}B", bytes);
-}
-
-std::string formatSizeList(const std::vector<uint64_t>& sizes) {
-  std::string result;
-  for (size_t i = 0; i < sizes.size(); ++i) {
-    if (i != 0) {
-      result += ",";
-    }
-    result += formatBytes(sizes[i]);
-  }
-  return result;
 }
 
 std::string formatSizeDistribution(const std::vector<uint64_t>& sizes) {
@@ -372,10 +364,51 @@ class BenchmarkMetricsRegistry final : public MetricsRegistry {
     }
   }
 
+  uint64_t CounterValue(std::string_view name) const {
+    std::lock_guard<std::mutex> l(mutex_);
+    uint64_t total = 0;
+    for (const auto& [key, counter] : counters_) {
+      if (matchesMetricName(key, name)) {
+        total += counter->value();
+      }
+    }
+    return total;
+  }
+
+  int64_t GaugeValue(std::string_view name) const {
+    std::lock_guard<std::mutex> l(mutex_);
+    int64_t total = 0;
+    for (const auto& [key, gauge] : gauges_) {
+      if (matchesMetricName(key, name)) {
+        total += gauge->value();
+      }
+    }
+    return total;
+  }
+
+  uint64_t HistogramCount(std::string_view name) const {
+    std::lock_guard<std::mutex> l(mutex_);
+    uint64_t total = 0;
+    for (const auto& [key, histogram] : histograms_) {
+      if (matchesMetricName(key, name)) {
+        total += histogram->count();
+      }
+    }
+    return total;
+  }
+
  private:
   static std::string makeKey(std::string_view name, std::string_view labels) {
     return labels.empty() ? std::string(name)
                           : fmt::format("{}{{{}}}", name, labels);
+  }
+
+  static bool matchesMetricName(
+      const std::string& key,
+      std::string_view name) {
+    return key == name ||
+        (key.size() > name.size() && key.compare(0, name.size(), name) == 0 &&
+         key[name.size()] == '{');
   }
 
   mutable std::mutex mutex_;
@@ -420,9 +453,7 @@ class SortBenchmark {
         formatBytes(dataBytes_));
     std::cout << fmt::format(
         "blockSizeProfile={} blockSizeDistribution={} memoryBudgetBytes={}\n",
-        FLAGS_bm_sort_benchmark_block_sizes_kb.empty()
-            ? FLAGS_bm_sort_benchmark_weighted_block_sizes_kb
-            : FLAGS_bm_sort_benchmark_block_sizes_kb,
+        FLAGS_bm_sort_benchmark_weighted_block_sizes_kb,
         formatSizeDistribution(blockSizes_),
         memoryBudgetBytes_);
 
@@ -447,6 +478,7 @@ class SortBenchmark {
 
     const auto snapshot = manager_.Snapshot();
     metrics_.print(std::cout);
+    printFeatureCoverage(std::cout);
     std::cout << fmt::format(
         "\nSummary: dataBytes={} rows={} runs={} generateSortMs={} "
         "mergeMs={} verifyMs={} totalMs={} orderedChecksum={} "
@@ -718,6 +750,53 @@ class SortBenchmark {
     }
   }
 
+  void printFeatureCoverage(std::ostream& out) const {
+    const auto counter = [&](std::string_view name) {
+      return metrics_.CounterValue(name);
+    };
+    const auto histogram = [&](std::string_view name) {
+      return metrics_.HistogramCount(name);
+    };
+    const auto line = [&](std::string_view name, bool covered, uint64_t value) {
+      out << "  " << name << " = " << (covered ? "yes" : "no")
+          << " value=" << value << "\n";
+    };
+
+    out << "\nBufferManager feature coverage\n";
+    line("reclaim", counter("bm_reclaim_requests_total") > 0,
+         counter("bm_reclaim_requests_total"));
+    line("spill_submit", counter("bm_spill_submit_total") > 0,
+         counter("bm_spill_submit_total"));
+    line("sync_backpressure_fallback",
+         counter("bm_spill_backpressured_total") > 0,
+         counter("bm_spill_backpressured_total"));
+    line("async_spill_scheduled", counter("bm_spill_scheduled_total") > 0,
+         counter("bm_spill_scheduled_total"));
+    line("async_spill_executed", counter("bm_spill_executed_total") > 0,
+         counter("bm_spill_executed_total"));
+    line("async_wait_for_progress",
+         histogram("bm_wait_for_spill_progress_duration_us") > 0,
+         histogram("bm_wait_for_spill_progress_duration_us"));
+    line("small_spill_slot", counter("bm_spill_small_slot_total") > 0,
+         counter("bm_spill_small_slot_total"));
+    line("dedicated_spill_file", counter("bm_spill_dedicated_file_total") > 0,
+         counter("bm_spill_dedicated_file_total"));
+    line("compression_attempt", counter("bm_spill_compress_attempt_total") > 0,
+         counter("bm_spill_compress_attempt_total"));
+    line("compression_saved_bytes",
+         counter("bm_spill_compress_saved_bytes") > 0,
+         counter("bm_spill_compress_saved_bytes"));
+    line("compression_raw_fallback",
+         counter("bm_spill_compress_fallback_raw_total") > 0,
+         counter("bm_spill_compress_fallback_raw_total"));
+    line("spill_read", counter("bm_spill_bytes_read") > 0,
+         counter("bm_spill_bytes_read"));
+    line("spill_release", counter("bm_spill_release_total") > 0,
+         counter("bm_spill_release_total"));
+    out << "  configured_spill_workers = "
+        << FLAGS_bm_sort_benchmark_spill_worker_threads << "\n";
+  }
+
   uint64_t dataBytes_;
   uint64_t memoryBudgetBytes_;
   std::vector<uint64_t> blockSizes_;
@@ -742,7 +821,8 @@ void configureServices(BenchmarkMetricsRegistry& metrics) {
 
   ProcessSpillServiceConfig spillConfig;
   spillConfig.spillDir = FLAGS_bm_sort_benchmark_spill_dir;
-  spillConfig.workerThreadCount = 0;
+  spillConfig.forcedKind = parseDiskKind();
+  spillConfig.workerThreadCount = FLAGS_bm_sort_benchmark_spill_worker_threads;
   spillConfig.cleanupOnDestroy = FLAGS_bm_sort_benchmark_cleanup;
   spillConfig.metrics = &metrics;
   ProcessSpillService::ConfigureDefault(std::move(spillConfig));
@@ -758,17 +838,14 @@ int main(int argc, char** argv) {
   bytedance::bolt::memory::bm::BenchmarkMetricsRegistry metrics;
   bytedance::bolt::memory::bm::configureServices(metrics);
 
-  const auto sizes =
-      bytedance::bolt::memory::bm::parseBenchmarkSizes();
+  const auto size = bytedance::bolt::memory::bm::parseBenchmarkSize();
   const uint64_t memoryBudgetBytes =
       FLAGS_bm_sort_benchmark_memory_budget_mb * 1024ULL * 1024ULL;
-  const uint64_t chunkBytes =
-      FLAGS_bm_sort_benchmark_chunk_mb * 1024ULL * 1024ULL;
-  auto blockSizes = bytedance::bolt::memory::bm::parseBlockSizes(chunkBytes);
+  auto blockSizes = bytedance::bolt::memory::bm::parseBlockSizeProfile();
 
-  for (const auto size : sizes) {
+  {
     bytedance::bolt::memory::bm::SortBenchmark benchmark(
-        size, memoryBudgetBytes, blockSizes, metrics);
+        size, memoryBudgetBytes, std::move(blockSizes), metrics);
     benchmark.run();
   }
   bytedance::bolt::memory::bm::ProcessSpillService::ResetForTesting();

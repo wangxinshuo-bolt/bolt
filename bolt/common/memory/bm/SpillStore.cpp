@@ -345,6 +345,7 @@ void SpillStore::Read(
 void SpillStore::Release(const SpillLocation& location) {
   ScopedBmTimer timer(releaseDuration_);
   if (!location.Valid()) {
+    invalidReleaseCounter_.Add(1);
     return;
   }
   bool live = false;

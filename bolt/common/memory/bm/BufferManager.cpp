@@ -90,7 +90,7 @@ BufferManager::BufferManager(
       allocator_(pool_, *leafPool_),
       evictor_(*this) {
   BOLT_MEM_LOG(INFO) << "BufferManager created pool=" << config_.poolName
-                     << " spillEnabled=" << (spillService_ != nullptr)
+                     << " spillService=lazy"
                      << " reserveWaitTimeoutMs="
                      << config_.reserveWaitTimeout.count();
 }

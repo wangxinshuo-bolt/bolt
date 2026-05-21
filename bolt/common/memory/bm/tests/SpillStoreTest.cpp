@@ -326,5 +326,37 @@ TEST(SpillStoreTest, recordsMetricsForWriteReadReleaseAndCompressionPath) {
             1);
 }
 
+TEST(SpillStoreTest, recordsInvalidAndDoubleReleaseMetrics) {
+  auto root = std::filesystem::temp_directory_path() /
+      "bolt_bm_spill_store_release_edge_metrics_test";
+  std::filesystem::remove_all(root);
+
+  test::RecordingMetricsRegistry metrics;
+  auto engine = std::make_unique<RecordingDiskIoEngine>();
+  DiskIoScheduler scheduler(std::move(engine), syncConfig());
+
+  SpillStore store(
+      SpillStoreConfig{.spillDir = root.string(),
+                       .cleanupOnDestroy = true,
+                       .diskProbe = ssdProbe(),
+                       .smallSpill = SmallSpillConfig{},
+                       .compression = SpillCompressionConfig{}},
+      &metrics,
+      &scheduler);
+
+  SpillLocation invalid;
+  store.Release(invalid);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_invalid_release", "disk=ssd"), 1);
+
+  std::vector<uint8_t> payload(32 << 10, 9);
+  auto location =
+      store.Write(MemoryTag::kShuffle, payload.data(), payload.size());
+  store.Release(location);
+  store.Release(location);
+
+  EXPECT_EQ(metrics.CounterValue("bm_spill_release_total", "disk=ssd"), 1);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_double_release", "disk=ssd"), 1);
+}
+
 } // namespace
 } // namespace bytedance::bolt::memory::bm

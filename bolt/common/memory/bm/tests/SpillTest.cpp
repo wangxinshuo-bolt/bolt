@@ -246,6 +246,37 @@ TEST(SpillTest, processSpillServiceRecordsSubmitBackpressureMetrics) {
   EXPECT_EQ(metrics.HistogramCount("bm_spill_submit_duration_us"), 1);
 }
 
+TEST(SpillTest, processSpillServiceRecordsSkippedExpiredSubmit) {
+  auto root = std::filesystem::temp_directory_path() /
+      "bolt_bm_test_process_spill_skipped";
+  std::filesystem::remove_all(root);
+  std::filesystem::create_directories(root);
+
+  test::RecordingMetricsRegistry metrics;
+  DiskIoConfig ioConfig;
+  ioConfig.backend = DiskIoBackend::kSync;
+  ioConfig.initialQueueDepth = 4;
+  ioConfig.minQueueDepth = 1;
+  ioConfig.maxQueueDepth = 16;
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(ioConfig);
+
+  ProcessSpillServiceConfig serviceConfig;
+  serviceConfig.spillDir = root.string();
+  serviceConfig.workerThreadCount = 1;
+  serviceConfig.cleanupOnDestroy = true;
+  serviceConfig.diskProbeDuration = std::chrono::milliseconds(0);
+  serviceConfig.metrics = &metrics;
+  auto service = ProcessSpillService::CreateForTesting(std::move(serviceConfig));
+
+  EvictionNode node;
+  node.cost = EvictionCostClass::kSpill;
+
+  ASSERT_EQ(service->SubmitSpill(node).kind, EvictResultKind::kSkipped);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_submit_total"), 1);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_skipped_total"), 1);
+  EXPECT_EQ(metrics.CounterValue("bm_spill_scheduled_total"), 0);
+}
+
 TEST(SpillTest, spillPoliciesUseConfiguredProcessService) {
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;

@@ -6,6 +6,7 @@
 #pragma once
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <string>
 
@@ -18,6 +19,12 @@ struct DiskProbeConfig {
   std::chrono::milliseconds duration{std::chrono::seconds(1)};
   DiskKind forcedKind{DiskKind::kUnknown};
   DiskKind fallbackKind{DiskKind::kHdd};
+  size_t blockBytes{4096};
+  uint64_t probeFileBytes{64ULL * 1024ULL * 1024ULL};
+  uint64_t nvmeMinIops{40'000};
+  uint64_t ssdMinIops{2'000};
+  uint64_t writeFsyncEveryOps{64};
+  uint64_t offsetStride{104'729};
 };
 
 struct DiskProbeResult {

@@ -40,7 +40,18 @@ class BufferManager {
   // Creates a BufferManager backed by a dedicated Bolt MemoryPool subtree.
   // The constructor registers the pool subtree under 'memoryManager'.
   // Throws BoltUserError on invalid config (see BufferManagerConfig docs).
-  BufferManager(MemoryManager& memoryManager, BufferManagerConfig config);
+  BufferManager(
+      MemoryManager& memoryManager,
+      const BufferManagerConfig& config = {});
+
+  // Initializes process-level services shared by all BufferManagers in the
+  // process. Must be called before using EvictPolicy::kSpillToDisk.
+  static void InitializeProcessServices(
+      BufferManagerProcessServicesConfig config);
+
+  // Tests only: tears down process-level services so the next test can install
+  // an isolated configuration.
+  static void ResetProcessServicesForTesting();
 
   // Stops background work, invalidates live blocks, and tears down owned
   // pools. After the destructor returns, any still-live

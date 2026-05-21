@@ -16,17 +16,16 @@
 #include <vector>
 
 #include "bolt/common/memory/bm/EvictionTypes.h"
+#include "bolt/common/memory/bm/DiskIo.h"
 #include "bolt/common/memory/bm/Metrics.h"
 #include "bolt/common/memory/bm/SpillStore.h"
 
 namespace bytedance::bolt::memory::bm {
 
-// Process-wide spill service configuration. Pass via ConfigureDefault()
-// before the first Instance() call. ConfigureDefault() must be called
-// exactly once: any subsequent call (including a re-call after
-// ResetForTesting) throws BoltUserError. Instance() also throws if no
-// ConfigureDefault has been issued, because the service has no implicit
-// process defaults.
+// Process-wide spill service configuration. Production callers install this
+// through BufferManager::InitializeProcessServices(); ConfigureDefault() is
+// kept as the internal singleton hook. Instance() throws if no configuration
+// has been installed, because the service has no implicit process defaults.
 struct ProcessSpillServiceConfig {
   // Single spill directory. Must be non-empty.
   std::string spillDir;
@@ -43,6 +42,12 @@ struct ProcessSpillServiceConfig {
   // Active disk probe duration for each spill directory. Zero disables active
   // probing and uses the configured forced/fallback kind.
   std::chrono::milliseconds diskProbeDuration{std::chrono::seconds(1)};
+  // Probe geometry and classification policy. spillDir, forcedKind,
+  // unknownFallbackKind, and diskProbeDuration remain the authoritative
+  // process-level fields and are copied into this probe config at startup.
+  DiskProbeConfig diskProbe;
+  // Process-wide disk I/O scheduler policy used by the spill store.
+  DiskIoConfig diskIo;
   // Small spill block packing policy. When sizeClasses is empty, the store
   // derives defaults from the effective disk kind.
   SmallSpillConfig smallSpill;
@@ -70,14 +75,6 @@ class ProcessSpillService : public SpillRequester {
   // same reference. Throws BoltUserError if ConfigureDefault has not been
   // called.
   static ProcessSpillService& Instance();
-
-  // Installs the configuration used by lazy initialization. Must be called
-  // exactly once per process (including across ResetForTesting cycles in
-  // tests). Validates: 'config.spillDir' must be non-empty.
-  // Throws BoltUserError on:
-  //   * a second invocation while an Instance is alive
-  //   * an empty spillDir.
-  static void ConfigureDefault(ProcessSpillServiceConfig config);
 
   // Tests only: tears down the singleton so the next ConfigureDefault can
   // succeed. Safe to call when no Instance has been created.
@@ -111,6 +108,12 @@ class ProcessSpillService : public SpillRequester {
   ProcessSpillService& operator=(const ProcessSpillService&) = delete;
 
  private:
+  friend class BufferManager;
+
+  // Installs the configuration used by lazy initialization. Exposed only to
+  // BufferManager so process service setup has a single public entry point.
+  static void ConfigureDefault(ProcessSpillServiceConfig config);
+
   // unique_ptr<ProcessSpillService> in the singleton holder needs to invoke
   // our destructor; expose it via std::default_delete without leaking the
   // dtor into the public API.

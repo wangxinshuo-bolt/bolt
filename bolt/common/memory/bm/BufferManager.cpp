@@ -64,13 +64,30 @@ std::string uniquePoolName(const std::string& configuredName) {
   return configuredName;
 }
 
+ProcessSpillServiceConfig makeProcessSpillConfig(
+    const BufferManagerProcessServicesConfig& config) {
+  ProcessSpillServiceConfig spill;
+  spill.spillDir = config.spill.spillDir;
+  spill.forcedKind = config.spill.forcedKind;
+  spill.workerThreadCount = config.spill.workerThreadCount;
+  spill.metrics = config.metrics;
+  spill.unknownFallbackKind = config.spill.unknownFallbackKind;
+  spill.cleanupOnDestroy = config.spill.cleanupOnDestroy;
+  spill.diskProbeDuration = config.spill.diskProbeDuration;
+  spill.diskProbe = config.spill.diskProbe;
+  spill.diskIo = config.spill.diskIo;
+  spill.smallSpill = config.spill.smallSpill;
+  spill.compression = config.spill.compression;
+  return spill;
+}
+
 } // namespace
 
 BufferManager::BufferManager(
     MemoryManager& memoryManager,
-    BufferManagerConfig config)
+    const BufferManagerConfig& config)
     : memoryManager_(memoryManager),
-      config_(std::move(config)),
+      config_(config),
       metrics_(EffectiveMetricsRegistry(config_.metrics)),
       allocateRequestsCounter_(
           metrics_.GetCounter("bm_allocate_requests_total", "")),
@@ -90,9 +107,21 @@ BufferManager::BufferManager(
       allocator_(pool_, *leafPool_),
       evictor_(*this) {
   BOLT_MEM_LOG(INFO) << "BufferManager created pool=" << config_.poolName
-                     << " spillService=lazy"
+                     << " spillEnabled=" << config_.spillEnabled
                      << " reserveWaitTimeoutMs="
                      << config_.reserveWaitTimeout.count();
+}
+
+void BufferManager::InitializeProcessServices(
+    BufferManagerProcessServicesConfig config) {
+  if (config.spill.enabled) {
+    ProcessSpillService::ConfigureDefault(makeProcessSpillConfig(config));
+  }
+}
+
+void BufferManager::ResetProcessServicesForTesting() {
+  ProcessSpillService::ResetForTesting();
+  ProcessDiskIoService::ResetForTesting();
 }
 
 BufferManager::~BufferManager() {
@@ -269,6 +298,7 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
       auto base = node.block.lock();
       auto block = std::dynamic_pointer_cast<BlockHandle>(base);
       if (block != nullptr) {
+        EnsureSpillService();
         reclaimed += block->SpillToDisk();
       }
       continue;
@@ -369,6 +399,9 @@ void BufferManager::EnsureSpillService() {
   if (spillService_ != nullptr) {
     return;
   }
+  BOLT_USER_CHECK(
+      config_.spillEnabled,
+      "BufferManager spill is disabled but kSpillToDisk was requested");
   spillService_ = &ProcessSpillService::Instance();
   evictor_.SetSpillRequester(spillService_);
 }

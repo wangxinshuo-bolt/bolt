@@ -194,6 +194,7 @@ ByteCount BlockHandle::SpillToDisk() {
     state_ = BlockState::kSpilling;
     spillingMemory = std::move(memory_);
     spill = manager_->Spill();
+    BOLT_USER_CHECK_NOT_NULL(spill, "BufferManager spill service is not wired");
     BOLT_MEM_VLOG(1) << "Spilling BufferManager block id=" << id_
                        << " size=" << spillingMemory->Size()
                        << " policy=" << ToString(options_.policy);

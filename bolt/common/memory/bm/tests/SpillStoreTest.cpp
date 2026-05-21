@@ -120,6 +120,7 @@ TEST(SpillStoreTest, smallBlocksShareSizeClassSlabAndReuseSlots) {
   small.sizeClasses = {4 << 10, 8 << 10};
   SpillCompressionConfig compression;
   compression.enabled = false;
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(syncConfig());
 
   SpillStore store(
       SpillStoreConfig{.spillDir = root.string(),
@@ -180,6 +181,7 @@ TEST(SpillStoreTest, largeRawBlockUsesDedicatedFile) {
   small.sizeClasses = {4 << 10};
   SpillCompressionConfig compression;
   compression.enabled = false;
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(syncConfig());
 
   SpillStore store(
       SpillStoreConfig{.spillDir = root.string(),
@@ -210,6 +212,7 @@ TEST(SpillStoreTest, compressesByDefaultAndReadsBackLogicalBytes) {
   small.dedicatedFileThresholdBytes = 1 << 20;
   small.slabFileBytes = 64 << 10;
   small.sizeClasses = {4 << 10, 8 << 10, 16 << 10};
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(syncConfig());
 
   SpillStore store(
       SpillStoreConfig{.spillDir = root.string(),
@@ -243,6 +246,7 @@ TEST(SpillStoreTest, fallsBackToRawWhenCompressionDoesNotSaveSpace) {
   SpillCompressionConfig compression;
   compression.enabled = true;
   compression.minSavingsRatio = 0.95;
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(syncConfig());
 
   SpillStore store(
       SpillStoreConfig{.spillDir = root.string(),

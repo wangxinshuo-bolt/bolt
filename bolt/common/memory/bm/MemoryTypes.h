@@ -87,8 +87,8 @@ const char* ToString(EvictPolicy policy);
 ReservationKind BodyReservationKind(EvictPolicy policy);
 
 // Returns true iff 'policy' can externalize block bytes to spill storage.
-// Pure function; matches the set of policies that require
-// ProcessSpillService to be configured.
+// Pure function; matches the set of policies that require process services to
+// be initialized through BufferManager before use.
 bool IsSpillPolicy(EvictPolicy policy);
 
 } // namespace bytedance::bolt::memory::bm

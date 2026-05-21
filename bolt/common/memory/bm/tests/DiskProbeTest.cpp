@@ -61,5 +61,25 @@ TEST(DiskProbeTest, runsActiveIopsProbe) {
   EXPECT_GT(result.readIops, 0);
 }
 
+TEST(DiskProbeTest, runsActiveProbeWithConfiguredGeometry) {
+  auto root = std::filesystem::temp_directory_path() /
+      "bolt_bm_custom_geometry_disk_probe";
+  std::filesystem::remove_all(root);
+  DiskProbeConfig config;
+  config.directory = root.string();
+  config.duration = std::chrono::milliseconds(50);
+  config.blockBytes = 4096;
+  config.probeFileBytes = config.blockBytes * 4;
+  config.writeFsyncEveryOps = 2;
+  config.offsetStride = 3;
+
+  auto result = ProbeDisk(config);
+
+  EXPECT_TRUE(result.activeProbeRan);
+  EXPECT_TRUE(result.directIoUsed);
+  EXPECT_GT(result.writeIops, 0);
+  EXPECT_GT(result.readIops, 0);
+}
+
 } // namespace
 } // namespace bytedance::bolt::memory::bm

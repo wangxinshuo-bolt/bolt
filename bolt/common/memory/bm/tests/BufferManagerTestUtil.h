@@ -14,7 +14,7 @@
 #include <string_view>
 #include <unordered_map>
 
-#include "bolt/common/memory/bm/ProcessSpillService.h"
+#include "bolt/common/memory/bm/BufferManager.h"
 
 namespace bytedance::bolt::memory::bm::test {
 
@@ -159,29 +159,26 @@ inline std::string testSpillDir(const std::string& name) {
   return path.string();
 }
 
-// Test fixture helper: lazily install the ProcessSpillService singleton with
+// Test fixture helper: lazily install BufferManager process services with
 // a single root directory the suite can extend per BufferManager. Subsequent
 // callers reuse the same configuration so the tests stay isolated from each
-// other while respecting the "ConfigureDefault may be called only once"
-// contract. Returns the root directory the suite is rooted in.
+// other while respecting the "initialize once" contract. Returns the root
+// directory the suite is rooted in.
 inline std::string ensureTestSpillService() {
   static std::once_flag flag;
   static std::string root;
   std::call_once(flag, [&] {
     root = testSpillDir("bolt_bm_test_spill_root");
-    DiskIoConfig ioConfig;
-    ioConfig.backend = DiskIoBackend::kSync;
-    ioConfig.initialQueueDepth = 4;
-    ioConfig.minQueueDepth = 1;
-    ioConfig.maxQueueDepth = 16;
-    ProcessDiskIoService::ConfigureDefault(ioConfig);
-
-    ProcessSpillServiceConfig cfg;
-    cfg.spillDir = root;
-    cfg.workerThreadCount = 0; // synchronous spill keeps unit tests deterministic
-    cfg.cleanupOnDestroy = true;
-    cfg.diskProbeDuration = std::chrono::milliseconds(0);
-    ProcessSpillService::ConfigureDefault(std::move(cfg));
+    BufferManagerProcessServicesConfig config;
+    config.spill.spillDir = root;
+    config.spill.workerThreadCount = 0; // deterministic synchronous spill
+    config.spill.cleanupOnDestroy = true;
+    config.spill.diskProbeDuration = std::chrono::milliseconds(0);
+    config.spill.diskIo.backend = DiskIoBackend::kSync;
+    config.spill.diskIo.initialQueueDepth = 4;
+    config.spill.diskIo.minQueueDepth = 1;
+    config.spill.diskIo.maxQueueDepth = 16;
+    BufferManager::InitializeProcessServices(std::move(config));
   });
   return root;
 }

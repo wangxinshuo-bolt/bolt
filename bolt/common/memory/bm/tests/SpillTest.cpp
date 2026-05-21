@@ -277,21 +277,105 @@ TEST(SpillTest, processSpillServiceRecordsSkippedExpiredSubmit) {
   EXPECT_EQ(metrics.CounterValue("bm_spill_scheduled_total"), 0);
 }
 
-TEST(SpillTest, spillPoliciesUseConfiguredProcessService) {
-  test::ensureTestSpillService();
-  memory::MemoryManager memoryManager;
-  BufferManager manager(
-      memoryManager,
-      BufferManagerConfig{.poolName = "bm_process_spill_service"});
+TEST(SpillTest, spillPolicyRequiresExplicitProcessServiceInitialization) {
+  BufferManager::ResetProcessServicesForTesting();
 
-  auto block = manager.AllocatePersistent(
-      AllocateOptions{.tag = MemoryTag::kHashTable,
-                      .size = 1024,
-                      .policy = EvictPolicy::kSpillToDisk,
-                      .recoveryFn = nullptr},
-      [](DataPtr data, ByteCount bytes) { std::memset(data, 55, bytes); });
-  ASSERT_EQ(manager.Reclaim(1024), 1024);
-  ASSERT_EQ(block->State(), BlockState::kSpilled);
+  memory::MemoryManager memoryManager;
+  BufferManagerConfig config;
+  config.poolName = "bm_unconfigured_process_spill_service";
+  BufferManager manager(memoryManager, config);
+
+  EXPECT_THROW(
+      manager.AllocatePersistent(
+          AllocateOptions{.tag = MemoryTag::kHashTable,
+                          .size = 1024,
+                          .policy = EvictPolicy::kSpillToDisk,
+                          .recoveryFn = nullptr},
+          [](DataPtr data, ByteCount bytes) { std::memset(data, 55, bytes); }),
+      BoltUserError);
+
+  BufferManager::ResetProcessServicesForTesting();
+}
+
+TEST(SpillTest, spillPoliciesUseInitializedProcessService) {
+  BufferManager::ResetProcessServicesForTesting();
+
+  BufferManagerProcessServicesConfig services;
+  services.spill.spillDir =
+      test::testSpillDir("bolt_bm_configured_from_manager");
+  services.spill.workerThreadCount = 0;
+  services.spill.diskProbeDuration = std::chrono::milliseconds(0);
+  services.spill.diskIo.backend = DiskIoBackend::kSync;
+  services.spill.diskIo.initialQueueDepth = 4;
+  services.spill.diskIo.minQueueDepth = 1;
+  services.spill.diskIo.maxQueueDepth = 16;
+  BufferManager::InitializeProcessServices(std::move(services));
+
+  memory::MemoryManager memoryManager;
+  BufferManagerConfig config;
+  config.poolName = "bm_process_spill_service";
+
+  {
+    BufferManager manager(memoryManager, std::move(config));
+
+    auto block = manager.AllocatePersistent(
+        AllocateOptions{.tag = MemoryTag::kHashTable,
+                        .size = 1024,
+                        .policy = EvictPolicy::kSpillToDisk,
+                        .recoveryFn = nullptr},
+        [](DataPtr data, ByteCount bytes) { std::memset(data, 55, bytes); });
+    ASSERT_EQ(manager.Reclaim(1024), 1024);
+    ASSERT_EQ(block->State(), BlockState::kSpilled);
+  }
+
+  BufferManager::ResetProcessServicesForTesting();
+}
+
+TEST(SpillTest, multipleBufferManagersShareConfiguredSpillService) {
+  BufferManager::ResetProcessServicesForTesting();
+
+  const auto spillDir = test::testSpillDir("bolt_bm_multi_manager_spill_root");
+  BufferManagerProcessServicesConfig services;
+  services.spill.spillDir = spillDir;
+  services.spill.workerThreadCount = 0;
+  services.spill.diskProbeDuration = std::chrono::milliseconds(0);
+  services.spill.diskIo.backend = DiskIoBackend::kSync;
+  services.spill.diskIo.initialQueueDepth = 4;
+  services.spill.diskIo.minQueueDepth = 1;
+  services.spill.diskIo.maxQueueDepth = 16;
+  BufferManager::InitializeProcessServices(std::move(services));
+
+  auto makeConfig = [](const std::string& poolName) {
+    BufferManagerConfig config;
+    config.poolName = poolName;
+    return config;
+  };
+
+  memory::MemoryManager memoryManager;
+  {
+    BufferManager first(memoryManager, makeConfig("bm_task_one"));
+    BufferManager second(memoryManager, makeConfig("bm_task_two"));
+
+    auto firstBlock = first.AllocatePersistent(
+        AllocateOptions{.tag = MemoryTag::kHashTable,
+                        .size = 512,
+                        .policy = EvictPolicy::kSpillToDisk,
+                        .recoveryFn = nullptr},
+        [](DataPtr data, ByteCount bytes) { std::memset(data, 1, bytes); });
+    auto secondBlock = second.AllocatePersistent(
+        AllocateOptions{.tag = MemoryTag::kShuffle,
+                        .size = 512,
+                        .policy = EvictPolicy::kSpillToDisk,
+                        .recoveryFn = nullptr},
+        [](DataPtr data, ByteCount bytes) { std::memset(data, 2, bytes); });
+
+    ASSERT_EQ(first.Reclaim(512), 512);
+    ASSERT_EQ(second.Reclaim(512), 512);
+    ASSERT_EQ(firstBlock->State(), BlockState::kSpilled);
+    ASSERT_EQ(secondBlock->State(), BlockState::kSpilled);
+  }
+
+  BufferManager::ResetProcessServicesForTesting();
 }
 
 } // namespace bytedance::bolt::memory::bm

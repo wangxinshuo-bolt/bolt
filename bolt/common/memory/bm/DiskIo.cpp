@@ -23,15 +23,9 @@
 namespace bytedance::bolt::memory::bm {
 namespace {
 
-constexpr size_t kAdaptiveWindowCompletions = 8;
 constexpr size_t kPercentScale = 100;
-constexpr size_t kP95Percentile = 95;
-constexpr double kLatencyRisingRatio = 1.25;
-constexpr double kLatencyStableRatio = 1.10;
-constexpr double kThroughputDroppingRatio = 0.95;
-constexpr double kThroughputHealthyRatio = 0.98;
-constexpr double kQueueDepthDecreaseRatio = 0.70;
-constexpr double kQueueDepthIncreaseRatio = 1.20;
+constexpr double kMiB = 1024.0 * 1024.0;
+constexpr double kMicrosPerSecond = 1'000'000.0;
 
 uint64_t elapsedUs(std::chrono::steady_clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -70,6 +64,38 @@ void validateConfig(const DiskIoConfig& config) {
   for (auto weight : config.priorityWeights) {
     BOLT_USER_CHECK_GT(weight, 0, "Disk IO priority weight must be > 0");
   }
+  BOLT_USER_CHECK_GT(
+      config.adaptive.windowCompletionCount,
+      0,
+      "Disk IO adaptive window completion count must be > 0");
+  BOLT_USER_CHECK_LE(
+      config.adaptive.percentile,
+      kPercentScale,
+      "Disk IO adaptive percentile must be <= 100");
+  BOLT_USER_CHECK_GT(
+      config.adaptive.latencyRisingRatio,
+      0,
+      "Disk IO adaptive latency rising ratio must be > 0");
+  BOLT_USER_CHECK_GT(
+      config.adaptive.latencyStableRatio,
+      0,
+      "Disk IO adaptive latency stable ratio must be > 0");
+  BOLT_USER_CHECK_GT(
+      config.adaptive.throughputDroppingRatio,
+      0,
+      "Disk IO adaptive throughput dropping ratio must be > 0");
+  BOLT_USER_CHECK_GT(
+      config.adaptive.throughputHealthyRatio,
+      0,
+      "Disk IO adaptive throughput healthy ratio must be > 0");
+  BOLT_USER_CHECK_GT(
+      config.adaptive.queueDepthDecreaseRatio,
+      0,
+      "Disk IO adaptive queue depth decrease ratio must be > 0");
+  BOLT_USER_CHECK_GT(
+      config.adaptive.queueDepthIncreaseRatio,
+      0,
+      "Disk IO adaptive queue depth increase ratio must be > 0");
 }
 
 int64_t runSync(const DiskIoRequest& request) {
@@ -289,7 +315,8 @@ DiskIoCompletion UringDiskIoEngine::Execute(const DiskIoRequest& request) {
 }
 
 AdaptiveQueueDepth::AdaptiveQueueDepth(DiskIoConfig config)
-    : depth_(config.initialQueueDepth),
+    : config_(config.adaptive),
+      depth_(config.initialQueueDepth),
       minDepth_(config.minQueueDepth),
       maxDepth_(config.maxQueueDepth) {
   validateConfig(config);
@@ -309,7 +336,7 @@ void AdaptiveQueueDepth::Observe(const DiskIoCompletion& completion) {
   windowBytes_ += static_cast<uint64_t>(completion.result);
   windowLatencyUs_ += completion.latencyUs;
   latencies_.push_back(completion.latencyUs);
-  if (latencies_.size() < kAdaptiveWindowCompletions) {
+  if (latencies_.size() < config_.windowCompletionCount) {
     return;
   }
 
@@ -318,21 +345,27 @@ void AdaptiveQueueDepth::Observe(const DiskIoCompletion& completion) {
   if (hasPreviousWindow_) {
     const bool latencyRising =
         p95 > static_cast<uint64_t>(
-                  static_cast<double>(lastP95Us_) * kLatencyRisingRatio);
+                  static_cast<double>(lastP95Us_) *
+                  config_.latencyRisingRatio);
     const bool latencyStable =
         p95 <= static_cast<uint64_t>(
-                   static_cast<double>(lastP95Us_) * kLatencyStableRatio);
+                   static_cast<double>(lastP95Us_) *
+                   config_.latencyStableRatio);
     const bool throughputDropping =
-        throughput < lastThroughputMiBPerSec_ * kThroughputDroppingRatio;
+        throughput <
+        lastThroughputMiBPerSec_ * config_.throughputDroppingRatio;
     const bool throughputHealthy =
-        throughput >= lastThroughputMiBPerSec_ * kThroughputHealthyRatio;
+        throughput >=
+        lastThroughputMiBPerSec_ * config_.throughputHealthyRatio;
 
     if (latencyRising && throughputDropping) {
       depth_ = std::max(
-          minDepth_, static_cast<int>(depth_ * kQueueDepthDecreaseRatio));
+          minDepth_,
+          static_cast<int>(depth_ * config_.queueDepthDecreaseRatio));
     } else if (latencyStable && throughputHealthy) {
       depth_ = std::min(
-          maxDepth_, static_cast<int>(depth_ * kQueueDepthIncreaseRatio) + 1);
+          maxDepth_,
+          static_cast<int>(depth_ * config_.queueDepthIncreaseRatio) + 1);
     }
   }
   lastP95Us_ = p95;
@@ -344,7 +377,7 @@ void AdaptiveQueueDepth::Observe(const DiskIoCompletion& completion) {
 }
 
 uint64_t AdaptiveQueueDepth::Percentile95() {
-  const auto index = percentileIndex(latencies_.size(), kP95Percentile);
+  const auto index = percentileIndex(latencies_.size(), config_.percentile);
   auto selected = latencies_.begin() + static_cast<std::ptrdiff_t>(index);
   std::nth_element(latencies_.begin(), selected, latencies_.end());
   return *selected;
@@ -354,8 +387,9 @@ double AdaptiveQueueDepth::WindowThroughputMiBPerSec() const {
   if (windowLatencyUs_ == 0) {
     return 0.0;
   }
-  const double mib = static_cast<double>(windowBytes_) / 1024.0 / 1024.0;
-  const double seconds = static_cast<double>(windowLatencyUs_) / 1'000'000.0;
+  const double mib = static_cast<double>(windowBytes_) / kMiB;
+  const double seconds =
+      static_cast<double>(windowLatencyUs_) / kMicrosPerSecond;
   return seconds == 0.0 ? 0.0 : mib / seconds;
 }
 

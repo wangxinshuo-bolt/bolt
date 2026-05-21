@@ -232,7 +232,8 @@ MemoryManager::MemoryManager(const MemoryManager::Options& options)
   if (options.enableBufferManager) {
     bm::BufferManagerConfig config;
     config.poolName = "__buffer_manager__";
-    bufferManager_ = std::make_unique<bm::BufferManager>(*this, config);
+    bufferManager_ = std::make_unique<bm::BufferManager>(
+        *this, static_cast<const bm::BufferManagerConfig&>(config));
   }
 }
 

@@ -69,15 +69,13 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
   storeCfg.unknownFallbackKind = config_.unknownFallbackKind;
   storeCfg.smallSpill = config_.smallSpill;
   storeCfg.compression = config_.compression;
-  DiskProbeConfig probeConfig;
+  DiskProbeConfig probeConfig = config_.diskProbe;
   probeConfig.directory = storeCfg.spillDir;
   probeConfig.duration = config_.diskProbeDuration;
   probeConfig.forcedKind = storeCfg.forcedKind;
   probeConfig.fallbackKind = storeCfg.unknownFallbackKind;
   storeCfg.diskProbe = ProbeDisk(probeConfig);
-  DiskIoConfig ioConfig;
-  ioConfig.backend = DiskIoBackend::kUring;
-  ProcessDiskIoService::ConfigureDefaultIfNeeded(ioConfig);
+  ProcessDiskIoService::ConfigureDefaultIfNeeded(config_.diskIo);
   SpillStore::CleanupAtStartup(storeCfg);
   store_ = std::make_unique<SpillStore>(storeCfg, config_.metrics);
   StartWorkers();

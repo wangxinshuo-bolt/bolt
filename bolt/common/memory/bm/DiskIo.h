@@ -31,6 +31,17 @@ enum class DiskIoBackend {
   kUring,
 };
 
+struct AdaptiveQueueDepthConfig {
+  size_t windowCompletionCount{8};
+  size_t percentile{95};
+  double latencyRisingRatio{1.25};
+  double latencyStableRatio{1.10};
+  double throughputDroppingRatio{0.95};
+  double throughputHealthyRatio{0.98};
+  double queueDepthDecreaseRatio{0.70};
+  double queueDepthIncreaseRatio{1.20};
+};
+
 struct DiskIoConfig {
   DiskIoBackend backend{DiskIoBackend::kUring};
   uint32_t ringEntries{128};
@@ -38,6 +49,7 @@ struct DiskIoConfig {
   int minQueueDepth{1};
   int maxQueueDepth{128};
   std::array<uint32_t, 3> priorityWeights{{1, 4, 8}};
+  AdaptiveQueueDepthConfig adaptive;
 };
 
 struct DiskIoRequest {
@@ -104,6 +116,7 @@ class AdaptiveQueueDepth {
   double WindowThroughputMiBPerSec() const;
 
   mutable std::mutex mutex_;
+  AdaptiveQueueDepthConfig config_;
   int depth_;
   int minDepth_;
   int maxDepth_;

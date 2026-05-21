@@ -43,6 +43,18 @@ DEFINE_uint32(
     2,
     "ProcessSpillService worker thread count. Use 0 to benchmark the "
     "synchronous backpressure fallback path.");
+DEFINE_uint32(
+    bm_sort_benchmark_disk_io_initial_queue_depth,
+    16,
+    "Initial disk I/O queue depth used by the spill service.");
+DEFINE_uint32(
+    bm_sort_benchmark_disk_io_min_queue_depth,
+    1,
+    "Minimum adaptive disk I/O queue depth used by the spill service.");
+DEFINE_uint32(
+    bm_sort_benchmark_disk_io_max_queue_depth,
+    64,
+    "Maximum adaptive disk I/O queue depth used by the spill service.");
 DEFINE_string(
     bm_sort_benchmark_disk_kind,
     "probe",
@@ -424,6 +436,40 @@ struct Run {
   uint64_t bytes{0};
 };
 
+DiskIoConfig makeDiskIoConfig() {
+  DiskIoConfig ioConfig;
+  ioConfig.backend = DiskIoBackend::kSync;
+  ioConfig.initialQueueDepth =
+      static_cast<int>(FLAGS_bm_sort_benchmark_disk_io_initial_queue_depth);
+  ioConfig.minQueueDepth =
+      static_cast<int>(FLAGS_bm_sort_benchmark_disk_io_min_queue_depth);
+  ioConfig.maxQueueDepth =
+      static_cast<int>(FLAGS_bm_sort_benchmark_disk_io_max_queue_depth);
+  return ioConfig;
+}
+
+BufferManagerProcessServicesConfig makeProcessServicesConfig(
+    BenchmarkMetricsRegistry& metrics) {
+  BufferManagerProcessServicesConfig config;
+  config.metrics = &metrics;
+  config.spill.spillDir = FLAGS_bm_sort_benchmark_spill_dir;
+  config.spill.forcedKind = parseDiskKind();
+  config.spill.workerThreadCount =
+      FLAGS_bm_sort_benchmark_spill_worker_threads;
+  config.spill.cleanupOnDestroy = FLAGS_bm_sort_benchmark_cleanup;
+  config.spill.diskIo = makeDiskIoConfig();
+  return config;
+}
+
+BufferManagerConfig makeBufferManagerConfig(
+    uint64_t dataBytes,
+    BenchmarkMetricsRegistry& metrics) {
+  BufferManagerConfig config;
+  config.poolName = fmt::format("bm_sort_{}", formatBytes(dataBytes));
+  config.metrics = &metrics;
+  return config;
+}
+
 class SortBenchmark {
  public:
   SortBenchmark(
@@ -437,9 +483,7 @@ class SortBenchmark {
         metrics_(metrics),
         manager_(
             memoryManager_,
-            BufferManagerConfig{
-                .poolName = fmt::format("bm_sort_{}", formatBytes(dataBytes_)),
-                .metrics = &metrics_}) {
+            makeBufferManagerConfig(dataBytes, metrics_)) {
     BOLT_USER_CHECK(!blockSizes_.empty(), "block size profile must not be empty");
     for (const auto bytes : blockSizes_) {
       blockRows_.push_back(std::max<uint64_t>(1, bytes / kBytesPerRow));
@@ -808,24 +852,9 @@ class SortBenchmark {
   BufferManager manager_;
 };
 
-void configureServices(BenchmarkMetricsRegistry& metrics) {
+void prepareSpillDirectory() {
   std::filesystem::remove_all(FLAGS_bm_sort_benchmark_spill_dir);
   std::filesystem::create_directories(FLAGS_bm_sort_benchmark_spill_dir);
-
-  DiskIoConfig ioConfig;
-  ioConfig.backend = DiskIoBackend::kSync;
-  ioConfig.initialQueueDepth = 16;
-  ioConfig.minQueueDepth = 1;
-  ioConfig.maxQueueDepth = 64;
-  ProcessDiskIoService::ConfigureDefault(ioConfig);
-
-  ProcessSpillServiceConfig spillConfig;
-  spillConfig.spillDir = FLAGS_bm_sort_benchmark_spill_dir;
-  spillConfig.forcedKind = parseDiskKind();
-  spillConfig.workerThreadCount = FLAGS_bm_sort_benchmark_spill_worker_threads;
-  spillConfig.cleanupOnDestroy = FLAGS_bm_sort_benchmark_cleanup;
-  spillConfig.metrics = &metrics;
-  ProcessSpillService::ConfigureDefault(std::move(spillConfig));
 }
 
 } // namespace
@@ -836,7 +865,9 @@ int main(int argc, char** argv) {
   google::InitGoogleLogging(argv[0]);
 
   bytedance::bolt::memory::bm::BenchmarkMetricsRegistry metrics;
-  bytedance::bolt::memory::bm::configureServices(metrics);
+  bytedance::bolt::memory::bm::prepareSpillDirectory();
+  bytedance::bolt::memory::bm::BufferManager::InitializeProcessServices(
+      bytedance::bolt::memory::bm::makeProcessServicesConfig(metrics));
 
   const auto size = bytedance::bolt::memory::bm::parseBenchmarkSize();
   const uint64_t memoryBudgetBytes =
@@ -848,6 +879,6 @@ int main(int argc, char** argv) {
         size, memoryBudgetBytes, std::move(blockSizes), metrics);
     benchmark.run();
   }
-  bytedance::bolt::memory::bm::ProcessSpillService::ResetForTesting();
+  bytedance::bolt::memory::bm::BufferManager::ResetProcessServicesForTesting();
   return 0;
 }

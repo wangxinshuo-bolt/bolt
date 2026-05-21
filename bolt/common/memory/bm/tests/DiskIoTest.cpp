@@ -167,6 +167,28 @@ TEST(DiskIoTest, adaptiveQueueDepthDropsWhenLatencyRisesAndThroughputStalls) {
   ASSERT_LT(depth.Limit(), 8);
 }
 
+TEST(DiskIoTest, adaptiveQueueDepthUsesConfiguredWindow) {
+  auto config = syncConfig();
+  config.initialQueueDepth = 8;
+  config.maxQueueDepth = 16;
+  config.adaptive.windowCompletionCount = 2;
+  AdaptiveQueueDepth depth(config);
+
+  DiskIoCompletion completion;
+  completion.op = DiskIoOp::kRead;
+  completion.result = 4096;
+  completion.latencyUs = 100;
+  for (int i = 0; i < 2; ++i) {
+    depth.Observe(completion);
+  }
+
+  completion.latencyUs = 10'000;
+  for (int i = 0; i < 2; ++i) {
+    depth.Observe(completion);
+  }
+  ASSERT_LT(depth.Limit(), 8);
+}
+
 TEST(DiskIoTest, schedulerUsesWeightedPriorityOrder) {
   auto engine = std::make_unique<RecordingDiskIoEngine>();
   auto* raw = engine.get();

@@ -10,8 +10,12 @@
 #include <functional>
 #include <string>
 
+#include "bolt/common/memory/bm/DiskIo.h"
+#include "bolt/common/memory/bm/DiskProbe.h"
 #include "bolt/common/memory/bm/MemoryTypes.h"
 #include "bolt/common/memory/bm/Metrics.h"
+#include "bolt/common/memory/bm/SmallSpillAllocator.h"
+#include "bolt/common/memory/bm/SpillCompression.h"
 #include "bolt/common/memory/bm/SpillTypes.h"
 
 namespace bytedance::bolt::memory::bm {
@@ -25,6 +29,32 @@ struct BufferPoolSnapshot {
   ByteCount usedSpilledBytes{0};
 };
 
+// Process-level spill configuration supplied through
+// BufferManager::InitializeProcessServices(). This owns executor/process-wide
+// resources: spill directory, disk probing, disk I/O scheduling, small-block
+// layout, compression, and spill workers.
+struct BufferManagerProcessSpillConfig {
+  bool enabled{true};
+  std::string spillDir;
+  DiskKind forcedKind{DiskKind::kUnknown};
+  uint32_t workerThreadCount{0};
+  DiskKind unknownFallbackKind{DiskKind::kHdd};
+  bool cleanupOnDestroy{true};
+  std::chrono::milliseconds diskProbeDuration{std::chrono::seconds(1)};
+  DiskProbeConfig diskProbe;
+  DiskIoConfig diskIo;
+  SmallSpillConfig smallSpill;
+  SpillCompressionConfig compression;
+};
+
+// Process-level service configuration. Call
+// BufferManager::InitializeProcessServices() once before any BufferManager uses
+// EvictPolicy::kSpillToDisk.
+struct BufferManagerProcessServicesConfig {
+  BufferManagerProcessSpillConfig spill;
+  MetricsRegistry* metrics{nullptr};
+};
+
 // Configuration knob bundle passed to BufferManager's constructor.
 struct BufferManagerConfig {
   // Name registered with the underlying Bolt MemoryPool. An empty string
@@ -35,10 +65,15 @@ struct BufferManagerConfig {
   // progress before returning the bytes-freed value it has so far.
   std::chrono::milliseconds reserveWaitTimeout{std::chrono::milliseconds(1000)};
 
-  // Optional metrics sink used for BufferPool / BlockHandle counters. The
-  // ProcessSpillService is configured separately via ConfigureDefault().
-  // nullptr installs NoOpMetricsRegistry().
+  // Optional metrics sink used for this BufferManager's BufferPool /
+  // BlockHandle counters. Process-level services receive their metrics sink
+  // through BufferManagerProcessServicesConfig.
   MetricsRegistry* metrics{nullptr};
+
+  // Whether this BufferManager may allocate blocks with
+  // EvictPolicy::kSpillToDisk. The process spill service must still be
+  // initialized explicitly before such allocations.
+  bool spillEnabled{true};
 };
 
 // Parameters supplied at block creation time. After Allocate() returns, the
@@ -48,8 +83,8 @@ struct AllocateOptions {
   MemoryTag tag{MemoryTag::kHashTable};
   // Block payload size in bytes. Must be > 0; Allocate throws otherwise.
   ByteCount size{0};
-  // Externalization strategy. kSpillToDisk requires ProcessSpillService to
-  // be configured before Allocate().
+  // Externalization strategy. kSpillToDisk requires
+  // BufferManager::InitializeProcessServices() to be called before Allocate().
   // kRecompute additionally requires recoveryFn != nullptr.
   EvictPolicy policy{EvictPolicy::kDiscard};
   // Importance hint used by the eviction queue. Higher priority blocks are

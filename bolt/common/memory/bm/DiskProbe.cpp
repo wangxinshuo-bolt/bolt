@@ -54,26 +54,27 @@ AlignedBuffer allocateAlignedBuffer(size_t alignment, size_t bytes) {
   return AlignedBuffer(ptr);
 }
 
-uint64_t classifyIopsThreshold(uint64_t iops) {
-  return iops;
-}
-
-DiskKind classifyDisk(uint64_t writeIops, uint64_t readIops) {
+DiskKind classifyDisk(
+    uint64_t writeIops,
+    uint64_t readIops,
+    const DiskProbeConfig& config) {
   const auto iops = std::min(writeIops, readIops);
-  if (iops >= 40'000) {
+  if (iops >= config.nvmeMinIops) {
     return DiskKind::kNvme;
   }
-  if (iops >= 2'000) {
+  if (iops >= config.ssdMinIops) {
     return DiskKind::kSsd;
   }
   return DiskKind::kHdd;
 }
 
-off_t nextProbeOffset(uint64_t op, size_t bytes, uint64_t fileBytes) {
+off_t nextProbeOffset(
+    uint64_t op,
+    size_t bytes,
+    uint64_t fileBytes,
+    uint64_t stride) {
   const uint64_t blocks = std::max<uint64_t>(1, fileBytes / bytes);
-  // Prime stride keeps repeated short probes from hammering the same block
-  // while preserving O_DIRECT alignment.
-  return static_cast<off_t>(((op * 104'729) % blocks) * bytes);
+  return static_cast<off_t>(((op * stride) % blocks) * bytes);
 }
 
 uint64_t countDirectIopsFor(
@@ -81,20 +82,23 @@ uint64_t countDirectIopsFor(
     void* buffer,
     size_t bytes,
     uint64_t fileBytes,
+    uint64_t offsetStride,
+    uint64_t writeFsyncEveryOps,
     std::chrono::milliseconds duration,
     bool write) {
   using clock = std::chrono::steady_clock;
   const auto deadline = clock::now() + duration;
   uint64_t ops = 0;
   while (clock::now() < deadline) {
-    const off_t offset = nextProbeOffset(ops, bytes, fileBytes);
+    const off_t offset = nextProbeOffset(ops, bytes, fileBytes, offsetStride);
     ssize_t rc = write ? ::pwrite(fd, buffer, bytes, offset)
                        : ::pread(fd, buffer, bytes, offset);
     if (rc != static_cast<ssize_t>(bytes)) {
       break;
     }
     ++ops;
-    if (write && ops % 64 == 0 && ::fdatasync(fd) != 0) {
+    if (write && writeFsyncEveryOps != 0 &&
+        ops % writeFsyncEveryOps == 0 && ::fdatasync(fd) != 0) {
       break;
     }
   }
@@ -134,8 +138,6 @@ DiskProbeResult logProbeResult(
 } // namespace
 
 DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
-  constexpr size_t kBlockBytes = 4096;
-  constexpr uint64_t kProbeFileBytes = 64ULL * 1024ULL * 1024ULL;
   if (config.forcedKind != DiskKind::kUnknown) {
     return logProbeResult(
         config,
@@ -152,6 +154,15 @@ DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
         0,
         0);
   }
+  BOLT_USER_CHECK_GT(config.blockBytes, 0, "Disk probe block bytes must be > 0");
+  BOLT_USER_CHECK_GT(
+      config.probeFileBytes, 0, "Disk probe file bytes must be > 0");
+  BOLT_USER_CHECK_GE(
+      config.probeFileBytes,
+      config.blockBytes,
+      "Disk probe file bytes must be >= block bytes");
+  BOLT_USER_CHECK_GT(
+      config.offsetStride, 0, "Disk probe offset stride must be > 0");
 
   std::filesystem::create_directories(config.directory);
   const auto path =
@@ -163,11 +174,11 @@ DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
         config,
         inactiveResult(config.fallbackKind),
         std::string("open_direct_failed:") + std::strerror(errno),
-        kProbeFileBytes,
-        kBlockBytes);
+        config.probeFileBytes,
+        config.blockBytes);
   }
   const int fallocateError =
-      ::posix_fallocate(fd.get(), 0, static_cast<off_t>(kProbeFileBytes));
+      ::posix_fallocate(fd.get(), 0, static_cast<off_t>(config.probeFileBytes));
   if (fallocateError != 0) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -175,11 +186,11 @@ DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
         config,
         inactiveResult(config.fallbackKind),
         std::string("posix_fallocate_failed:") + std::strerror(fallocateError),
-        kProbeFileBytes,
-        kBlockBytes);
+        config.probeFileBytes,
+        config.blockBytes);
   }
 
-  auto buffer = allocateAlignedBuffer(kBlockBytes, kBlockBytes);
+  auto buffer = allocateAlignedBuffer(config.blockBytes, config.blockBytes);
   if (buffer == nullptr) {
     std::error_code ec;
     std::filesystem::remove(path, ec);
@@ -187,21 +198,35 @@ DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
         config,
         inactiveResult(config.fallbackKind),
         "aligned_buffer_failed",
-        kProbeFileBytes,
-        kBlockBytes);
+        config.probeFileBytes,
+        config.blockBytes);
   }
   auto* bytes = static_cast<uint8_t*>(buffer.get());
-  for (size_t i = 0; i < kBlockBytes; ++i) {
+  for (size_t i = 0; i < config.blockBytes; ++i) {
     bytes[i] = static_cast<uint8_t>(i % 251);
   }
 
   const auto half = std::chrono::milliseconds(
       std::max<int64_t>(1, config.duration.count() / 2));
   const auto writeIops = countDirectIopsFor(
-      fd.get(), buffer.get(), kBlockBytes, kProbeFileBytes, half, true);
+      fd.get(),
+      buffer.get(),
+      config.blockBytes,
+      config.probeFileBytes,
+      config.offsetStride,
+      config.writeFsyncEveryOps,
+      half,
+      true);
   (void)::posix_fadvise(fd.get(), 0, 0, POSIX_FADV_DONTNEED);
   const auto readIops = countDirectIopsFor(
-      fd.get(), buffer.get(), kBlockBytes, kProbeFileBytes, half, false);
+      fd.get(),
+      buffer.get(),
+      config.blockBytes,
+      config.probeFileBytes,
+      config.offsetStride,
+      config.writeFsyncEveryOps,
+      half,
+      false);
   std::error_code ec;
   std::filesystem::remove(path, ec);
   if (writeIops == 0 || readIops == 0) {
@@ -209,18 +234,17 @@ DiskProbeResult ProbeDisk(const DiskProbeConfig& config) {
         config,
         inactiveResult(config.fallbackKind),
         "zero_iops",
-        kProbeFileBytes,
-        kBlockBytes);
+        config.probeFileBytes,
+        config.blockBytes);
   }
 
-  const auto kind = classifyDisk(
-      classifyIopsThreshold(writeIops), classifyIopsThreshold(readIops));
+  const auto kind = classifyDisk(writeIops, readIops, config);
   return logProbeResult(
       config,
       DiskProbeResult{kind, writeIops, readIops, true, true},
       "completed",
-      kProbeFileBytes,
-      kBlockBytes);
+      config.probeFileBytes,
+      config.blockBytes);
 }
 
 } // namespace bytedance::bolt::memory::bm

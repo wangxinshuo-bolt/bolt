@@ -14,35 +14,42 @@
 namespace bytedance::bolt::memory::bm {
 namespace {
 
+constexpr ByteCount kKiB = 1024;
+constexpr ByteCount kMiB = 1024 * kKiB;
+constexpr ByteCount kDefaultDedicatedFileThresholdBytes = 4 * kMiB;
+constexpr ByteCount kDefaultNvmeSlabFileBytes = 256 * kMiB;
+constexpr ByteCount kDefaultSsdSlabFileBytes = 128 * kMiB;
+constexpr ByteCount kDefaultConservativeSlabFileBytes = 64 * kMiB;
+
 SmallSpillConfig DefaultSmallSpillConfig(DiskKind disk) {
   SmallSpillConfig config;
   config.enabled = true;
-  config.dedicatedFileThresholdBytes = 4 << 20;
+  config.dedicatedFileThresholdBytes = kDefaultDedicatedFileThresholdBytes;
   switch (disk) {
     case DiskKind::kNvme:
-      config.slabFileBytes = 256 << 20;
+      config.slabFileBytes = kDefaultNvmeSlabFileBytes;
       break;
     case DiskKind::kSsd:
-      config.slabFileBytes = 128 << 20;
+      config.slabFileBytes = kDefaultSsdSlabFileBytes;
       break;
     case DiskKind::kHdd:
     case DiskKind::kNetworkFs:
     case DiskKind::kUnknown:
-      config.slabFileBytes = 64 << 20;
+      config.slabFileBytes = kDefaultConservativeSlabFileBytes;
       break;
   }
   config.sizeClasses = {
-      4 << 10,
-      8 << 10,
-      16 << 10,
-      32 << 10,
-      64 << 10,
-      128 << 10,
-      256 << 10,
-      512 << 10,
-      1 << 20,
-      2 << 20,
-      4 << 20};
+      4 * kKiB,
+      8 * kKiB,
+      16 * kKiB,
+      32 * kKiB,
+      64 * kKiB,
+      128 * kKiB,
+      256 * kKiB,
+      512 * kKiB,
+      1 * kMiB,
+      2 * kMiB,
+      4 * kMiB};
   return config;
 }
 

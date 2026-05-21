@@ -6,13 +6,13 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -501,6 +501,333 @@ struct Run {
   uint64_t bytes{0};
 };
 
+class DeterministicRowGenerator {
+ public:
+  explicit DeterministicRowGenerator(uint64_t rowOffset) : nextRow_(rowOffset) {}
+
+  uint64_t next() {
+    return splitmix64(nextRow_++);
+  }
+
+ private:
+  uint64_t nextRow_;
+};
+
+class TaskQuota {
+ public:
+  explicit TaskQuota(uint64_t budgetBytes) : budgetBytes_(budgetBytes) {}
+
+  void ensureCanAllocate(BufferManager& manager, ByteCount bytes) const {
+    const auto usage = manager.GetMemoryUsage();
+    if (usage + bytes > budgetBytes_) {
+      manager.Reclaim(usage + bytes - budgetBytes_);
+    }
+  }
+
+ private:
+  uint64_t budgetBytes_;
+};
+
+class RunReader {
+ public:
+  RunReader(BufferManager& manager, const Run& run)
+      : manager_(manager), run_(run) {
+    openNextBlock();
+  }
+
+  bool hasValue() const {
+    return data_ != nullptr;
+  }
+
+  uint64_t value() const {
+    return data_[position_];
+  }
+
+  void advance() {
+    ++position_;
+    if (position_ >= rowsInBlock_) {
+      handle_ = BufferHandle();
+      openNextBlock();
+    }
+  }
+
+ private:
+  void openNextBlock() {
+    data_ = nullptr;
+    position_ = 0;
+    rowsInBlock_ = 0;
+    if (blockIndex_ >= run_.blocks.size()) {
+      return;
+    }
+    handle_ = manager_.Pin(run_.blocks[blockIndex_++]);
+    BOLT_USER_CHECK(handle_.IsValid(), "Failed to pin sorted run block");
+    rowsInBlock_ = handle_.Size() / kBytesPerRow;
+    data_ = reinterpret_cast<const uint64_t*>(handle_.Data());
+  }
+
+  BufferManager& manager_;
+  const Run& run_;
+  size_t blockIndex_{0};
+  BufferHandle handle_;
+  const uint64_t* data_{nullptr};
+  uint64_t position_{0};
+  uint64_t rowsInBlock_{0};
+};
+
+class RunWriter {
+ public:
+  RunWriter(
+      BufferManager& manager,
+      const TaskQuota& quota,
+      const std::vector<uint64_t>& blockRows,
+      uint64_t totalRows)
+      : manager_(manager),
+        quota_(quota),
+        blockRows_(blockRows),
+        totalRows_(totalRows) {}
+
+  void append(uint64_t value) {
+    if (!current_.has_value()) {
+      openBlock();
+    }
+    current_->data[current_->position++] = value;
+    ++writtenRows_;
+    if (current_->position == current_->rows) {
+      closeBlock();
+    }
+  }
+
+  Run finish() {
+    closeBlock();
+    BOLT_USER_CHECK_EQ(writtenRows_, totalRows_);
+    return std::move(run_);
+  }
+
+ private:
+  struct WritableBlock {
+    BufferHandle handle;
+    uint64_t* data{nullptr};
+    uint64_t rows{0};
+    uint64_t position{0};
+  };
+
+  uint64_t nextBlockRows() const {
+    const auto remaining = totalRows_ - writtenRows_;
+    return std::min(blockRows_[blockIndex_ % blockRows_.size()], remaining);
+  }
+
+  void openBlock() {
+    BOLT_USER_CHECK_LT(writtenRows_, totalRows_);
+    const auto rows = nextBlockRows();
+    const auto bytes = rows * kBytesPerRow;
+    quota_.ensureCanAllocate(manager_, bytes);
+    auto handle = manager_.Allocate(
+        AllocateOptions{.tag = MemoryTag::kSort,
+                        .size = bytes,
+                        .policy = EvictPolicy::kSpillToDisk,
+                        .priority = Priority::kNormal,
+                        .recoveryFn = nullptr});
+    current_.emplace(WritableBlock{
+        .handle = std::move(handle),
+        .data = nullptr,
+        .rows = rows,
+        .position = 0});
+    current_->data = reinterpret_cast<uint64_t*>(current_->handle.MutableData());
+  }
+
+  void closeBlock() {
+    if (!current_.has_value()) {
+      return;
+    }
+    const auto bytes = current_->position * kBytesPerRow;
+    BOLT_USER_CHECK_EQ(current_->position, current_->rows);
+    run_.rows += current_->position;
+    run_.bytes += bytes;
+    run_.blocks.push_back(current_->handle.Block());
+    current_.reset();
+    ++blockIndex_;
+  }
+
+  BufferManager& manager_;
+  const TaskQuota& quota_;
+  const std::vector<uint64_t>& blockRows_;
+  uint64_t totalRows_;
+  uint64_t writtenRows_{0};
+  size_t blockIndex_{0};
+  std::optional<WritableBlock> current_;
+  Run run_;
+};
+
+class SortOperator {
+ public:
+  SortOperator(
+      uint32_t taskId,
+      uint64_t totalRows,
+      BufferManager& manager,
+      const TaskQuota& quota,
+      const std::vector<uint64_t>& blockRows,
+      DataFingerprint& expectedFingerprint)
+      : taskId_(taskId),
+        totalRows_(totalRows),
+        manager_(manager),
+        quota_(quota),
+        blockRows_(blockRows),
+        expectedFingerprint_(expectedFingerprint) {}
+
+  void addInput(uint64_t value) {
+    BOLT_USER_CHECK(!inputClosed_, "Cannot add input after noMoreInput");
+    if (!input_.has_value()) {
+      openInputBlock();
+    }
+    input_->data[input_->position++] = value;
+    expectedFingerprint_.add(value);
+    ++inputRows_;
+    if (input_->position == input_->rows) {
+      closeInputBlock();
+    }
+  }
+
+  void noMoreInput() {
+    BOLT_USER_CHECK(!inputClosed_, "noMoreInput called twice");
+    inputClosed_ = true;
+    closeInputBlock();
+    BOLT_USER_CHECK_EQ(inputRows_, totalRows_);
+  }
+
+  void mergeAll() {
+    BOLT_USER_CHECK(inputClosed_, "Cannot merge before noMoreInput");
+    uint32_t pass = 0;
+    while (runs_.size() > 1) {
+      runs_ = mergePass(std::move(runs_), ++pass);
+    }
+    if (!runs_.empty()) {
+      outputRun_ = std::move(runs_.front());
+      outputReader_ = std::make_unique<RunReader>(manager_, outputRun_);
+    }
+  }
+
+  bool hasNext() const {
+    return outputReader_ != nullptr && outputReader_->hasValue();
+  }
+
+  uint64_t next() {
+    BOLT_USER_CHECK(hasNext(), "SortOperator output is exhausted");
+    const auto value = outputReader_->value();
+    outputReader_->advance();
+    return value;
+  }
+
+  uint64_t finalBlockCount() const {
+    return outputRun_.blocks.size();
+  }
+
+ private:
+  struct WritableBlock {
+    BufferHandle handle;
+    uint64_t* data{nullptr};
+    uint64_t rows{0};
+    uint64_t position{0};
+  };
+
+  uint64_t nextInputBlockRows() const {
+    const auto remaining = totalRows_ - inputRows_;
+    return std::min(blockRows_[inputBlockIndex_ % blockRows_.size()], remaining);
+  }
+
+  void openInputBlock() {
+    BOLT_USER_CHECK_LT(inputRows_, totalRows_);
+    const auto rows = nextInputBlockRows();
+    const auto bytes = rows * kBytesPerRow;
+    quota_.ensureCanAllocate(manager_, bytes);
+    auto handle = manager_.Allocate(
+        AllocateOptions{.tag = MemoryTag::kSort,
+                        .size = bytes,
+                        .policy = EvictPolicy::kSpillToDisk,
+                        .priority = Priority::kNormal,
+                        .recoveryFn = nullptr});
+    input_.emplace(WritableBlock{
+        .handle = std::move(handle),
+        .data = nullptr,
+        .rows = rows,
+        .position = 0});
+    input_->data = reinterpret_cast<uint64_t*>(input_->handle.MutableData());
+  }
+
+  void closeInputBlock() {
+    if (!input_.has_value()) {
+      return;
+    }
+    BOLT_USER_CHECK_EQ(input_->position, input_->rows);
+    std::sort(input_->data, input_->data + input_->position);
+    Run run;
+    run.rows = input_->position;
+    run.bytes = input_->position * kBytesPerRow;
+    run.blocks.push_back(input_->handle.Block());
+    input_.reset();
+    runs_.push_back(std::move(run));
+    ++inputBlockIndex_;
+  }
+
+  std::vector<Run> mergePass(std::vector<Run> runs, uint32_t pass) {
+    std::vector<Run> next;
+    next.reserve((runs.size() + 1) / 2);
+    for (size_t i = 0; i < runs.size(); i += 2) {
+      if (i + 1 == runs.size()) {
+        next.push_back(std::move(runs[i]));
+        continue;
+      }
+      next.push_back(mergeTwo(runs[i], runs[i + 1]));
+      std::cout << fmt::format(
+          "\rtask {} merge pass {}: {} / {} input runs",
+          taskId_,
+          pass,
+          std::min(i + 2, runs.size()),
+          runs.size())
+                << std::flush;
+    }
+    std::cout << "\n";
+    return next;
+  }
+
+  Run mergeTwo(const Run& left, const Run& right) {
+    RunReader leftReader(manager_, left);
+    RunReader rightReader(manager_, right);
+    RunWriter writer(manager_, quota_, blockRows_, left.rows + right.rows);
+    while (leftReader.hasValue() && rightReader.hasValue()) {
+      if (leftReader.value() <= rightReader.value()) {
+        writer.append(leftReader.value());
+        leftReader.advance();
+      } else {
+        writer.append(rightReader.value());
+        rightReader.advance();
+      }
+    }
+    while (leftReader.hasValue()) {
+      writer.append(leftReader.value());
+      leftReader.advance();
+    }
+    while (rightReader.hasValue()) {
+      writer.append(rightReader.value());
+      rightReader.advance();
+    }
+    return writer.finish();
+  }
+
+  uint32_t taskId_;
+  uint64_t totalRows_;
+  BufferManager& manager_;
+  const TaskQuota& quota_;
+  const std::vector<uint64_t>& blockRows_;
+  DataFingerprint& expectedFingerprint_;
+  uint64_t inputRows_{0};
+  size_t inputBlockIndex_{0};
+  bool inputClosed_{false};
+  std::optional<WritableBlock> input_;
+  std::vector<Run> runs_;
+  Run outputRun_;
+  std::unique_ptr<RunReader> outputReader_;
+};
+
 DiskIoConfig makeDiskIoConfig() {
   DiskIoConfig ioConfig;
   ioConfig.backend = DiskIoBackend::kSync;
@@ -596,25 +923,67 @@ class SortBenchmark {
         memoryBudgetBytes_);
 
     const auto genStart = Clock::now();
-    auto runs = buildInitialRuns();
+    DeterministicRowGenerator generator(rowOffset_);
+    TaskQuota quota(memoryBudgetBytes_);
+    SortOperator sort(
+        taskId_,
+        rows_,
+        manager_,
+        quota,
+        blockRows_,
+        expectedFingerprint_);
+    for (uint64_t i = 0; i < rows_; ++i) {
+      sort.addInput(generator.next());
+      if ((i + 1) % (1 << 16) == 0 || i + 1 == rows_) {
+        std::cout << fmt::format(
+            "\rtask {} addInput: {} / {} rows",
+            taskId_,
+            i + 1,
+            rows_)
+                  << std::flush;
+      }
+    }
+    std::cout << "\n";
+    sort.noMoreInput();
     const auto generateAndSortMs = elapsedMs(genStart);
 
     const auto mergeStart = Clock::now();
-    uint32_t pass = 0;
-    while (runs.size() > 1) {
-      runs = mergePass(std::move(runs), ++pass);
-    }
+    sort.mergeAll();
     const auto mergeMs = elapsedMs(mergeStart);
 
     uint64_t orderedChecksum = 0;
     DataFingerprint actualFingerprint;
-    if (FLAGS_bm_sort_benchmark_verify && !runs.empty()) {
+    uint64_t outputRows = 0;
+    if (FLAGS_bm_sort_benchmark_verify) {
       const auto verifyStart = Clock::now();
-      actualFingerprint = verifySorted(runs.front(), &orderedChecksum);
+      bool hasLast = false;
+      uint64_t last = 0;
+      while (sort.hasNext()) {
+        const auto value = sort.next();
+        if (hasLast) {
+          BOLT_USER_CHECK_LE(last, value, "Final run is not sorted");
+        }
+        hasLast = true;
+        last = value;
+        actualFingerprint.add(value);
+        orderedChecksum ^= splitmix64(value + outputRows);
+        ++outputRows;
+      }
+      BOLT_USER_CHECK_EQ(outputRows, rows_);
+      BOLT_USER_CHECK_EQ(actualFingerprint.rows, expectedFingerprint_.rows);
+      BOLT_USER_CHECK_EQ(
+          actualFingerprint.valueXor, expectedFingerprint_.valueXor);
+      BOLT_USER_CHECK_EQ(
+          actualFingerprint.valueSum, expectedFingerprint_.valueSum);
+      BOLT_USER_CHECK_EQ(
+          actualFingerprint.hashXor, expectedFingerprint_.hashXor);
+      BOLT_USER_CHECK_EQ(
+          actualFingerprint.hashSum, expectedFingerprint_.hashSum);
       verifyMs_ = elapsedMs(verifyStart);
     }
     if (!FLAGS_bm_sort_benchmark_verify) {
       actualFingerprint = expectedFingerprint_;
+      outputRows = rows_;
     }
 
     const auto snapshot = manager_.Snapshot();
@@ -630,7 +999,7 @@ class SortBenchmark {
         rowOffset_,
         dataBytes_,
         rows_,
-        runs.empty() ? 0 : runs.front().blocks.size(),
+        sort.finalBlockCount(),
         generateAndSortMs,
         mergeMs,
         verifyMs_,
@@ -654,7 +1023,7 @@ class SortBenchmark {
         .rowOffset = rowOffset_,
         .rows = rows_,
         .dataBytes = dataBytes_,
-        .runs = runs.empty() ? 0 : runs.front().blocks.size(),
+        .runs = sort.finalBlockCount(),
         .generateAndSortMs = generateAndSortMs,
         .mergeMs = mergeMs,
         .verifyMs = verifyMs_,
@@ -666,246 +1035,6 @@ class SortBenchmark {
   }
 
  private:
-  class RunReader {
-   public:
-    RunReader(BufferManager& manager, const Run& run)
-        : manager_(manager), run_(run) {
-      openNextBlock();
-    }
-
-    bool hasValue() const {
-      return data_ != nullptr;
-    }
-
-    uint64_t value() const {
-      return data_[position_];
-    }
-
-    void advance() {
-      ++position_;
-      if (position_ >= rowsInBlock_) {
-        handle_ = BufferHandle();
-        openNextBlock();
-      }
-    }
-
-   private:
-    void openNextBlock() {
-      data_ = nullptr;
-      position_ = 0;
-      rowsInBlock_ = 0;
-      if (blockIndex_ >= run_.blocks.size()) {
-        return;
-      }
-      handle_ = manager_.Pin(run_.blocks[blockIndex_++]);
-      BOLT_USER_CHECK(handle_.IsValid(), "Failed to pin sorted run block");
-      rowsInBlock_ = handle_.Size() / kBytesPerRow;
-      data_ = reinterpret_cast<const uint64_t*>(handle_.Data());
-    }
-
-    BufferManager& manager_;
-    const Run& run_;
-    size_t blockIndex_{0};
-    BufferHandle handle_;
-    const uint64_t* data_{nullptr};
-    uint64_t position_{0};
-    uint64_t rowsInBlock_{0};
-  };
-
-  class RunWriter {
-   public:
-    RunWriter(
-        BufferManager& manager,
-        const std::vector<uint64_t>& blockRows,
-        uint64_t memoryBudgetBytes)
-        : manager_(manager),
-          blockRows_(blockRows),
-          memoryBudgetBytes_(memoryBudgetBytes) {
-      buffer_.reserve(maxBlockRows());
-    }
-
-    void append(uint64_t value) {
-      buffer_.push_back(value);
-      if (buffer_.size() == currentBlockRows()) {
-        flush();
-      }
-    }
-
-    Run finish() {
-      flush();
-      return std::move(run_);
-    }
-
-   private:
-    void flush() {
-      if (buffer_.empty()) {
-        return;
-      }
-      const auto bytes = buffer_.size() * kBytesPerRow;
-      auto block = manager_.AllocatePersistent(
-          AllocateOptions{.tag = MemoryTag::kSort,
-                          .size = bytes,
-                          .policy = EvictPolicy::kSpillToDisk,
-                          .priority = Priority::kNormal,
-                          .recoveryFn = nullptr},
-          [&](DataPtr data, ByteCount size) {
-            BOLT_USER_CHECK_EQ(size, bytes);
-            std::memcpy(data, buffer_.data(), bytes);
-          });
-      run_.rows += buffer_.size();
-      run_.bytes += bytes;
-      run_.blocks.push_back(std::move(block));
-      buffer_.clear();
-      ++blockIndex_;
-      reclaimIfNeeded();
-    }
-
-    uint64_t currentBlockRows() const {
-      return blockRows_[blockIndex_ % blockRows_.size()];
-    }
-
-    uint64_t maxBlockRows() const {
-      return *std::max_element(blockRows_.begin(), blockRows_.end());
-    }
-
-    void reclaimIfNeeded() {
-      const auto usage = manager_.GetMemoryUsage();
-      if (usage > memoryBudgetBytes_) {
-        manager_.Reclaim(usage - memoryBudgetBytes_);
-      }
-    }
-
-    BufferManager& manager_;
-    const std::vector<uint64_t>& blockRows_;
-    uint64_t memoryBudgetBytes_;
-    size_t blockIndex_{0};
-    std::vector<uint64_t> buffer_;
-    Run run_;
-  };
-
-  std::vector<Run> buildInitialRuns() {
-    std::vector<uint64_t> values;
-    values.reserve(*std::max_element(blockRows_.begin(), blockRows_.end()));
-    std::vector<Run> runs;
-    size_t blockIndex = 0;
-    for (uint64_t base = 0; base < rows_;) {
-      const uint64_t rows =
-          std::min(blockRows_[blockIndex % blockRows_.size()], rows_ - base);
-      values.clear();
-      for (uint64_t i = 0; i < rows; ++i) {
-        const auto value = splitmix64(rowOffset_ + base + i);
-        values.push_back(value);
-        expectedFingerprint_.add(value);
-      }
-      std::sort(values.begin(), values.end());
-      auto block = manager_.AllocatePersistent(
-          AllocateOptions{.tag = MemoryTag::kSort,
-                          .size = rows * kBytesPerRow,
-                          .policy = EvictPolicy::kSpillToDisk,
-                          .priority = Priority::kNormal,
-                          .recoveryFn = nullptr},
-          [&](DataPtr data, ByteCount size) {
-            BOLT_USER_CHECK_EQ(size, rows * kBytesPerRow);
-            std::memcpy(data, values.data(), size);
-          });
-      Run run;
-      run.rows = rows;
-      run.bytes = rows * kBytesPerRow;
-      run.blocks.push_back(std::move(block));
-      runs.push_back(std::move(run));
-      reclaimIfNeeded();
-      base += rows;
-      ++blockIndex;
-      std::cout << fmt::format(
-          "\rtask {} initial runs: {} / {} rows",
-          taskId_,
-          std::min(base, rows_),
-          rows_)
-                << std::flush;
-    }
-    std::cout << "\n";
-    return runs;
-  }
-
-  std::vector<Run> mergePass(std::vector<Run> runs, uint32_t pass) {
-    std::vector<Run> next;
-    next.reserve((runs.size() + 1) / 2);
-    for (size_t i = 0; i < runs.size(); i += 2) {
-      if (i + 1 == runs.size()) {
-        next.push_back(std::move(runs[i]));
-        continue;
-      }
-      next.push_back(mergeTwo(runs[i], runs[i + 1]));
-      std::cout << fmt::format(
-          "\rtask {} merge pass {}: {} / {} input runs",
-          taskId_,
-          pass,
-          std::min(i + 2, runs.size()),
-          runs.size())
-                << std::flush;
-    }
-    std::cout << "\n";
-    return next;
-  }
-
-  Run mergeTwo(const Run& left, const Run& right) {
-    RunReader leftReader(manager_, left);
-    RunReader rightReader(manager_, right);
-    RunWriter writer(manager_, blockRows_, memoryBudgetBytes_);
-    while (leftReader.hasValue() && rightReader.hasValue()) {
-      if (leftReader.value() <= rightReader.value()) {
-        writer.append(leftReader.value());
-        leftReader.advance();
-      } else {
-        writer.append(rightReader.value());
-        rightReader.advance();
-      }
-    }
-    while (leftReader.hasValue()) {
-      writer.append(leftReader.value());
-      leftReader.advance();
-    }
-    while (rightReader.hasValue()) {
-      writer.append(rightReader.value());
-      rightReader.advance();
-    }
-    return writer.finish();
-  }
-
-  DataFingerprint verifySorted(const Run& run, uint64_t* orderedChecksum) {
-    DataFingerprint actual;
-    bool hasLast = false;
-    uint64_t last = 0;
-    uint64_t rows = 0;
-    RunReader reader(manager_, run);
-    while (reader.hasValue()) {
-      const auto value = reader.value();
-      if (hasLast) {
-        BOLT_USER_CHECK_LE(last, value, "Final run is not sorted");
-      }
-      hasLast = true;
-      last = value;
-      actual.add(value);
-      *orderedChecksum ^= splitmix64(value + rows);
-      ++rows;
-      reader.advance();
-    }
-    BOLT_USER_CHECK_EQ(rows, rows_);
-    BOLT_USER_CHECK_EQ(actual.rows, expectedFingerprint_.rows);
-    BOLT_USER_CHECK_EQ(actual.valueXor, expectedFingerprint_.valueXor);
-    BOLT_USER_CHECK_EQ(actual.valueSum, expectedFingerprint_.valueSum);
-    BOLT_USER_CHECK_EQ(actual.hashXor, expectedFingerprint_.hashXor);
-    BOLT_USER_CHECK_EQ(actual.hashSum, expectedFingerprint_.hashSum);
-    return actual;
-  }
-
-  void reclaimIfNeeded() {
-    const auto usage = manager_.GetMemoryUsage();
-    if (usage > memoryBudgetBytes_) {
-      manager_.Reclaim(usage - memoryBudgetBytes_);
-    }
-  }
-
   uint32_t taskId_;
   uint64_t rowOffset_;
   uint64_t rows_;

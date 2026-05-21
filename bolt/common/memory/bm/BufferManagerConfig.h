@@ -29,6 +29,13 @@ struct BufferPoolSnapshot {
   ByteCount usedSpilledBytes{0};
 };
 
+// Controls which thread executes spill work. This is intentionally separate
+// from DiskIoBackend: a worker thread can still use synchronous disk I/O.
+enum class SpillExecutionMode : uint8_t {
+  kOwnerThread,
+  kWorkerThread,
+};
+
 // Process-level spill configuration supplied through
 // BufferManager::InitializeProcessServices(). This owns executor/process-wide
 // resources: spill directory, disk probing, disk I/O scheduling, small-block
@@ -37,7 +44,8 @@ struct BufferManagerProcessSpillConfig {
   bool enabled{true};
   std::string spillDir;
   DiskKind forcedKind{DiskKind::kUnknown};
-  uint32_t workerThreadCount{0};
+  SpillExecutionMode executionMode{SpillExecutionMode::kWorkerThread};
+  uint32_t workerThreadCount{1};
   DiskKind unknownFallbackKind{DiskKind::kHdd};
   bool cleanupOnDestroy{true};
   std::chrono::milliseconds diskProbeDuration{std::chrono::seconds(1)};

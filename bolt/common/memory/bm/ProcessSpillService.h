@@ -16,8 +16,9 @@
 #include <thread>
 #include <vector>
 
-#include "bolt/common/memory/bm/EvictionTypes.h"
+#include "bolt/common/memory/bm/BufferManagerConfig.h"
 #include "bolt/common/memory/bm/DiskIo.h"
+#include "bolt/common/memory/bm/EvictionTypes.h"
 #include "bolt/common/memory/bm/Metrics.h"
 #include "bolt/common/memory/bm/BufferPool.h"
 #include "bolt/common/memory/bm/SpillStore.h"
@@ -35,9 +36,10 @@ struct ProcessSpillServiceConfig {
   // Single spill directory. Must be non-empty.
   std::string spillDir;
   DiskKind forcedKind{DiskKind::kUnknown};
-  // Worker thread pool size. 0 means no async workers; SubmitSpill returns
-  // kBackpressured so the caller can fall back to synchronous SpillToDisk.
-  uint32_t workerThreadCount{0};
+  // Which thread executes spill work. kWorkerThread requires
+  // workerThreadCount > 0 and never falls back to owner-thread writes.
+  SpillExecutionMode executionMode{SpillExecutionMode::kWorkerThread};
+  uint32_t workerThreadCount{1};
   // Optional metrics sink shared by every component the service owns.
   MetricsRegistry* metrics{nullptr};
   // Default classification when probing returns kUnknown.
@@ -92,6 +94,10 @@ class ProcessSpillService : public SpillRequester {
       ProcessSpillServiceConfig config);
 
   EvictResult SubmitSpill(EvictionNode node) override;
+
+  SpillExecutionMode ExecutionMode() const {
+    return config_.executionMode;
+  }
 
   bool WaitForProgress(
       ByteCount bytesNeeded,

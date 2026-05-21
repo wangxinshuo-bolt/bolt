@@ -34,9 +34,16 @@ SingletonState& globalState() {
   return state;
 }
 
-uint32_t resolveWorkerThreadCount(uint32_t configured) {
-  // Pass through unchanged: 0 means caller wants synchronous fallback.
-  return configured;
+void validateSpillExecutionConfig(const ProcessSpillServiceConfig& config) {
+  if (config.executionMode == SpillExecutionMode::kWorkerThread) {
+    BOLT_USER_CHECK(
+        config.workerThreadCount > 0,
+        "worker-thread spill requires workerThreadCount > 0");
+  } else {
+    BOLT_USER_CHECK(
+        config.workerThreadCount == 0,
+        "owner-thread spill does not use ProcessSpillService workers");
+  }
 }
 
 } // namespace
@@ -58,6 +65,7 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
           metrics_.GetHistogram("bm_spill_execute_duration_us", "")),
       waitForProgressDuration_(
           metrics_.GetHistogram("bm_wait_for_spill_progress_duration_us", "")) {
+  validateSpillExecutionConfig(config_);
   BOLT_USER_CHECK(
       !config_.spillDir.empty(),
       "ProcessSpillService requires a spill directory");
@@ -81,6 +89,11 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
   StartWorkers();
   BOLT_MEM_LOG(INFO) << "ProcessSpillService initialized"
                      << " spillDir=" << config_.spillDir
+                     << " executionMode="
+                     << (config_.executionMode ==
+                             SpillExecutionMode::kWorkerThread
+                         ? "worker_thread"
+                         : "owner_thread")
                      << " workerThreadCount=" << config_.workerThreadCount
                      << " cleanupOnDestroy=" << config_.cleanupOnDestroy
                      << " diskKind=" << ToString(storeCfg.diskProbe.kind)
@@ -117,6 +130,7 @@ void ProcessSpillService::ConfigureDefault(ProcessSpillServiceConfig config) {
   BOLT_USER_CHECK(
       !config.spillDir.empty(),
       "ProcessSpillServiceConfig.spillDir must not be empty");
+  validateSpillExecutionConfig(config);
   state.pendingConfig = std::move(config);
   state.configured = true;
 }
@@ -147,12 +161,9 @@ EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
     skippedCounter_.Add(1);
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
-  if (resolveWorkerThreadCount(config_.workerThreadCount) == 0) {
-    backpressuredCounter_.Add(1);
-    BOLT_MEM_VLOG(1) << "ProcessSpillService backpressured spill submit"
-                       << " workerThreadCount=0";
-    return EvictResult{EvictResultKind::kBackpressured, 0};
-  }
+  BOLT_USER_CHECK(
+      config_.executionMode == SpillExecutionMode::kWorkerThread,
+      "ProcessSpillService::SubmitSpill requires worker-thread spill mode");
   auto base = node.block.lock();
   if (base == nullptr) {
     skippedCounter_.Add(1);
@@ -274,7 +285,11 @@ void ProcessSpillService::StartWorkers() {
     return;
   }
   started_ = true;
-  const auto workerCount = resolveWorkerThreadCount(config_.workerThreadCount);
+  if (config_.executionMode == SpillExecutionMode::kOwnerThread) {
+    queueDepthGauge_.Set(0);
+    return;
+  }
+  const auto workerCount = config_.workerThreadCount;
   for (uint32_t i = 0; i < workerCount; ++i) {
     workers_.emplace_back([this] { WorkerLoop(); });
   }

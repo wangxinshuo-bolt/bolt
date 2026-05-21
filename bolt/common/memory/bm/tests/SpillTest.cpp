@@ -31,6 +31,22 @@ class CountingSpillRequester final : public SpillRequester {
   int submitCount{0};
 };
 
+class FailingSpillRequester final : public SpillRequester {
+ public:
+  EvictResult SubmitSpill(EvictionNode /*node*/) override {
+    ++submitCount;
+    return EvictResult{EvictResultKind::kFailed, 0};
+  }
+
+  bool WaitForProgress(
+      ByteCount /*bytesNeeded*/,
+      std::chrono::milliseconds /*timeout*/) override {
+    return false;
+  }
+
+  int submitCount{0};
+};
+
 class FakeBlockHandleBase final : public BlockHandleBase {
  public:
   uint64_t EvictionSequence() const override {
@@ -279,6 +295,7 @@ TEST(SpillTest, spillLocationReleaseUsesSingleStore) {
 
   ProcessSpillServiceConfig serviceConfig;
   serviceConfig.spillDir = root.string();
+  serviceConfig.executionMode = SpillExecutionMode::kOwnerThread;
   serviceConfig.workerThreadCount = 0;
   serviceConfig.cleanupOnDestroy = true;
   serviceConfig.diskProbeDuration = std::chrono::milliseconds(0);
@@ -294,9 +311,9 @@ TEST(SpillTest, spillLocationReleaseUsesSingleStore) {
   ASSERT_EQ(service->UsedDiskBytes(), 0);
 }
 
-TEST(SpillTest, processSpillServiceRecordsSubmitBackpressureMetrics) {
+TEST(SpillTest, workerThreadSpillRejectsZeroWorkers) {
   auto root = std::filesystem::temp_directory_path() /
-      "bolt_bm_test_process_spill_metrics";
+      "bolt_bm_test_process_spill_zero_workers";
   std::filesystem::remove_all(root);
   std::filesystem::create_directories(root);
 
@@ -310,21 +327,14 @@ TEST(SpillTest, processSpillServiceRecordsSubmitBackpressureMetrics) {
   test::RecordingMetricsRegistry metrics;
   ProcessSpillServiceConfig serviceConfig;
   serviceConfig.spillDir = root.string();
+  serviceConfig.executionMode = SpillExecutionMode::kWorkerThread;
   serviceConfig.workerThreadCount = 0;
   serviceConfig.cleanupOnDestroy = true;
   serviceConfig.diskProbeDuration = std::chrono::milliseconds(0);
   serviceConfig.metrics = &metrics;
-  auto service = ProcessSpillService::CreateForTesting(std::move(serviceConfig));
-
-  auto block = std::make_shared<FakeBlockHandleBase>();
-  EvictionNode node;
-  node.block = block;
-  node.cost = EvictionCostClass::kSpill;
-
-  ASSERT_EQ(service->SubmitSpill(node).kind, EvictResultKind::kBackpressured);
-  EXPECT_EQ(metrics.CounterValue("bm_spill_submit_total"), 1);
-  EXPECT_EQ(metrics.CounterValue("bm_spill_backpressured_total"), 1);
-  EXPECT_EQ(metrics.HistogramCount("bm_spill_submit_duration_us"), 1);
+  EXPECT_THROW(
+      ProcessSpillService::CreateForTesting(std::move(serviceConfig)),
+      BoltUserError);
 }
 
 TEST(SpillTest, processSpillServiceRecordsSkippedExpiredSubmit) {
@@ -343,6 +353,7 @@ TEST(SpillTest, processSpillServiceRecordsSkippedExpiredSubmit) {
 
   ProcessSpillServiceConfig serviceConfig;
   serviceConfig.spillDir = root.string();
+  serviceConfig.executionMode = SpillExecutionMode::kWorkerThread;
   serviceConfig.workerThreadCount = 1;
   serviceConfig.cleanupOnDestroy = true;
   serviceConfig.diskProbeDuration = std::chrono::milliseconds(0);
@@ -384,6 +395,7 @@ TEST(SpillTest, spillPoliciesUseInitializedProcessService) {
   BufferManagerProcessServicesConfig services;
   services.spill.spillDir =
       test::testSpillDir("bolt_bm_configured_from_manager");
+  services.spill.executionMode = SpillExecutionMode::kOwnerThread;
   services.spill.workerThreadCount = 0;
   services.spill.diskProbeDuration = std::chrono::milliseconds(0);
   services.spill.diskIo.backend = DiskIoBackend::kSync;
@@ -412,12 +424,51 @@ TEST(SpillTest, spillPoliciesUseInitializedProcessService) {
   BufferManager::ResetProcessServicesForTesting();
 }
 
+TEST(SpillTest, workerThreadSpillDoesNotFallbackToOwnerThreadOnSubmitFailure) {
+  BufferManager::ResetProcessServicesForTesting();
+
+  BufferManagerProcessServicesConfig services;
+  services.spill.spillDir = test::testSpillDir("bolt_bm_no_sync_fallback");
+  services.spill.executionMode = SpillExecutionMode::kWorkerThread;
+  services.spill.workerThreadCount = 1;
+  services.spill.diskProbeDuration = std::chrono::milliseconds(0);
+  services.spill.diskIo.backend = DiskIoBackend::kSync;
+  services.spill.diskIo.initialQueueDepth = 4;
+  services.spill.diskIo.minQueueDepth = 1;
+  services.spill.diskIo.maxQueueDepth = 16;
+  BufferManager::InitializeProcessServices(std::move(services));
+
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_no_sync_fallback"});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 512,
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 6, bytes); });
+
+  FailingSpillRequester requester;
+  dynamic_cast<BlockEvictor&>(manager.EvictionQueue())
+      .SetSpillRequester(requester);
+
+  ASSERT_EQ(manager.Reclaim(512), 0);
+  ASSERT_GE(requester.submitCount, 1);
+  ASSERT_EQ(block->State(), BlockState::kLoaded);
+  ASSERT_EQ(manager.GetMemoryUsage(), 512);
+
+  BufferManager::ResetProcessServicesForTesting();
+}
+
 TEST(SpillTest, multipleBufferManagersShareConfiguredSpillService) {
   BufferManager::ResetProcessServicesForTesting();
 
   const auto spillDir = test::testSpillDir("bolt_bm_multi_manager_spill_root");
   BufferManagerProcessServicesConfig services;
   services.spill.spillDir = spillDir;
+  services.spill.executionMode = SpillExecutionMode::kOwnerThread;
   services.spill.workerThreadCount = 0;
   services.spill.diskProbeDuration = std::chrono::milliseconds(0);
   services.spill.diskIo.backend = DiskIoBackend::kSync;

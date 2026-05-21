@@ -69,6 +69,7 @@ ProcessSpillServiceConfig makeProcessSpillConfig(
   ProcessSpillServiceConfig spill;
   spill.spillDir = config.spill.spillDir;
   spill.forcedKind = config.spill.forcedKind;
+  spill.executionMode = config.spill.executionMode;
   spill.workerThreadCount = config.spill.workerThreadCount;
   spill.metrics = config.metrics;
   spill.unknownFallbackKind = config.spill.unknownFallbackKind;
@@ -302,6 +303,16 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
   while ((targetBytes == 0 || reclaimed < targetBytes) &&
          evictor_.TryPopAnyCandidate(node)) {
     if (node.cost == EvictionCostClass::kSpill) {
+      EnsureSpillService();
+      if (spillService_->get().ExecutionMode() ==
+          SpillExecutionMode::kOwnerThread) {
+        auto base = node.block.lock();
+        auto block = std::dynamic_pointer_cast<BlockHandle>(base);
+        if (block != nullptr) {
+          reclaimed += block->SpillToDisk();
+        }
+        continue;
+      }
       auto submit = evictor_.TryScheduleEvict(node);
       BOLT_MEM_VLOG(1) << "BufferManager reclaim spill candidate"
                          << " target=" << targetBytes
@@ -311,13 +322,12 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
                          << " priority=" << static_cast<int>(node.priority);
       if (submit.kind == EvictResultKind::kScheduled) {
         ++scheduledSpillCount;
-        continue;
-      }
-      auto base = node.block.lock();
-      auto block = std::dynamic_pointer_cast<BlockHandle>(base);
-      if (block != nullptr) {
-        EnsureSpillService();
-        reclaimed += block->SpillToDisk();
+      } else if (submit.kind == EvictResultKind::kFailed ||
+          submit.kind == EvictResultKind::kBackpressured) {
+        BOLT_MEM_LOG(WARNING)
+            << "BufferManager worker-thread spill submit did not schedule"
+            << " target=" << targetBytes
+            << " result=" << ToString(submit.kind);
       }
       continue;
     }

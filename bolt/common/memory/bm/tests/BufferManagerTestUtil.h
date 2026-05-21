@@ -171,7 +171,8 @@ inline std::string ensureTestSpillService() {
     root = testSpillDir("bolt_bm_test_spill_root");
     BufferManagerProcessServicesConfig config;
     config.spill.spillDir = root;
-    config.spill.workerThreadCount = 0; // deterministic synchronous spill
+    config.spill.executionMode = SpillExecutionMode::kOwnerThread;
+    config.spill.workerThreadCount = 0; // deterministic owner-thread spill
     config.spill.cleanupOnDestroy = true;
     config.spill.diskProbeDuration = std::chrono::milliseconds(0);
     config.spill.diskIo.backend = DiskIoBackend::kSync;

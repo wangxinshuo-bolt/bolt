@@ -44,8 +44,8 @@ DEFINE_uint64(
 DEFINE_uint32(
     bm_sort_benchmark_spill_worker_threads,
     4,
-    "ProcessSpillService worker thread count. Use 0 to benchmark the "
-    "synchronous backpressure fallback path.");
+    "ProcessSpillService worker thread count. Use 0 to benchmark explicit "
+    "owner-thread spill mode.");
 DEFINE_uint32(
     bm_sort_benchmark_disk_io_initial_queue_depth,
     16,
@@ -846,6 +846,10 @@ BufferManagerProcessServicesConfig makeProcessServicesConfig(
   config.metrics = &metrics;
   config.spill.spillDir = FLAGS_bm_sort_benchmark_spill_dir;
   config.spill.forcedKind = parseDiskKind();
+  config.spill.executionMode =
+      FLAGS_bm_sort_benchmark_spill_worker_threads == 0
+          ? SpillExecutionMode::kOwnerThread
+          : SpillExecutionMode::kWorkerThread;
   config.spill.workerThreadCount =
       FLAGS_bm_sort_benchmark_spill_worker_threads;
   config.spill.cleanupOnDestroy = FLAGS_bm_sort_benchmark_cleanup;

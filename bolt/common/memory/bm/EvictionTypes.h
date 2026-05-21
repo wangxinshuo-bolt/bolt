@@ -48,8 +48,7 @@ enum class BlockState : uint8_t {
 //                  is the number of bytes the caller may treat as reclaimed.
 //   kScheduled     spill submitted to the spill service; freedBytes is 0
 //                  because the bytes are not yet released.
-//   kBackpressured spill service could not start async I/O
-//                  (e.g. workerThreadCount == 0).
+//   kBackpressured spill service could not accept more async I/O now.
 //   kSkipped       candidate is stale (block expired, evictionSequence moved
 //                  on, block currently pinned, or policy mismatches the path)
 //                  – the caller should drop the node and pop the next one.
@@ -110,8 +109,7 @@ class SpillRequester {
   virtual ~SpillRequester() = default;
   // Hands an evict candidate to the spill service. Return contract:
   //   kScheduled     – node accepted, will run asynchronously.
-  //   kBackpressured – async spill is unavailable (e.g. no workers). Caller
-  //                    may choose a synchronous fallback.
+  //   kBackpressured – async spill is temporarily unavailable.
   //   kFailed        – spill service is stopping or gone.
   //   kSkipped       – the weak_ptr is already expired.
   // Implementations must never silently drop a node – Reserve's slow path

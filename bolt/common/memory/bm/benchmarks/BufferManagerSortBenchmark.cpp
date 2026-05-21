@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <iostream>
 #include <limits>
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -37,10 +39,11 @@ DEFINE_uint64(
 DEFINE_uint64(
     bm_sort_benchmark_memory_budget_mb,
     256,
-    "Resident BufferManager memory budget used to trigger Reclaim().");
+    "Total resident BufferManager memory budget. The benchmark splits this "
+    "budget evenly across the four sort tasks.");
 DEFINE_uint32(
     bm_sort_benchmark_spill_worker_threads,
-    2,
+    4,
     "ProcessSpillService worker thread count. Use 0 to benchmark the "
     "synchronous backpressure fallback path.");
 DEFINE_uint32(
@@ -91,6 +94,7 @@ using Clock = std::chrono::steady_clock;
 constexpr uint64_t kGiB = 1024ULL * 1024ULL * 1024ULL;
 constexpr uint64_t kMiB = 1024ULL * 1024ULL;
 constexpr uint64_t kBytesPerRow = sizeof(uint64_t);
+constexpr uint32_t kSortTaskCount = 4;
 
 uint64_t elapsedMs(Clock::time_point start) {
   return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -220,7 +224,8 @@ std::string formatSizeDistribution(const std::vector<uint64_t>& sizes) {
     if (i != 0) {
       result += ",";
     }
-    result += fmt::format("{}x{}", formatBytes(counts[i].first), counts[i].second);
+    result +=
+        fmt::format("{}x{}", formatBytes(counts[i].first), counts[i].second);
   }
   return result;
 }
@@ -241,6 +246,17 @@ struct DataFingerprint {
     hashSum += hash;
   }
 };
+
+DataFingerprint combineFingerprint(
+    const DataFingerprint& left,
+    const DataFingerprint& right) {
+  return DataFingerprint{
+      .rows = left.rows + right.rows,
+      .valueXor = left.valueXor ^ right.valueXor,
+      .valueSum = left.valueSum + right.valueSum,
+      .hashXor = left.hashXor ^ right.hashXor,
+      .hashSum = left.hashSum + right.hashSum};
+}
 
 class BenchmarkCounter final : public Counter {
  public:
@@ -430,6 +446,55 @@ class BenchmarkMetricsRegistry final : public MetricsRegistry {
       histograms_;
 };
 
+void printFeatureCoverage(
+    const BenchmarkMetricsRegistry& metrics,
+    std::ostream& out) {
+  const auto counter = [&](std::string_view name) {
+    return metrics.CounterValue(name);
+  };
+  const auto histogram = [&](std::string_view name) {
+    return metrics.HistogramCount(name);
+  };
+  const auto line = [&](std::string_view name, bool covered, uint64_t value) {
+    out << "  " << name << " = " << (covered ? "yes" : "no")
+        << " value=" << value << "\n";
+  };
+
+  out << "\nBufferManager feature coverage\n";
+  line("reclaim", counter("bm_reclaim_requests_total") > 0,
+       counter("bm_reclaim_requests_total"));
+  line("spill_submit", counter("bm_spill_submit_total") > 0,
+       counter("bm_spill_submit_total"));
+  line("sync_backpressure_fallback",
+       counter("bm_spill_backpressured_total") > 0,
+       counter("bm_spill_backpressured_total"));
+  line("async_spill_scheduled", counter("bm_spill_scheduled_total") > 0,
+       counter("bm_spill_scheduled_total"));
+  line("async_spill_executed", counter("bm_spill_executed_total") > 0,
+       counter("bm_spill_executed_total"));
+  line("async_wait_for_progress",
+       histogram("bm_wait_for_spill_progress_duration_us") > 0,
+       histogram("bm_wait_for_spill_progress_duration_us"));
+  line("small_spill_slot", counter("bm_spill_small_slot_total") > 0,
+       counter("bm_spill_small_slot_total"));
+  line("dedicated_spill_file", counter("bm_spill_dedicated_file_total") > 0,
+       counter("bm_spill_dedicated_file_total"));
+  line("compression_attempt", counter("bm_spill_compress_attempt_total") > 0,
+       counter("bm_spill_compress_attempt_total"));
+  line("compression_saved_bytes",
+       counter("bm_spill_compress_saved_bytes") > 0,
+       counter("bm_spill_compress_saved_bytes"));
+  line("compression_raw_fallback",
+       counter("bm_spill_compress_fallback_raw_total") > 0,
+       counter("bm_spill_compress_fallback_raw_total"));
+  line("spill_read", counter("bm_spill_bytes_read") > 0,
+       counter("bm_spill_bytes_read"));
+  line("spill_release", counter("bm_spill_release_total") > 0,
+       counter("bm_spill_release_total"));
+  out << "  configured_spill_workers = "
+      << FLAGS_bm_sort_benchmark_spill_worker_threads << "\n";
+}
+
 struct Run {
   std::vector<std::shared_ptr<BlockHandle>> blocks;
   uint64_t rows{0};
@@ -462,41 +527,70 @@ BufferManagerProcessServicesConfig makeProcessServicesConfig(
 }
 
 BufferManagerConfig makeBufferManagerConfig(
+    uint32_t taskId,
     uint64_t dataBytes,
     BenchmarkMetricsRegistry& metrics) {
   BufferManagerConfig config;
-  config.poolName = fmt::format("bm_sort_{}", formatBytes(dataBytes));
+  config.poolName =
+      fmt::format("bm_sort_task_{}_{}", taskId, formatBytes(dataBytes));
   config.metrics = &metrics;
   return config;
 }
 
+struct SortTaskResult {
+  uint32_t taskId{0};
+  uint64_t rowOffset{0};
+  uint64_t rows{0};
+  uint64_t dataBytes{0};
+  uint64_t runs{0};
+  uint64_t generateAndSortMs{0};
+  uint64_t mergeMs{0};
+  uint64_t verifyMs{0};
+  uint64_t totalMs{0};
+  uint64_t orderedChecksum{0};
+  DataFingerprint expected;
+  DataFingerprint actual;
+  BufferPoolSnapshot snapshot;
+};
+
 class SortBenchmark {
  public:
   SortBenchmark(
+      uint32_t taskId,
+      uint64_t rowOffset,
+      uint64_t rows,
       uint64_t dataBytes,
       uint64_t memoryBudgetBytes,
       std::vector<uint64_t> blockSizes,
       BenchmarkMetricsRegistry& metrics)
-      : dataBytes_(dataBytes),
+      : taskId_(taskId),
+        rowOffset_(rowOffset),
+        rows_(rows),
+        dataBytes_(dataBytes),
         memoryBudgetBytes_(memoryBudgetBytes),
         blockSizes_(std::move(blockSizes)),
         metrics_(metrics),
         manager_(
             memoryManager_,
-            makeBufferManagerConfig(dataBytes, metrics_)) {
+            makeBufferManagerConfig(taskId, dataBytes, metrics_)) {
     BOLT_USER_CHECK(!blockSizes_.empty(), "block size profile must not be empty");
     for (const auto bytes : blockSizes_) {
       blockRows_.push_back(std::max<uint64_t>(1, bytes / kBytesPerRow));
     }
   }
 
-  void run() {
+  SortTaskResult run() {
     const auto totalStart = Clock::now();
     std::cout << fmt::format(
-        "\n=== BufferManager sort benchmark: {} ===\n",
+        "\n=== BufferManager sort task {}: {} rows ({}) ===\n",
+        taskId_,
+        rows_,
         formatBytes(dataBytes_));
     std::cout << fmt::format(
-        "blockSizeProfile={} blockSizeDistribution={} memoryBudgetBytes={}\n",
+        "task={} rowOffset={} blockSizeProfile={} blockSizeDistribution={} "
+        "memoryBudgetBytes={}\n",
+        taskId_,
+        rowOffset_,
         FLAGS_bm_sort_benchmark_weighted_block_sizes_kb,
         formatSizeDistribution(blockSizes_),
         memoryBudgetBytes_);
@@ -519,19 +613,23 @@ class SortBenchmark {
       actualFingerprint = verifySorted(runs.front(), &orderedChecksum);
       verifyMs_ = elapsedMs(verifyStart);
     }
+    if (!FLAGS_bm_sort_benchmark_verify) {
+      actualFingerprint = expectedFingerprint_;
+    }
 
     const auto snapshot = manager_.Snapshot();
-    metrics_.print(std::cout);
-    printFeatureCoverage(std::cout);
     std::cout << fmt::format(
-        "\nSummary: dataBytes={} rows={} runs={} generateSortMs={} "
+        "\nTaskSummary: task={} rowOffset={} dataBytes={} rows={} runs={} "
+        "generateSortMs={} "
         "mergeMs={} verifyMs={} totalMs={} orderedChecksum={} "
         "expectedRows={} actualRows={} expectedValueXor={} actualValueXor={} "
         "expectedValueSum={} actualValueSum={} expectedHashXor={} "
         "actualHashXor={} expectedHashSum={} actualHashSum={} usedTotal={} "
-        "loadedBytes={} spilledBytes={} usedDiskBytes={}\n",
+        "loadedBytes={} spilledBytes={}\n",
+        taskId_,
+        rowOffset_,
         dataBytes_,
-        dataBytes_ / kBytesPerRow,
+        rows_,
         runs.empty() ? 0 : runs.front().blocks.size(),
         generateAndSortMs,
         mergeMs,
@@ -550,8 +648,21 @@ class SortBenchmark {
         actualFingerprint.hashSum,
         snapshot.usedTotalBytes,
         snapshot.usedLoadedBytes,
-        snapshot.usedSpilledBytes,
-        ProcessSpillService::Instance().UsedDiskBytes());
+        snapshot.usedSpilledBytes);
+    return SortTaskResult{
+        .taskId = taskId_,
+        .rowOffset = rowOffset_,
+        .rows = rows_,
+        .dataBytes = dataBytes_,
+        .runs = runs.empty() ? 0 : runs.front().blocks.size(),
+        .generateAndSortMs = generateAndSortMs,
+        .mergeMs = mergeMs,
+        .verifyMs = verifyMs_,
+        .totalMs = elapsedMs(totalStart),
+        .orderedChecksum = orderedChecksum,
+        .expected = expectedFingerprint_,
+        .actual = actualFingerprint,
+        .snapshot = snapshot};
   }
 
  private:
@@ -675,15 +786,14 @@ class SortBenchmark {
   std::vector<Run> buildInitialRuns() {
     std::vector<uint64_t> values;
     values.reserve(*std::max_element(blockRows_.begin(), blockRows_.end()));
-    const uint64_t totalRows = dataBytes_ / kBytesPerRow;
     std::vector<Run> runs;
     size_t blockIndex = 0;
-    for (uint64_t base = 0; base < totalRows;) {
+    for (uint64_t base = 0; base < rows_;) {
       const uint64_t rows =
-          std::min(blockRows_[blockIndex % blockRows_.size()], totalRows - base);
+          std::min(blockRows_[blockIndex % blockRows_.size()], rows_ - base);
       values.clear();
       for (uint64_t i = 0; i < rows; ++i) {
-        const auto value = splitmix64(base + i);
+        const auto value = splitmix64(rowOffset_ + base + i);
         values.push_back(value);
         expectedFingerprint_.add(value);
       }
@@ -707,9 +817,10 @@ class SortBenchmark {
       base += rows;
       ++blockIndex;
       std::cout << fmt::format(
-          "\rinitial runs: {} / {} rows",
-          std::min(base, totalRows),
-          totalRows)
+          "\rtask {} initial runs: {} / {} rows",
+          taskId_,
+          std::min(base, rows_),
+          rows_)
                 << std::flush;
     }
     std::cout << "\n";
@@ -726,7 +837,8 @@ class SortBenchmark {
       }
       next.push_back(mergeTwo(runs[i], runs[i + 1]));
       std::cout << fmt::format(
-          "\rmerge pass {}: {} / {} input runs",
+          "\rtask {} merge pass {}: {} / {} input runs",
+          taskId_,
           pass,
           std::min(i + 2, runs.size()),
           runs.size())
@@ -778,7 +890,7 @@ class SortBenchmark {
       ++rows;
       reader.advance();
     }
-    BOLT_USER_CHECK_EQ(rows, dataBytes_ / kBytesPerRow);
+    BOLT_USER_CHECK_EQ(rows, rows_);
     BOLT_USER_CHECK_EQ(actual.rows, expectedFingerprint_.rows);
     BOLT_USER_CHECK_EQ(actual.valueXor, expectedFingerprint_.valueXor);
     BOLT_USER_CHECK_EQ(actual.valueSum, expectedFingerprint_.valueSum);
@@ -794,53 +906,9 @@ class SortBenchmark {
     }
   }
 
-  void printFeatureCoverage(std::ostream& out) const {
-    const auto counter = [&](std::string_view name) {
-      return metrics_.CounterValue(name);
-    };
-    const auto histogram = [&](std::string_view name) {
-      return metrics_.HistogramCount(name);
-    };
-    const auto line = [&](std::string_view name, bool covered, uint64_t value) {
-      out << "  " << name << " = " << (covered ? "yes" : "no")
-          << " value=" << value << "\n";
-    };
-
-    out << "\nBufferManager feature coverage\n";
-    line("reclaim", counter("bm_reclaim_requests_total") > 0,
-         counter("bm_reclaim_requests_total"));
-    line("spill_submit", counter("bm_spill_submit_total") > 0,
-         counter("bm_spill_submit_total"));
-    line("sync_backpressure_fallback",
-         counter("bm_spill_backpressured_total") > 0,
-         counter("bm_spill_backpressured_total"));
-    line("async_spill_scheduled", counter("bm_spill_scheduled_total") > 0,
-         counter("bm_spill_scheduled_total"));
-    line("async_spill_executed", counter("bm_spill_executed_total") > 0,
-         counter("bm_spill_executed_total"));
-    line("async_wait_for_progress",
-         histogram("bm_wait_for_spill_progress_duration_us") > 0,
-         histogram("bm_wait_for_spill_progress_duration_us"));
-    line("small_spill_slot", counter("bm_spill_small_slot_total") > 0,
-         counter("bm_spill_small_slot_total"));
-    line("dedicated_spill_file", counter("bm_spill_dedicated_file_total") > 0,
-         counter("bm_spill_dedicated_file_total"));
-    line("compression_attempt", counter("bm_spill_compress_attempt_total") > 0,
-         counter("bm_spill_compress_attempt_total"));
-    line("compression_saved_bytes",
-         counter("bm_spill_compress_saved_bytes") > 0,
-         counter("bm_spill_compress_saved_bytes"));
-    line("compression_raw_fallback",
-         counter("bm_spill_compress_fallback_raw_total") > 0,
-         counter("bm_spill_compress_fallback_raw_total"));
-    line("spill_read", counter("bm_spill_bytes_read") > 0,
-         counter("bm_spill_bytes_read"));
-    line("spill_release", counter("bm_spill_release_total") > 0,
-         counter("bm_spill_release_total"));
-    out << "  configured_spill_workers = "
-        << FLAGS_bm_sort_benchmark_spill_worker_threads << "\n";
-  }
-
+  uint32_t taskId_;
+  uint64_t rowOffset_;
+  uint64_t rows_;
   uint64_t dataBytes_;
   uint64_t memoryBudgetBytes_;
   std::vector<uint64_t> blockSizes_;
@@ -850,6 +918,151 @@ class SortBenchmark {
   uint64_t verifyMs_{0};
   MemoryManager memoryManager_;
   BufferManager manager_;
+};
+
+class ConcurrentSortBenchmark {
+ public:
+  ConcurrentSortBenchmark(
+      uint64_t dataBytes,
+      uint64_t memoryBudgetBytes,
+      std::vector<uint64_t> blockSizes,
+      BenchmarkMetricsRegistry& metrics)
+      : dataBytes_(dataBytes),
+        memoryBudgetBytes_(memoryBudgetBytes),
+        blockSizes_(std::move(blockSizes)),
+        metrics_(metrics) {}
+
+  void run() {
+    const auto totalStart = Clock::now();
+    const auto totalRows = dataBytes_ / kBytesPerRow;
+    const auto perTaskBudget =
+        std::max<uint64_t>(1, memoryBudgetBytes_ / kSortTaskCount);
+
+    std::cout << fmt::format(
+        "\n=== BufferManager concurrent sort benchmark: {} ===\n",
+        formatBytes(dataBytes_));
+    std::cout << fmt::format(
+        "sortTasks={} processSpillWorkers={} totalMemoryBudgetBytes={} "
+        "perTaskMemoryBudgetBytes={}\n",
+        kSortTaskCount,
+        FLAGS_bm_sort_benchmark_spill_worker_threads,
+        memoryBudgetBytes_,
+        perTaskBudget);
+
+    std::vector<SortTaskResult> results(kSortTaskCount);
+    std::vector<std::exception_ptr> errors(kSortTaskCount);
+    std::vector<std::thread> threads;
+    threads.reserve(kSortTaskCount);
+
+    uint64_t rowOffset = 0;
+    for (uint32_t taskId = 0; taskId < kSortTaskCount; ++taskId) {
+      const auto taskRows =
+          totalRows / kSortTaskCount + (taskId < totalRows % kSortTaskCount);
+      const auto taskOffset = rowOffset;
+      rowOffset += taskRows;
+      threads.emplace_back([&, taskId, taskOffset, taskRows]() {
+        try {
+          SortBenchmark task(
+              taskId,
+              taskOffset,
+              taskRows,
+              taskRows * kBytesPerRow,
+              perTaskBudget,
+              blockSizes_,
+              metrics_);
+          results[taskId] = task.run();
+        } catch (...) {
+          errors[taskId] = std::current_exception();
+        }
+      });
+    }
+
+    for (auto& thread : threads) {
+      thread.join();
+    }
+    for (uint32_t taskId = 0; taskId < kSortTaskCount; ++taskId) {
+      if (errors[taskId] != nullptr) {
+        std::rethrow_exception(errors[taskId]);
+      }
+    }
+
+    printSummary(results, elapsedMs(totalStart));
+  }
+
+ private:
+  void printSummary(
+      const std::vector<SortTaskResult>& results,
+      uint64_t totalMs) const {
+    DataFingerprint expected;
+    DataFingerprint actual;
+    BufferPoolSnapshot snapshot;
+    uint64_t rows = 0;
+    uint64_t runs = 0;
+    uint64_t orderedChecksum = 0;
+    uint64_t generateAndSortMs = 0;
+    uint64_t mergeMs = 0;
+    uint64_t verifyMs = 0;
+    for (const auto& result : results) {
+      rows += result.rows;
+      runs += result.runs;
+      orderedChecksum ^= result.orderedChecksum;
+      expected = combineFingerprint(expected, result.expected);
+      actual = combineFingerprint(actual, result.actual);
+      snapshot.usedTotalBytes += result.snapshot.usedTotalBytes;
+      snapshot.usedPinnedBytes += result.snapshot.usedPinnedBytes;
+      snapshot.usedLoadedBytes += result.snapshot.usedLoadedBytes;
+      snapshot.usedSpilledBytes += result.snapshot.usedSpilledBytes;
+      generateAndSortMs = std::max(generateAndSortMs, result.generateAndSortMs);
+      mergeMs = std::max(mergeMs, result.mergeMs);
+      verifyMs = std::max(verifyMs, result.verifyMs);
+    }
+
+    BOLT_USER_CHECK_EQ(rows, dataBytes_ / kBytesPerRow);
+    BOLT_USER_CHECK_EQ(actual.rows, expected.rows);
+    BOLT_USER_CHECK_EQ(actual.valueXor, expected.valueXor);
+    BOLT_USER_CHECK_EQ(actual.valueSum, expected.valueSum);
+    BOLT_USER_CHECK_EQ(actual.hashXor, expected.hashXor);
+    BOLT_USER_CHECK_EQ(actual.hashSum, expected.hashSum);
+
+    metrics_.print(std::cout);
+    printFeatureCoverage(metrics_, std::cout);
+    std::cout << fmt::format(
+        "\nSummary: dataBytes={} rows={} sortTasks={} runs={} "
+        "generateSortMs={} mergeMs={} verifyMs={} totalMs={} "
+        "orderedChecksum={} expectedRows={} actualRows={} "
+        "expectedValueXor={} actualValueXor={} expectedValueSum={} "
+        "actualValueSum={} expectedHashXor={} actualHashXor={} "
+        "expectedHashSum={} actualHashSum={} usedTotal={} loadedBytes={} "
+        "spilledBytes={} usedDiskBytes={}\n",
+        dataBytes_,
+        rows,
+        kSortTaskCount,
+        runs,
+        generateAndSortMs,
+        mergeMs,
+        verifyMs,
+        totalMs,
+        orderedChecksum,
+        expected.rows,
+        actual.rows,
+        expected.valueXor,
+        actual.valueXor,
+        expected.valueSum,
+        actual.valueSum,
+        expected.hashXor,
+        actual.hashXor,
+        expected.hashSum,
+        actual.hashSum,
+        snapshot.usedTotalBytes,
+        snapshot.usedLoadedBytes,
+        snapshot.usedSpilledBytes,
+        ProcessSpillService::Instance().UsedDiskBytes());
+  }
+
+  uint64_t dataBytes_;
+  uint64_t memoryBudgetBytes_;
+  std::vector<uint64_t> blockSizes_;
+  BenchmarkMetricsRegistry& metrics_;
 };
 
 void prepareSpillDirectory() {
@@ -875,7 +1088,7 @@ int main(int argc, char** argv) {
   auto blockSizes = bytedance::bolt::memory::bm::parseBlockSizeProfile();
 
   {
-    bytedance::bolt::memory::bm::SortBenchmark benchmark(
+    bytedance::bolt::memory::bm::ConcurrentSortBenchmark benchmark(
         size, memoryBudgetBytes, std::move(blockSizes), metrics);
     benchmark.run();
   }

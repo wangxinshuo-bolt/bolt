@@ -225,6 +225,22 @@ ProcessSpillService::DrainCompletions(
   return completions;
 }
 
+std::vector<ProcessSpillService::PrefetchCompletion>
+ProcessSpillService::DrainPrefetchCompletions(
+    const std::shared_ptr<SpillOwnerToken>& owner) {
+  std::vector<PrefetchCompletion> completions;
+  std::lock_guard<std::mutex> l(mutex_);
+  for (auto it = prefetchCompleted_.begin(); it != prefetchCompleted_.end();) {
+    if (!it->owner.owner_before(owner) && !owner.owner_before(it->owner)) {
+      completions.push_back(std::move(*it));
+      it = prefetchCompleted_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  return completions;
+}
+
 bool ProcessSpillService::HasPendingSpills(
     const std::shared_ptr<SpillOwnerToken>& owner) const {
   std::lock_guard<std::mutex> l(mutex_);
@@ -234,7 +250,19 @@ bool ProcessSpillService::HasPendingSpills(
       return true;
     }
   }
+  for (const auto& request : prefetchReady_) {
+    if (!request.owner.owner_before(owner) &&
+        !owner.owner_before(request.owner)) {
+      return true;
+    }
+  }
   for (const auto& completion : completed_) {
+    if (!completion.owner.owner_before(owner) &&
+        !owner.owner_before(completion.owner)) {
+      return true;
+    }
+  }
+  for (const auto& completion : prefetchCompleted_) {
     if (!completion.owner.owner_before(owner) &&
         !owner.owner_before(completion.owner)) {
       return true;
@@ -319,6 +347,17 @@ void ProcessSpillService::StopWorkers() {
           SpillLocation{},
           "ProcessSpillService stopped before write"});
     }
+    while (!prefetchReady_.empty()) {
+      auto request = std::move(prefetchReady_.front());
+      prefetchReady_.pop_front();
+      prefetchCompleted_.push_back(PrefetchCompletion{
+          request.owner,
+          request.blockId,
+          request.evictionSequence,
+          request.tag,
+          std::move(request.memory),
+          "ProcessSpillService stopped before read"});
+    }
     queueDepthGauge_.Set(0);
   }
   cv_.notify_all();
@@ -334,20 +373,39 @@ void ProcessSpillService::StopWorkers() {
 void ProcessSpillService::WorkerLoop() {
   for (;;) {
     SpillRequest request;
+    PrefetchRequest prefetch;
+    bool hasSpill = false;
+    bool hasPrefetch = false;
     {
       std::unique_lock<std::mutex> l(mutex_);
-      cv_.wait(l, [&] { return stopping_ || !ready_.empty(); });
+      cv_.wait(l, [&] {
+        return stopping_ || !ready_.empty() || !prefetchReady_.empty();
+      });
       if (stopping_) {
         return;
       }
-      request = std::move(ready_.front());
-      ready_.pop_front();
-      if (auto owner = request.owner.lock()) {
-        ++activeByOwner_[owner];
+      if (!ready_.empty()) {
+        request = std::move(ready_.front());
+        ready_.pop_front();
+        hasSpill = true;
+      } else {
+        prefetch = std::move(prefetchReady_.front());
+        prefetchReady_.pop_front();
+        hasPrefetch = true;
       }
-      queueDepthGauge_.Set(static_cast<int64_t>(ready_.size()));
+      const auto ownerToken =
+          hasSpill ? request.owner.lock() : prefetch.owner.lock();
+      if (ownerToken) {
+        ++activeByOwner_[ownerToken];
+      }
+      queueDepthGauge_.Set(
+          static_cast<int64_t>(ready_.size() + prefetchReady_.size()));
     }
-    ExecuteSpill(std::move(request));
+    if (hasSpill) {
+      ExecuteSpill(std::move(request));
+    } else if (hasPrefetch) {
+      ExecutePrefetch(std::move(prefetch));
+    }
     NotifyProgress();
   }
 }
@@ -389,6 +447,65 @@ void ProcessSpillService::ExecuteSpill(SpillRequest request) {
       }
     }
     completed_.push_back(std::move(completion));
+  }
+}
+
+EvictResult ProcessSpillService::SubmitPrefetch(PrefetchRequest request) {
+  if (request.owner.expired()) {
+    return EvictResult{EvictResultKind::kSkipped, 0};
+  }
+  BOLT_USER_CHECK_NOT_NULL(
+      request.memory, "ProcessSpillService prefetch requires resident memory");
+  BOLT_USER_CHECK(
+      request.location.Valid(),
+      "ProcessSpillService prefetch requires a valid spill location");
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (stopping_) {
+      return EvictResult{EvictResultKind::kFailed, 0};
+    }
+    prefetchReady_.push_back(std::move(request));
+    queueDepthGauge_.Set(
+        static_cast<int64_t>(ready_.size() + prefetchReady_.size()));
+  }
+  cv_.notify_one();
+  return EvictResult{EvictResultKind::kScheduled, 0};
+}
+
+void ProcessSpillService::ExecutePrefetch(PrefetchRequest request) {
+  ScopedBmTimer timer(executeDuration_);
+  PrefetchCompletion completion;
+  completion.owner = request.owner;
+  completion.blockId = request.blockId;
+  completion.evictionSequence = request.evictionSequence;
+  completion.tag = request.tag;
+  completion.memory = std::move(request.memory);
+  try {
+    BOLT_USER_CHECK_NOT_NULL(
+        completion.memory, "Async prefetch request has no resident memory");
+    Read(request.location, completion.memory->Data(), completion.memory->Size());
+    executedCounter_.Add(1);
+    BOLT_MEM_VLOG(1) << "ProcessSpillService read async prefetch bytes="
+                     << completion.memory->Size();
+  } catch (const std::exception& e) {
+    completion.error = e.what();
+    failedCounter_.Add(1);
+    BOLT_MEM_LOG(WARNING) << "ProcessSpillService failed async prefetch: "
+                          << e.what();
+  }
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (auto owner = completion.owner.lock()) {
+      auto active = activeByOwner_.find(owner);
+      if (active != activeByOwner_.end()) {
+        if (active->second <= 1) {
+          activeByOwner_.erase(active);
+        } else {
+          --active->second;
+        }
+      }
+    }
+    prefetchCompleted_.push_back(std::move(completion));
   }
 }
 

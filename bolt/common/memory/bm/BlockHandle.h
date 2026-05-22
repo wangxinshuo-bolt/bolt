@@ -116,6 +116,11 @@ class BlockHandle : public BlockHandleBase,
   void CommitAsyncSpillFailure(
       uint64_t expectedSequence,
       std::unique_ptr<AccountedMemory> memory);
+  std::optional<ProcessSpillService::PrefetchRequest> PrepareAsyncPrefetch();
+  ByteCount CommitAsyncPrefetchSuccess(
+      uint64_t expectedSequence,
+      std::unique_ptr<AccountedMemory> memory);
+  void CommitAsyncPrefetchFailure(uint64_t expectedSequence);
 
   // Returns the current state in the lifecycle state machine.
   BlockState State() const;

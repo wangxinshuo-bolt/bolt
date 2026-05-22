@@ -135,6 +135,7 @@ BufferManager::~BufferManager() {
   if (spillService_.has_value()) {
     for (;;) {
       DrainSpillCompletions();
+      DrainPrefetchCompletions();
       if (!spillService_->get().HasPendingSpills(spillOwnerToken_)) {
         break;
       }
@@ -218,6 +219,7 @@ BufferHandle BufferManager::Pin(const std::shared_ptr<BlockHandle>& block) {
   if (block == nullptr) {
     return BufferHandle();
   }
+  DrainPrefetchCompletionsBeforePin(block);
   return block->Pin();
 }
 
@@ -288,6 +290,7 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
   reclaimRequestsCounter_.Add(1);
   const auto before = GetMemoryUsage();
   const auto reclaimableBefore = ReclaimableBytes();
+  DrainPrefetchCompletions();
   ByteCount reclaimed = DrainSpillCompletions();
   for (auto it = blocks_.begin(); it != blocks_.end();) {
     if (auto block = it->lock()) {
@@ -374,6 +377,58 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
                      << " reclaimableBefore=" << reclaimableBefore
                      << " scheduledSpill=" << scheduledSpillCount;
   return reclaimed;
+}
+
+PrefetchResult BufferManager::Prefetch(
+    const std::vector<std::shared_ptr<BlockHandle>>& blocks,
+    PrefetchOptions options) {
+  AssertOwnerThread();
+  PrefetchResult result;
+  if (blocks.empty()) {
+    DrainPrefetchCompletions();
+    return result;
+  }
+  for (const auto& block : blocks) {
+    if (block == nullptr) {
+      ++result.skippedCount;
+      continue;
+    }
+    const auto state = block->State();
+    if (state == BlockState::kLoaded) {
+      ++result.alreadyLoadedCount;
+      continue;
+    }
+    if (state != BlockState::kSpilled) {
+      ++result.skippedCount;
+      continue;
+    }
+    EnsureSpillService();
+    std::optional<ProcessSpillService::PrefetchRequest> request;
+    try {
+      request = block->PrepareAsyncPrefetch();
+    } catch (...) {
+      if (!options.bestEffort) {
+        throw;
+      }
+      ++result.skippedCount;
+      continue;
+    }
+    if (!request.has_value()) {
+      ++result.skippedCount;
+      continue;
+    }
+    auto submit = spillService_->get().SubmitPrefetch(std::move(*request));
+    if (submit.kind == EvictResultKind::kScheduled) {
+      ++result.submittedCount;
+    } else if (submit.kind == EvictResultKind::kBackpressured) {
+      block->CommitAsyncPrefetchFailure(block->EvictionSequence());
+      ++result.backpressuredCount;
+    } else {
+      block->CommitAsyncPrefetchFailure(block->EvictionSequence());
+      ++result.skippedCount;
+    }
+  }
+  return result;
 }
 
 ByteCount BufferManager::ReclaimableBytes() const {
@@ -482,6 +537,71 @@ ByteCount BufferManager::DrainSpillCompletions(size_t* completionCount) {
     }
   }
   return reclaimed;
+}
+
+ByteCount BufferManager::DrainPrefetchCompletions(size_t* completionCount) {
+  if (completionCount != nullptr) {
+    *completionCount = 0;
+  }
+  if (!spillService_.has_value()) {
+    return 0;
+  }
+  ByteCount loaded = 0;
+  auto completions =
+      spillService_->get().DrainPrefetchCompletions(spillOwnerToken_);
+  if (completionCount != nullptr) {
+    *completionCount = completions.size();
+  }
+  for (auto& completion : completions) {
+    auto block = FindBlockById(completion.blockId);
+    if (completion.error.empty()) {
+      if (block != nullptr) {
+        loaded += block->CommitAsyncPrefetchSuccess(
+            completion.evictionSequence, std::move(completion.memory));
+        if (block->State() == BlockState::kLoaded && !block->IsPinned()) {
+          EnqueueEvictionCandidate(block);
+        }
+      } else {
+        completion.memory.reset();
+        BOLT_MEM_VLOG(1)
+            << "BufferManager dropped async prefetch completion for dead "
+               "block_id="
+            << completion.blockId;
+      }
+    } else {
+      if (block != nullptr) {
+        block->CommitAsyncPrefetchFailure(completion.evictionSequence);
+      }
+      completion.memory.reset();
+      BOLT_MEM_LOG(WARNING) << "BufferManager async prefetch failed block_id="
+                            << completion.blockId
+                            << " error=" << completion.error;
+    }
+  }
+  return loaded;
+}
+
+void BufferManager::DrainPrefetchCompletionsBeforePin(
+    const std::shared_ptr<BlockHandle>& block) {
+  if (block == nullptr) {
+    return;
+  }
+  for (;;) {
+    DrainPrefetchCompletions();
+    if (block->State() != BlockState::kLoading) {
+      return;
+    }
+    if (!spillService_.has_value() ||
+        !spillService_->get().HasPendingSpills(spillOwnerToken_)) {
+      return;
+    }
+    if (!spillService_->get().WaitForProgress(
+            0, config_.reserveWaitTimeout)) {
+      BOLT_MEM_LOG(WARNING)
+          << "BufferManager waiting for async prefetch before pin"
+          << " pool=" << config_.poolName << " block_id=" << block->Id();
+    }
+  }
 }
 
 std::shared_ptr<BlockHandle> BufferManager::FindBlockById(uint64_t blockId) {

@@ -402,6 +402,106 @@ void BlockHandle::CommitAsyncSpillFailure(
   cv_.notify_all();
 }
 
+std::optional<ProcessSpillService::PrefetchRequest>
+BlockHandle::PrepareAsyncPrefetch() {
+  std::shared_ptr<BufferManagerContext> context;
+  SpillLocation location;
+  uint64_t sequence = 0;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (!IsSpillPolicy(options_.policy) || state_ != BlockState::kSpilled ||
+        pinCount_ != 0 || context_.expired()) {
+      return std::nullopt;
+    }
+    context = context_.lock();
+    if (context == nullptr || !context->valid || !context->spill.has_value()) {
+      return std::nullopt;
+    }
+    location = spillLocation_;
+    if (!location.Valid()) {
+      return std::nullopt;
+    }
+    state_ = BlockState::kLoading;
+    sequence = evictionSequence_;
+    ++loadGeneration_;
+    lastLoadError_ = nullptr;
+  }
+
+  std::unique_ptr<AccountedMemory> memory;
+  try {
+    memory = context->allocator.Allocate(
+        options_.tag, size_, BodyReservationKind(options_.policy));
+  } catch (...) {
+    {
+      std::lock_guard<std::mutex> l(mutex_);
+      if (state_ == BlockState::kLoading &&
+          evictionSequence_ == sequence) {
+        state_ = BlockState::kSpilled;
+        lastLoadError_ = std::current_exception();
+      }
+    }
+    cv_.notify_all();
+    throw;
+  }
+
+  ProcessSpillService::PrefetchRequest request;
+  request.owner = context->spillOwnerToken;
+  request.blockId = id_;
+  request.evictionSequence = sequence;
+  request.tag = options_.tag;
+  request.memory = std::move(memory);
+  request.location = std::move(location);
+  BOLT_MEM_VLOG(1) << "Prepared async prefetch for BufferManager block id="
+                   << id_ << " size=" << request.memory->Size();
+  return request;
+}
+
+ByteCount BlockHandle::CommitAsyncPrefetchSuccess(
+    uint64_t expectedSequence,
+    std::unique_ptr<AccountedMemory> memory) {
+  std::optional<std::reference_wrapper<ProcessSpillService>> spillToRelease;
+  SpillLocation oldLocation;
+  const ByteCount loadedBytes = memory == nullptr ? 0 : memory->Size();
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    auto context = context_.lock();
+    if (state_ != BlockState::kLoading ||
+        evictionSequence_ != expectedSequence || context == nullptr ||
+        !context->valid || memory == nullptr) {
+      return 0;
+    }
+    memory_ = std::move(memory);
+    oldLocation = spillLocation_;
+    spillLocation_ = SpillLocation{};
+    state_ = BlockState::kLoaded;
+    lastLoadError_ = nullptr;
+    if (oldLocation.Valid() && context->spill.has_value()) {
+      spillToRelease = context->spill;
+    }
+  }
+  if (oldLocation.Valid() && spillToRelease.has_value()) {
+    spillToRelease->get().Release(oldLocation);
+  }
+  cv_.notify_all();
+  return loadedBytes;
+}
+
+void BlockHandle::CommitAsyncPrefetchFailure(uint64_t expectedSequence) {
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (state_ == BlockState::kLoading &&
+        evictionSequence_ == expectedSequence) {
+      state_ = BlockState::kSpilled;
+      try {
+        throw std::runtime_error("BufferManager async prefetch failed");
+      } catch (...) {
+        lastLoadError_ = std::current_exception();
+      }
+    }
+  }
+  cv_.notify_all();
+}
+
 void BlockHandle::ClearSpillScheduled() noexcept {
   std::lock_guard<std::mutex> l(mutex_);
   spillScheduled_ = false;

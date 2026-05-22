@@ -301,6 +301,115 @@ TEST(SpillTest, asyncSpillCompletionDoesNotKeepBlockAlive) {
   ASSERT_EQ(manager.GetMemoryUsage(), 0);
 }
 
+TEST(SpillTest, prefetchReportsLoadedAndNullBlocksWithoutDiskIo) {
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager,
+      BufferManagerConfig{.poolName = "bm_prefetch_loaded_no_disk"});
+
+  auto loaded = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 128,
+                      .policy = EvictPolicy::kDiscard,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 7, bytes); });
+
+  auto result = manager.Prefetch({loaded, nullptr});
+  ASSERT_EQ(result.alreadyLoadedCount, 1);
+  ASSERT_EQ(result.skippedCount, 1);
+  ASSERT_EQ(result.submittedCount, 0);
+  ASSERT_EQ(result.backpressuredCount, 0);
+}
+
+TEST(SpillTest, prefetchReloadsSpilledBlockWithoutPinning) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
+  BufferManager::ResetProcessServicesForTesting();
+  BufferManagerProcessServicesConfig services;
+  services.spill.spillDir = "/tmp/bolt_bm_prefetch_reload";
+  services.spill.workerThreadCount = 1;
+  services.spill.diskProbeDuration = std::chrono::milliseconds(0);
+  services.spill.cleanupOnDestroy = true;
+  services.spill.diskIo.initialQueueDepth = 4;
+  services.spill.diskIo.minQueueDepth = 1;
+  services.spill.diskIo.maxQueueDepth = 16;
+  BufferManager::InitializeProcessServices(std::move(services));
+
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager, BufferManagerConfig{.poolName = "bm_prefetch_reload"});
+
+  auto block = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 512,
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 41, bytes); });
+
+  ASSERT_EQ(manager.Reclaim(512), 512);
+  ASSERT_EQ(block->State(), BlockState::kSpilled);
+  ASSERT_EQ(manager.GetMemoryUsage(), 0);
+
+  auto result = manager.Prefetch({block});
+  ASSERT_EQ(result.submittedCount, 1);
+  ASSERT_EQ(result.skippedCount, 0);
+  ASSERT_TRUE(ProcessSpillService::Instance().WaitForProgress(
+      0, std::chrono::seconds(5)));
+
+  result = manager.Prefetch({});
+  ASSERT_EQ(result.submittedCount, 0);
+  ASSERT_EQ(block->State(), BlockState::kLoaded);
+  ASSERT_EQ(manager.GetMemoryUsage(), 512);
+  ASSERT_FALSE(block->IsPinned());
+
+  auto pinned = manager.Pin(block);
+  ASSERT_TRUE(pinned.IsValid());
+  ASSERT_EQ(pinned.Data()[0], 41);
+}
+
+TEST(SpillTest, prefetchSkipsLoadedAndDuplicateRequests) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
+  BufferManager::ResetProcessServicesForTesting();
+  BufferManagerProcessServicesConfig services;
+  services.spill.spillDir = "/tmp/bolt_bm_prefetch_skips";
+  services.spill.workerThreadCount = 1;
+  services.spill.diskProbeDuration = std::chrono::milliseconds(0);
+  services.spill.cleanupOnDestroy = true;
+  services.spill.diskIo.initialQueueDepth = 4;
+  services.spill.diskIo.minQueueDepth = 1;
+  services.spill.diskIo.maxQueueDepth = 16;
+  BufferManager::InitializeProcessServices(std::move(services));
+
+  memory::MemoryManager memoryManager;
+  BufferManager manager(
+      memoryManager, BufferManagerConfig{.poolName = "bm_prefetch_skips"});
+
+  auto loaded = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 128,
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 7, bytes); });
+  auto loadedResult = manager.Prefetch({loaded});
+  ASSERT_EQ(loadedResult.alreadyLoadedCount, 1);
+  ASSERT_EQ(loadedResult.submittedCount, 0);
+
+  auto spilled = manager.AllocatePersistent(
+      AllocateOptions{.tag = MemoryTag::kShuffle,
+                      .size = 512,
+                      .policy = EvictPolicy::kSpillToDisk,
+                      .recoveryFn = nullptr},
+      [](DataPtr data, ByteCount bytes) { std::memset(data, 9, bytes); });
+
+  ASSERT_EQ(manager.Reclaim(512), 512);
+  ASSERT_EQ(spilled->State(), BlockState::kSpilled);
+
+  auto submitted = manager.Prefetch({spilled});
+  ASSERT_EQ(submitted.submittedCount, 1);
+  auto duplicate = manager.Prefetch({spilled});
+  ASSERT_EQ(duplicate.skippedCount, 1);
+  ASSERT_EQ(duplicate.submittedCount, 0);
+}
+
 TEST(SpillTest, spillLocationReleaseUsesSingleStore) {
   BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   // Use a directly-owned ProcessSpillService instead of the singleton so this

@@ -123,7 +123,27 @@ class ProcessSpillService : public SpillRequester {
     std::string error;
   };
 
+  struct PrefetchRequest {
+    std::weak_ptr<SpillOwnerToken> owner;
+    uint64_t blockId{0};
+    uint64_t evictionSequence{0};
+    MemoryTag tag{MemoryTag::kInternal};
+    std::unique_ptr<AccountedMemory> memory;
+    SpillLocation location;
+  };
+
+  struct PrefetchCompletion {
+    std::weak_ptr<SpillOwnerToken> owner;
+    uint64_t blockId{0};
+    uint64_t evictionSequence{0};
+    MemoryTag tag{MemoryTag::kInternal};
+    std::unique_ptr<AccountedMemory> memory;
+    std::string error;
+  };
+
   std::vector<SpillCompletion> DrainCompletions(
+      const std::shared_ptr<SpillOwnerToken>& owner);
+  std::vector<PrefetchCompletion> DrainPrefetchCompletions(
       const std::shared_ptr<SpillOwnerToken>& owner);
 
   // Snapshot of total disk bytes currently held by the process spill store.
@@ -163,6 +183,8 @@ class ProcessSpillService : public SpillRequester {
   void WorkerLoop();
   void NotifyProgress();
   void ExecuteSpill(SpillRequest request);
+  EvictResult SubmitPrefetch(PrefetchRequest request);
+  void ExecutePrefetch(PrefetchRequest request);
 
   // Best-effort cleanup of <root>/bolt_spill_<pid>_* directories whose pid
   // is no longer alive. Called once per process at construction time. Any
@@ -189,7 +211,9 @@ class ProcessSpillService : public SpillRequester {
   std::condition_variable cv_;
   std::condition_variable progressCv_;
   std::deque<SpillRequest> ready_;
+  std::deque<PrefetchRequest> prefetchReady_;
   std::deque<SpillCompletion> completed_;
+  std::deque<PrefetchCompletion> prefetchCompleted_;
   std::map<std::weak_ptr<SpillOwnerToken>,
            size_t,
            std::owner_less<std::weak_ptr<SpillOwnerToken>>>

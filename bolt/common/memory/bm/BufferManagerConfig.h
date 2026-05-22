@@ -29,6 +29,21 @@ struct BufferPoolSnapshot {
   ByteCount usedSpilledBytes{0};
 };
 
+// Best-effort prefetch controls. Prefetch reloads spilled blocks into
+// resident memory without pinning them.
+struct PrefetchOptions {
+  Priority priority{Priority::kNormal};
+  bool bestEffort{true};
+};
+
+// Submission summary returned by BufferManager::Prefetch().
+struct PrefetchResult {
+  uint64_t submittedCount{0};
+  uint64_t skippedCount{0};
+  uint64_t alreadyLoadedCount{0};
+  uint64_t backpressuredCount{0};
+};
+
 // Controls which thread executes spill work. Disk I/O submission itself is
 // handled by the process-level disk service.
 enum class SpillExecutionMode : uint8_t {

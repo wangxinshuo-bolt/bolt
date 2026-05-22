@@ -128,6 +128,15 @@ class BufferManager {
   // make progress before returning.
   ByteCount Reclaim(ByteCount targetBytes);
 
+  // Best-effort asynchronous reload for spilled blocks. A successful prefetch
+  // makes a block resident again without pinning it. Passing an empty vector is
+  // a drain-only operation; non-empty calls keep submission accounting focused
+  // on this batch and leave completions to Pin(), Reclaim(), destruction, or a
+  // later drain-only Prefetch({}).
+  PrefetchResult Prefetch(
+      const std::vector<std::shared_ptr<BlockHandle>>& blocks,
+      PrefetchOptions options = {});
+
   // Returns currently resident, unpinned bytes that can participate in
   // reclaim. Useful for back-pressure heuristics; not a hard limit.
   ByteCount ReclaimableBytes() const;
@@ -172,6 +181,9 @@ class BufferManager {
 
   void AssertOwnerThread() const;
   ByteCount DrainSpillCompletions(size_t* completionCount = nullptr);
+  ByteCount DrainPrefetchCompletions(size_t* completionCount = nullptr);
+  void DrainPrefetchCompletionsBeforePin(
+      const std::shared_ptr<BlockHandle>& block);
   std::shared_ptr<BlockHandle> FindBlockById(uint64_t blockId);
 
   void EnsureSpillService();

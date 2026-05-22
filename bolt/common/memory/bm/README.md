@@ -143,7 +143,8 @@ Operator receives BufferHandle(initialWrite=true)
         |                              |    | kEvictedRecomputable |
         |                              |    +----------------------+
         |                              |             |
-        |                              | Pin()       |
+        |                              | Pin()/      |
+        |                              | Prefetch()  |
         |                              v             |
         |                         +----------+ <-----+
         |                         | kLoading |
@@ -168,7 +169,8 @@ Operator receives BufferHandle(initialWrite=true)
         |                | kSpilled | | kLoaded |
         |                +----------+ +---------+
         |                     |
-        |                     | Pin()
+        |                     | Pin()/
+        |                     | Prefetch()
         |                     v
         |                +----------+
         |                | kLoading |
@@ -447,6 +449,55 @@ Pin(block)
 
 - 同一代 reload 失败时，等待者看到同一个异常。
 - reload 成功后 `spillLocation_` 会被清空，并通过 spill service release 原 spill 文件/slot。
+
+## Prefetch 流程
+
+`Prefetch(blocks)` 是 best-effort 异步 reload 接口，用于把已经 spilled 的 block 提前读回 resident memory，但不 pin 住 block。它复用 `kLoading` 状态和 async completion 机制，因此和 `Pin()` 不会重复发起同一个 block 的读盘。
+
+```text
+Prefetch(blocks)
+    |
+    +--> DrainPrefetchCompletions()
+    |
+    +--> for each block:
+            |
+            +-- kLoaded
+            |      |
+            |      +--> alreadyLoadedCount++
+            |
+            +-- kSpilled
+            |      |
+            |      +--> BlockHandle.PrepareAsyncPrefetch()
+            |      |      - allocate resident AccountedMemory
+            |      |      - state = kLoading
+            |      |      - memory moves into PrefetchRequest
+            |      |
+            |      +--> ProcessSpillService.SubmitPrefetch(request)
+            |      +--> submittedCount++
+            |
+            +-- other states
+                   |
+                   +--> skippedCount++
+
+ProcessSpillService worker
+    |
+    +--> Read(spillLocation, request.memory)
+    +--> PrefetchCompletion(owner, blockId, seq, memory, error)
+    +--> NotifyProgress()
+
+Owner thread later:
+
+Prefetch({})
+    |
+    +--> DrainPrefetchCompletions()
+    +--> CommitAsyncPrefetchSuccess()
+           - memory moves back to BlockHandle
+           - state = kLoaded
+           - old spill location is released
+           - block is resident but pinCount is unchanged
+```
+
+`Prefetch({})` 是显式 drain-only 调用。带 block 的 `Prefetch(blocks)` 不会把“已经完成但还没 drain 的 prefetch completion”混入本次提交结果，避免 repeated prefetch 的去重语义变成竞态。
 
 ## SpillStore 落盘路径
 

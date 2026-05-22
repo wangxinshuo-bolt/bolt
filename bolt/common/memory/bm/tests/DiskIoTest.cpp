@@ -103,9 +103,8 @@ void assertRoundTrip(DiskIoEngine& engine, const std::string& name) {
   std::filesystem::remove(path);
 }
 
-DiskIoConfig syncConfig() {
+DiskIoConfig diskIoConfig() {
   DiskIoConfig config;
-  config.backend = DiskIoBackend::kSync;
   config.initialQueueDepth = 4;
   config.minQueueDepth = 1;
   config.maxQueueDepth = 16;
@@ -113,11 +112,6 @@ DiskIoConfig syncConfig() {
 }
 
 } // namespace
-
-TEST(DiskIoTest, syncEngineRoundTripsReadWrite) {
-  SyncDiskIoEngine engine;
-  assertRoundTrip(engine, "bolt_bm_sync_disk_io_test.bin");
-}
 
 TEST(DiskIoTest, uringEngineRoundTripsReadWrite) {
   std::unique_ptr<UringDiskIoEngine> engine;
@@ -131,7 +125,7 @@ TEST(DiskIoTest, uringEngineRoundTripsReadWrite) {
 }
 
 TEST(DiskIoTest, adaptiveQueueDepthDoesNotDropForStableHighLatency) {
-  auto config = syncConfig();
+  auto config = diskIoConfig();
   config.initialQueueDepth = 8;
   config.maxQueueDepth = 16;
   AdaptiveQueueDepth depth(config);
@@ -147,7 +141,7 @@ TEST(DiskIoTest, adaptiveQueueDepthDoesNotDropForStableHighLatency) {
 }
 
 TEST(DiskIoTest, adaptiveQueueDepthDropsWhenLatencyRisesAndThroughputStalls) {
-  auto config = syncConfig();
+  auto config = diskIoConfig();
   config.initialQueueDepth = 8;
   config.maxQueueDepth = 16;
   AdaptiveQueueDepth depth(config);
@@ -168,7 +162,7 @@ TEST(DiskIoTest, adaptiveQueueDepthDropsWhenLatencyRisesAndThroughputStalls) {
 }
 
 TEST(DiskIoTest, adaptiveQueueDepthUsesConfiguredWindow) {
-  auto config = syncConfig();
+  auto config = diskIoConfig();
   config.initialQueueDepth = 8;
   config.maxQueueDepth = 16;
   config.adaptive.windowCompletionCount = 2;
@@ -192,7 +186,7 @@ TEST(DiskIoTest, adaptiveQueueDepthUsesConfiguredWindow) {
 TEST(DiskIoTest, schedulerUsesWeightedPriorityOrder) {
   auto engine = std::make_unique<RecordingDiskIoEngine>();
   auto* raw = engine.get();
-  DiskIoScheduler scheduler(std::move(engine), syncConfig());
+  DiskIoScheduler scheduler(std::move(engine), diskIoConfig());
 
   std::array<uint8_t, 1> a{1};
   std::array<uint8_t, 1> b{2};

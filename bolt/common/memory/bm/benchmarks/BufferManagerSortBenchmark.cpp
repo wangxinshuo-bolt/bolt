@@ -830,7 +830,6 @@ class SortOperator {
 
 DiskIoConfig makeDiskIoConfig() {
   DiskIoConfig ioConfig;
-  ioConfig.backend = DiskIoBackend::kSync;
   ioConfig.initialQueueDepth =
       static_cast<int>(FLAGS_bm_sort_benchmark_disk_io_initial_queue_depth);
   ioConfig.minQueueDepth =

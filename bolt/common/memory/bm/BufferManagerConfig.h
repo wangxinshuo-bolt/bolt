@@ -29,8 +29,8 @@ struct BufferPoolSnapshot {
   ByteCount usedSpilledBytes{0};
 };
 
-// Controls which thread executes spill work. This is intentionally separate
-// from DiskIoBackend: a worker thread can still use synchronous disk I/O.
+// Controls which thread executes spill work. Disk I/O submission itself is
+// handled by the process-level disk service.
 enum class SpillExecutionMode : uint8_t {
   kOwnerThread,
   kWorkerThread,

@@ -5,6 +5,7 @@
 
 #include <cstring>
 #include <filesystem>
+#include <string>
 
 #include <gtest/gtest.h>
 
@@ -58,7 +59,17 @@ class FakeBlockHandleBase final : public BlockHandleBase {
 
 } // namespace
 
+#define BOLT_BM_SKIP_IF_URING_UNAVAILABLE()                         \
+  do {                                                               \
+    std::string reason;                                              \
+    if (!test::uringAvailableForTesting(&reason)) {                  \
+      GTEST_SKIP() << "io_uring is unavailable in this environment: " \
+                   << reason;                                        \
+    }                                                                \
+  } while (false)
+
 TEST(SpillTest, spillBlockCanBeReloaded) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
@@ -84,12 +95,13 @@ TEST(SpillTest, spillBlockCanBeReloaded) {
   ASSERT_EQ(manager.GetMemoryUsage(), 256);
 }
 
-TEST(SpillTest, synchronousSpillWorksWhenWorkersDisabled) {
+TEST(SpillTest, ownerThreadSpillWorksWhenWorkersDisabled) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
       memoryManager,
-      BufferManagerConfig{.poolName = "bm_sync_spill"});
+      BufferManagerConfig{.poolName = "bm_owner_thread_spill"});
 
   auto block = manager.AllocatePersistent(
       AllocateOptions{.tag = MemoryTag::kShuffle,
@@ -108,6 +120,7 @@ TEST(SpillTest, synchronousSpillWorksWhenWorkersDisabled) {
 }
 
 TEST(SpillTest, snapshotTracksLoadedAndSpilledBytes) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
@@ -133,6 +146,7 @@ TEST(SpillTest, snapshotTracksLoadedAndSpilledBytes) {
 }
 
 TEST(SpillTest, pinnedSpillBlockIsNotReclaimed) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
@@ -152,6 +166,7 @@ TEST(SpillTest, pinnedSpillBlockIsNotReclaimed) {
 }
 
 TEST(SpillTest, reclaimUsesEvictionQueueCostOrder) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
@@ -178,6 +193,7 @@ TEST(SpillTest, reclaimUsesEvictionQueueCostOrder) {
 }
 
 TEST(SpillTest, spillCandidateIsNotSubmittedTwiceWhileScheduled) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   BufferManager manager(
@@ -205,13 +221,13 @@ TEST(SpillTest, spillCandidateIsNotSubmittedTwiceWhileScheduled) {
 }
 
 TEST(SpillTest, asyncSpillWorkerWritesButOwnerCommitsCompletion) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   BufferManager::ResetProcessServicesForTesting();
   BufferManagerProcessServicesConfig services;
   services.spill.spillDir = "/tmp/bolt_bm_async_owner_commit";
   services.spill.workerThreadCount = 1;
   services.spill.diskProbeDuration = std::chrono::milliseconds(0);
   services.spill.cleanupOnDestroy = true;
-  services.spill.diskIo.backend = DiskIoBackend::kSync;
   services.spill.diskIo.initialQueueDepth = 4;
   services.spill.diskIo.minQueueDepth = 1;
   services.spill.diskIo.maxQueueDepth = 16;
@@ -245,13 +261,13 @@ TEST(SpillTest, asyncSpillWorkerWritesButOwnerCommitsCompletion) {
 }
 
 TEST(SpillTest, asyncSpillCompletionDoesNotKeepBlockAlive) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   BufferManager::ResetProcessServicesForTesting();
   BufferManagerProcessServicesConfig services;
   services.spill.spillDir = "/tmp/bolt_bm_async_completion_no_block_ref";
   services.spill.workerThreadCount = 1;
   services.spill.diskProbeDuration = std::chrono::milliseconds(0);
   services.spill.cleanupOnDestroy = true;
-  services.spill.diskIo.backend = DiskIoBackend::kSync;
   services.spill.diskIo.initialQueueDepth = 4;
   services.spill.diskIo.minQueueDepth = 1;
   services.spill.diskIo.maxQueueDepth = 16;
@@ -286,6 +302,7 @@ TEST(SpillTest, asyncSpillCompletionDoesNotKeepBlockAlive) {
 }
 
 TEST(SpillTest, spillLocationReleaseUsesSingleStore) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   // Use a directly-owned ProcessSpillService instead of the singleton so this
   // test can inspect the store without affecting other unit tests.
   auto root = std::filesystem::temp_directory_path() /
@@ -318,7 +335,6 @@ TEST(SpillTest, workerThreadSpillRejectsZeroWorkers) {
   std::filesystem::create_directories(root);
 
   DiskIoConfig ioConfig;
-  ioConfig.backend = DiskIoBackend::kSync;
   ioConfig.initialQueueDepth = 4;
   ioConfig.minQueueDepth = 1;
   ioConfig.maxQueueDepth = 16;
@@ -338,6 +354,7 @@ TEST(SpillTest, workerThreadSpillRejectsZeroWorkers) {
 }
 
 TEST(SpillTest, processSpillServiceRecordsSkippedExpiredSubmit) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_test_process_spill_skipped";
   std::filesystem::remove_all(root);
@@ -345,7 +362,6 @@ TEST(SpillTest, processSpillServiceRecordsSkippedExpiredSubmit) {
 
   test::RecordingMetricsRegistry metrics;
   DiskIoConfig ioConfig;
-  ioConfig.backend = DiskIoBackend::kSync;
   ioConfig.initialQueueDepth = 4;
   ioConfig.minQueueDepth = 1;
   ioConfig.maxQueueDepth = 16;
@@ -390,6 +406,7 @@ TEST(SpillTest, spillPolicyRequiresExplicitProcessServiceInitialization) {
 }
 
 TEST(SpillTest, spillPoliciesUseInitializedProcessService) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   BufferManager::ResetProcessServicesForTesting();
 
   BufferManagerProcessServicesConfig services;
@@ -398,7 +415,6 @@ TEST(SpillTest, spillPoliciesUseInitializedProcessService) {
   services.spill.executionMode = SpillExecutionMode::kOwnerThread;
   services.spill.workerThreadCount = 0;
   services.spill.diskProbeDuration = std::chrono::milliseconds(0);
-  services.spill.diskIo.backend = DiskIoBackend::kSync;
   services.spill.diskIo.initialQueueDepth = 4;
   services.spill.diskIo.minQueueDepth = 1;
   services.spill.diskIo.maxQueueDepth = 16;
@@ -425,6 +441,7 @@ TEST(SpillTest, spillPoliciesUseInitializedProcessService) {
 }
 
 TEST(SpillTest, workerThreadSpillDoesNotFallbackToOwnerThreadOnSubmitFailure) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   BufferManager::ResetProcessServicesForTesting();
 
   BufferManagerProcessServicesConfig services;
@@ -432,7 +449,6 @@ TEST(SpillTest, workerThreadSpillDoesNotFallbackToOwnerThreadOnSubmitFailure) {
   services.spill.executionMode = SpillExecutionMode::kWorkerThread;
   services.spill.workerThreadCount = 1;
   services.spill.diskProbeDuration = std::chrono::milliseconds(0);
-  services.spill.diskIo.backend = DiskIoBackend::kSync;
   services.spill.diskIo.initialQueueDepth = 4;
   services.spill.diskIo.minQueueDepth = 1;
   services.spill.diskIo.maxQueueDepth = 16;
@@ -463,6 +479,7 @@ TEST(SpillTest, workerThreadSpillDoesNotFallbackToOwnerThreadOnSubmitFailure) {
 }
 
 TEST(SpillTest, multipleBufferManagersShareConfiguredSpillService) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   BufferManager::ResetProcessServicesForTesting();
 
   const auto spillDir = test::testSpillDir("bolt_bm_multi_manager_spill_root");
@@ -471,7 +488,6 @@ TEST(SpillTest, multipleBufferManagersShareConfiguredSpillService) {
   services.spill.executionMode = SpillExecutionMode::kOwnerThread;
   services.spill.workerThreadCount = 0;
   services.spill.diskProbeDuration = std::chrono::milliseconds(0);
-  services.spill.diskIo.backend = DiskIoBackend::kSync;
   services.spill.diskIo.initialQueueDepth = 4;
   services.spill.diskIo.minQueueDepth = 1;
   services.spill.diskIo.maxQueueDepth = 16;
@@ -509,5 +525,7 @@ TEST(SpillTest, multipleBufferManagersShareConfiguredSpillService) {
 
   BufferManager::ResetProcessServicesForTesting();
 }
+
+#undef BOLT_BM_SKIP_IF_URING_UNAVAILABLE
 
 } // namespace bytedance::bolt::memory::bm

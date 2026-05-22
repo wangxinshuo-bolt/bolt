@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -159,6 +160,18 @@ inline std::string testSpillDir(const std::string& name) {
   return path.string();
 }
 
+inline bool uringAvailableForTesting(std::string* reason = nullptr) {
+  try {
+    UringDiskIoEngine engine(8);
+    return true;
+  } catch (const std::exception& e) {
+    if (reason != nullptr) {
+      *reason = e.what();
+    }
+    return false;
+  }
+}
+
 // Test fixture helper: lazily install BufferManager process services with
 // a single root directory the suite can extend per BufferManager. Subsequent
 // callers reuse the same configuration so the tests stay isolated from each
@@ -175,7 +188,6 @@ inline std::string ensureTestSpillService() {
     config.spill.workerThreadCount = 0; // deterministic owner-thread spill
     config.spill.cleanupOnDestroy = true;
     config.spill.diskProbeDuration = std::chrono::milliseconds(0);
-    config.spill.diskIo.backend = DiskIoBackend::kSync;
     config.spill.diskIo.initialQueueDepth = 4;
     config.spill.diskIo.minQueueDepth = 1;
     config.spill.diskIo.maxQueueDepth = 16;

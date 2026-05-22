@@ -58,7 +58,7 @@ Operator / Task
 - `BlockEvictor`：按 cost 和 priority 组织 eviction candidates，并分发 cheap eviction 或 spill scheduling。
 - `ProcessSpillService`：进程级 spill worker、completion queue、progress wait、single spill store。
 - `SpillStore`：真实文件读写，默认压缩，小块 slab slot，大块 dedicated file。
-- `DiskIoScheduler`：同步或 io_uring backend，带 priority deficit 和 adaptive queue depth。
+- `DiskIoScheduler`：io_uring I/O engine，带 priority deficit 和 adaptive queue depth。
 
 ## 线程模型
 
@@ -545,7 +545,7 @@ bm_<tag>_<id>.spill
 
 Disk I/O 层：
 
-- backend 支持 sync 和 io_uring。
+- I/O engine 固定使用 io_uring，不再提供 sync backend。
 - `DiskIoScheduler` 有 priority weights，读默认 high，写默认 low。
 - `AdaptiveQueueDepth` 根据窗口内 latency percentile 和 throughput 变化调节 queue depth。当前 `SubmitAndWait()` 是同步执行请求，但 scheduler 仍记录 completion 并维护 adaptive 状态。
 
@@ -564,7 +564,7 @@ BufferManager::InitializeProcessServices(BufferManagerProcessServicesConfig)
 - spill directory。
 - worker thread count。
 - disk probe。
-- disk I/O backend 和 queue depth。
+- disk I/O ring entries 和 queue depth。
 - small spill policy。
 - compression policy。
 - metrics sink。

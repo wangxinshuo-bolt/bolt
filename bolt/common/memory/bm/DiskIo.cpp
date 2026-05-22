@@ -6,8 +6,6 @@
 #include "bolt/common/memory/bm/DiskIo.h"
 
 #include <errno.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <chrono>
 #include <cstring>
@@ -98,44 +96,6 @@ void validateConfig(const DiskIoConfig& config) {
       "Disk IO adaptive queue depth increase ratio must be > 0");
 }
 
-int64_t runSync(const DiskIoRequest& request) {
-  validateRequest(request);
-  if (request.op == DiskIoOp::kFsync) {
-    return ::fsync(request.fd) == 0 ? 0 : -errno;
-  }
-
-  size_t done = 0;
-  while (done < request.size) {
-    const auto* base = static_cast<const uint8_t*>(request.buffer);
-    auto* mutableBase = static_cast<uint8_t*>(request.buffer);
-    ssize_t rc = 0;
-    if (request.op == DiskIoOp::kWrite) {
-      rc = ::pwrite(
-          request.fd,
-          base + done,
-          request.size - done,
-          static_cast<off_t>(request.offset + done));
-    } else {
-      rc = ::pread(
-          request.fd,
-          mutableBase + done,
-          request.size - done,
-          static_cast<off_t>(request.offset + done));
-    }
-    if (rc < 0) {
-      if (errno == EINTR) {
-        continue;
-      }
-      return -errno;
-    }
-    if (rc == 0) {
-      break;
-    }
-    done += static_cast<size_t>(rc);
-  }
-  return static_cast<int64_t>(done);
-}
-
 struct SingletonState {
   std::mutex mutex;
   bool configured{false};
@@ -149,17 +109,6 @@ SingletonState& globalState() {
 }
 
 } // namespace
-
-DiskIoCompletion SyncDiskIoEngine::Execute(const DiskIoRequest& request) {
-  const auto start = std::chrono::steady_clock::now();
-  return DiskIoCompletion{
-      request.op,
-      request.priority,
-      request.userData,
-      runSync(request),
-      request.size,
-      elapsedUs(start)};
-}
 
 struct UringDiskIoEngine::Impl {
 #ifdef IO_URING_SUPPORTED
@@ -462,9 +411,6 @@ void DiskIoScheduler::ChargePriorityLocked(
 std::unique_ptr<DiskIoEngine> CreateDiskIoEngine(
     const DiskIoConfig& config) {
   validateConfig(config);
-  if (config.backend == DiskIoBackend::kSync) {
-    return std::make_unique<SyncDiskIoEngine>();
-  }
   return std::make_unique<UringDiskIoEngine>(config.ringEntries);
 }
 

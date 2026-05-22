@@ -26,11 +26,6 @@ enum class DiskIoPriority {
   kHigh = 2,
 };
 
-enum class DiskIoBackend {
-  kSync,
-  kUring,
-};
-
 struct AdaptiveQueueDepthConfig {
   size_t windowCompletionCount{8};
   size_t percentile{95};
@@ -43,7 +38,6 @@ struct AdaptiveQueueDepthConfig {
 };
 
 struct DiskIoConfig {
-  DiskIoBackend backend{DiskIoBackend::kUring};
   uint32_t ringEntries{128};
   int initialQueueDepth{16};
   int minQueueDepth{1};
@@ -78,11 +72,6 @@ class DiskIoEngine {
   virtual DiskIoCompletion Execute(const DiskIoRequest& request) = 0;
 };
 
-class SyncDiskIoEngine final : public DiskIoEngine {
- public:
-  DiskIoCompletion Execute(const DiskIoRequest& request) override;
-};
-
 class UringDiskIoEngine final : public DiskIoEngine {
  public:
   explicit UringDiskIoEngine(unsigned entries);
@@ -101,7 +90,6 @@ class UringDiskIoEngine final : public DiskIoEngine {
 // Compatibility aliases for the earlier executor-shaped API used by a few
 // tests while this layer is being integrated.
 using DiskIoExecutor = DiskIoEngine;
-using SynchronousDiskIoExecutor = SyncDiskIoEngine;
 using UringDiskIoExecutor = UringDiskIoEngine;
 
 class AdaptiveQueueDepth {

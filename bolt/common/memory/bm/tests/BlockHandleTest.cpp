@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -15,6 +16,15 @@
 #include "bolt/common/memory/bm/tests/BufferManagerTestUtil.h"
 
 namespace bytedance::bolt::memory::bm {
+
+#define BOLT_BM_SKIP_IF_URING_UNAVAILABLE()                         \
+  do {                                                               \
+    std::string reason;                                              \
+    if (!test::uringAvailableForTesting(&reason)) {                  \
+      GTEST_SKIP() << "io_uring is unavailable in this environment: " \
+                   << reason;                                        \
+    }                                                                \
+  } while (false)
 
 TEST(BlockHandleTest, blockSealPinAndDiscardReclaim) {
   memory::MemoryManager memoryManager;
@@ -200,6 +210,7 @@ TEST(BlockHandleTest, reloadFailurePropagatesAndDoesNotThunder) {
 }
 
 TEST(BlockHandleTest, spillToDiskRejectsNonOwnerThreadAccess) {
+  BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   test::ensureTestSpillService();
   memory::MemoryManager memoryManager;
   auto bm = std::make_unique<BufferManager>(
@@ -225,5 +236,7 @@ TEST(BlockHandleTest, spillToDiskRejectsNonOwnerThreadAccess) {
   ASSERT_TRUE(rejected);
   bm.reset();
 }
+
+#undef BOLT_BM_SKIP_IF_URING_UNAVAILABLE
 
 } // namespace bytedance::bolt::memory::bm

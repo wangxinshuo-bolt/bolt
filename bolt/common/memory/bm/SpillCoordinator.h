@@ -21,30 +21,30 @@
 #include "bolt/common/memory/bm/EvictionTypes.h"
 #include "bolt/common/memory/bm/Metrics.h"
 #include "bolt/common/memory/bm/BufferPool.h"
-#include "bolt/common/memory/bm/SpillStore.h"
+#include "bolt/common/memory/bm/SpillFileStore.h"
 
 namespace bytedance::bolt::memory::bm {
 
 class BufferManager;
 struct SpillOwnerToken {};
 
-// Process-wide spill service configuration. Production callers install this
+// Process-wide spill coordinator configuration. Production callers install this
 // through BufferManager::InitializeProcessServices(); ConfigureDefault() is
 // kept as the internal singleton hook. Instance() throws if no configuration
-// has been installed, because the service has no implicit process defaults.
-struct ProcessSpillServiceConfig {
+// has been installed, because the coordinator has no implicit process defaults.
+struct SpillCoordinatorConfig {
   // Single spill directory. Must be non-empty.
   std::string spillDir;
   DiskKind forcedKind{DiskKind::kUnknown};
-  // Which thread executes spill work. kWorkerThread requires
-  // workerThreadCount > 0 and never falls back to owner-thread writes.
-  SpillExecutionMode executionMode{SpillExecutionMode::kWorkerThread};
+  // Number of process-level workers that execute spill and prefetch I/O.
+  // Must be greater than zero; BufferManager owner threads only submit
+  // requests and commit completions.
   uint32_t workerThreadCount{1};
-  // Optional metrics sink shared by every component the service owns.
+  // Optional metrics sink shared by every component the coordinator owns.
   MetricsRegistry* metrics{nullptr};
   // Default classification when probing returns kUnknown.
   DiskKind unknownFallbackKind{DiskKind::kHdd};
-  // Whether to remove spill files when ProcessSpillService is destroyed.
+  // Whether to remove spill files when SpillCoordinator is destroyed.
   bool cleanupOnDestroy{true};
   // Active disk probe duration for each spill directory. Zero disables active
   // probing and uses the configured forced/fallback kind.
@@ -53,7 +53,7 @@ struct ProcessSpillServiceConfig {
   // unknownFallbackKind, and diskProbeDuration remain the authoritative
   // process-level fields and are copied into this probe config at startup.
   DiskProbeConfig diskProbe;
-  // Process-wide disk I/O scheduler policy used by the spill store.
+  // Process-wide disk I/O scheduler policy used by the spill file store.
   DiskIoConfig diskIo;
   // Small spill block packing policy. When sizeClasses is empty, the store
   // derives defaults from the effective disk kind.
@@ -62,26 +62,27 @@ struct ProcessSpillServiceConfig {
   SpillCompressionConfig compression;
 };
 
-// Single process spill service. Owns the worker pool, file system view, and
-// the progress epoch used by reclaim waiters.
+// Process-wide spill coordinator. It turns BufferManager spill/prefetch
+// requests into disk tasks, tracks owner-token progress, and publishes
+// completions for owner-thread commit.
 //
 // Lifecycle:
 //   1) ConfigureDefault(cfg)   -> mandatory; throws on second call
 //   2) Instance()              -> lazy init; throws if not configured
 //   3) ResetForTesting()       -> tests only
 //
-// Shutdown is explicit: the destructor stops workers, syncs files, and
-// best-effort cleans owned spill dirs. atexit is intentionally NOT used
+// Shutdown is explicit: the destructor waits for active tasks, drops the file
+// store, and best-effort cleans owned spill dirs. atexit is intentionally NOT used
 // to avoid static destruction-order surprises.
 //
 // Thread-safety: all public methods are safe to call concurrently.
-class ProcessSpillService : public SpillRequester {
+class SpillCoordinator : public SpillRequester {
  public:
   // Returns the (lazily initialized) singleton. The first call after
   // ConfigureDefault constructs the service; subsequent calls return the
   // same reference. Throws BoltUserError if ConfigureDefault has not been
   // called.
-  static ProcessSpillService& Instance();
+  static SpillCoordinator& Instance();
 
   // Tests only: tears down the singleton so the next ConfigureDefault can
   // succeed. Safe to call when no Instance has been created.
@@ -90,14 +91,10 @@ class ProcessSpillService : public SpillRequester {
   // Tests only: creates an isolated, non-singleton service. This is useful
   // for cases that need a different process-level configuration than the
   // singleton used by other tests.
-  static std::unique_ptr<ProcessSpillService> CreateForTesting(
-      ProcessSpillServiceConfig config);
+  static std::unique_ptr<SpillCoordinator> CreateForTesting(
+      SpillCoordinatorConfig config);
 
   EvictResult SubmitSpill(EvictionNode node) override;
-
-  SpillExecutionMode ExecutionMode() const {
-    return config_.executionMode;
-  }
 
   bool WaitForProgress(
       ByteCount bytesNeeded,
@@ -146,7 +143,7 @@ class ProcessSpillService : public SpillRequester {
   std::vector<PrefetchCompletion> DrainPrefetchCompletions(
       const std::shared_ptr<SpillOwnerToken>& owner);
 
-  // Snapshot of total disk bytes currently held by the process spill store.
+  // Snapshot of total disk bytes currently held by the process spill file store.
   // Updated atomically by Write/Release; safe to read from any thread.
   ByteCount UsedDiskBytes() const {
     return usedDiskBytes_.load(std::memory_order_relaxed);
@@ -158,40 +155,40 @@ class ProcessSpillService : public SpillRequester {
 
   void Release(const SpillLocation& location) noexcept;
 
-  ProcessSpillService(const ProcessSpillService&) = delete;
-  ProcessSpillService& operator=(const ProcessSpillService&) = delete;
+  SpillCoordinator(const SpillCoordinator&) = delete;
+  SpillCoordinator& operator=(const SpillCoordinator&) = delete;
 
  private:
   friend class BufferManager;
 
   // Installs the configuration used by lazy initialization. Exposed only to
   // BufferManager so process service setup has a single public entry point.
-  static void ConfigureDefault(ProcessSpillServiceConfig config);
+  static void ConfigureDefault(SpillCoordinatorConfig config);
   bool HasPendingSpills(const std::shared_ptr<SpillOwnerToken>& owner) const;
 
-  // unique_ptr<ProcessSpillService> in the singleton holder needs to invoke
+  // unique_ptr<SpillCoordinator> in the singleton holder needs to invoke
   // our destructor; expose it via std::default_delete without leaking the
   // dtor into the public API.
-  friend struct std::default_delete<ProcessSpillService>;
+  friend struct std::default_delete<SpillCoordinator>;
 
   // Use Instance() / ResetForTesting() / ConfigureDefault().
-  explicit ProcessSpillService(ProcessSpillServiceConfig config);
-  ~ProcessSpillService();
+  explicit SpillCoordinator(SpillCoordinatorConfig config);
+  ~SpillCoordinator();
 
-  void StartWorkers();
-  void StopWorkers();
-  void WorkerLoop();
+  void StopAsyncTasks();
   void NotifyProgress();
   void ExecuteSpill(SpillRequest request);
   EvictResult SubmitPrefetch(PrefetchRequest request);
   void ExecutePrefetch(PrefetchRequest request);
+  void AddActiveOwner(const std::weak_ptr<SpillOwnerToken>& owner);
+  void CompleteActiveOwner(const std::weak_ptr<SpillOwnerToken>& owner);
 
   // Best-effort cleanup of <root>/bolt_spill_<pid>_* directories whose pid
   // is no longer alive. Called once per process at construction time. Any
   // I/O failure is logged but not propagated.
   void CleanupStaleDirsAtStartup();
 
-  ProcessSpillServiceConfig config_;
+  SpillCoordinatorConfig config_;
   MetricsRegistry& metrics_;
   Counter& submitCounter_;
   Counter& scheduledCounter_;
@@ -204,14 +201,11 @@ class ProcessSpillService : public SpillRequester {
   Histogram& submitDuration_;
   Histogram& executeDuration_;
   Histogram& waitForProgressDuration_;
-  std::unique_ptr<SpillStore> store_;
+  std::unique_ptr<SpillFileStore> store_;
   std::atomic<ByteCount> usedDiskBytes_{0};
 
   mutable std::mutex mutex_;
-  std::condition_variable cv_;
   std::condition_variable progressCv_;
-  std::deque<SpillRequest> ready_;
-  std::deque<PrefetchRequest> prefetchReady_;
   std::deque<SpillCompletion> completed_;
   std::deque<PrefetchCompletion> prefetchCompleted_;
   std::map<std::weak_ptr<SpillOwnerToken>,
@@ -219,9 +213,7 @@ class ProcessSpillService : public SpillRequester {
            std::owner_less<std::weak_ptr<SpillOwnerToken>>>
       activeByOwner_;
   bool stopping_{false};
-  bool started_{false};
   uint64_t progressEpoch_{0};
-  std::vector<std::thread> workers_;
 };
 
 } // namespace bytedance::bolt::memory::bm

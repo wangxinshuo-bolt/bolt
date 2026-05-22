@@ -22,10 +22,10 @@
 
 namespace bytedance::bolt::memory::bm {
 
-class SpillStore;
+class SpillFileStore;
 
 // Configuration for the process-wide BufferManager spill directory.
-struct SpillStoreConfig {
+struct SpillFileStoreConfig {
   std::string spillDir;
   bool cleanupOnDestroy{true};
   DiskKind forcedKind{DiskKind::kUnknown};
@@ -49,23 +49,23 @@ class SpillWriteSession {
   SpillLocation Write(MemoryTag tag, ConstDataPtr src, ByteCount bytes);
 
  private:
-  friend class SpillStore;
-  SpillWriteSession(SpillStore* store, DiskKind disk);
+  friend class SpillFileStore;
+  SpillWriteSession(SpillFileStore* store, DiskKind disk);
 
-  SpillStore* store_{nullptr};
+  SpillFileStore* store_{nullptr};
   DiskKind disk_{DiskKind::kUnknown};
   bool consumed_{false};
 };
 
-// File-backed spill store for immutable BufferManager blocks.
-class SpillStore {
+// File-backed spill file store for immutable BufferManager blocks.
+class SpillFileStore {
  public:
-  SpillStore(
-      SpillStoreConfig config,
+  SpillFileStore(
+      SpillFileStoreConfig config,
       MetricsRegistry* metrics = nullptr,
       DiskIoScheduler* ioScheduler = nullptr);
 
-  ~SpillStore();
+  ~SpillFileStore();
 
   SpillWriteSession BeginWriteAttempt(MemoryTag tag, bool allowCompression);
 
@@ -81,7 +81,7 @@ class SpillStore {
     return disk_;
   }
 
-  static void CleanupAtStartup(const SpillStoreConfig& cfg);
+  static void CleanupAtStartup(const SpillFileStoreConfig& cfg);
 
  private:
   friend class SpillWriteSession;
@@ -101,7 +101,7 @@ class SpillStore {
 
   bool ForgetLiveFile(const std::string& path) noexcept;
 
-  const SpillStoreConfig config_;
+  const SpillFileStoreConfig config_;
   const DiskProbeResult diskProbe_;
   const SpillCompressionConfig compressionConfig_;
   SmallSpillAllocator smallAllocator_;

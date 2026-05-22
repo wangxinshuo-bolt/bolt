@@ -15,8 +15,8 @@
 #include "bolt/common/memory/bm/BufferManagerConfig.h"
 #include "bolt/common/memory/bm/BufferPool.h"
 #include "bolt/common/memory/bm/EvictionTypes.h"
-#include "bolt/common/memory/bm/ProcessSpillService.h"
-#include "bolt/common/memory/bm/SpillStore.h"
+#include "bolt/common/memory/bm/SpillCoordinator.h"
+#include "bolt/common/memory/bm/SpillFileStore.h"
 
 namespace bytedance::bolt::memory::bm {
 
@@ -64,7 +64,7 @@ class BlockHandle : public BlockHandleBase,
   //
   // Behavior by current State():
   //   kLoaded                -> increments pinCount_, returns immediately.
-  //   kSpilled               -> reads back from SpillStore via the
+  //   kSpilled               -> reads back from SpillFileStore via the
   //                              registered recovery path.
   //   kAllocating / kInvalid -> throws BoltUserError.
   //   kEvicting              -> waits on cv_ until eviction resolves, then
@@ -107,7 +107,7 @@ class BlockHandle : public BlockHandleBase,
   // memory into a tokenized request keyed by block id; process spill workers
   // write bytes only and never keep this BlockHandle alive. Commit methods
   // are called by the owning BufferManager thread after it drains completions.
-  std::optional<ProcessSpillService::SpillRequest> PrepareAsyncSpill(
+  std::optional<SpillCoordinator::SpillRequest> PrepareAsyncSpill(
       uint64_t expectedSequence);
   ByteCount CommitAsyncSpillSuccess(
       uint64_t expectedSequence,
@@ -116,7 +116,7 @@ class BlockHandle : public BlockHandleBase,
   void CommitAsyncSpillFailure(
       uint64_t expectedSequence,
       std::unique_ptr<AccountedMemory> memory);
-  std::optional<ProcessSpillService::PrefetchRequest> PrepareAsyncPrefetch();
+  std::optional<SpillCoordinator::PrefetchRequest> PrepareAsyncPrefetch();
   ByteCount CommitAsyncPrefetchSuccess(
       uint64_t expectedSequence,
       std::unique_ptr<AccountedMemory> memory);

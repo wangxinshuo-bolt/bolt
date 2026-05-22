@@ -211,7 +211,7 @@ TEST(BlockHandleTest, reloadFailurePropagatesAndDoesNotThunder) {
 
 TEST(BlockHandleTest, spillToDiskRejectsNonOwnerThreadAccess) {
   BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
-  test::ensureTestSpillService();
+  test::ensureTestSpillCoordinator();
   memory::MemoryManager memoryManager;
   auto bm = std::make_unique<BufferManager>(
       memoryManager, BufferManagerConfig{.poolName = "bm_spill_thread"});

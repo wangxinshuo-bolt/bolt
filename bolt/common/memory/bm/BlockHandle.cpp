@@ -42,10 +42,10 @@ std::shared_ptr<BufferManagerContext> lockOwnerContext(
   return locked;
 }
 
-ProcessSpillService& requireSpill(BufferManagerContext& context) {
+SpillCoordinator& requireSpill(BufferManagerContext& context) {
   BOLT_USER_CHECK(
       context.spill.has_value(),
-      "BufferManager spill service is not wired");
+      "BufferManager spill coordinator is not wired");
   return context.spill->get();
 }
 
@@ -71,7 +71,7 @@ BlockHandle::~BlockHandle() {
 BufferHandle BlockHandle::Pin() {
   std::unique_ptr<AccountedMemory> loaded;
   std::optional<SpillLocation> oldSpill;
-  ProcessSpillService* spillForRelease{nullptr};
+  SpillCoordinator* spillForRelease{nullptr};
   std::optional<SpillLocation> spillToRelease;
   uint64_t myGeneration = 0;
   {
@@ -208,7 +208,7 @@ ByteCount BlockHandle::TryEvict(ByteCount targetBytes) {
 
 ByteCount BlockHandle::SpillToDisk() {
   std::unique_ptr<AccountedMemory> spillingMemory;
-  std::optional<std::reference_wrapper<ProcessSpillService>> spill;
+  std::optional<std::reference_wrapper<SpillCoordinator>> spill;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (!IsSpillPolicy(options_.policy) || state_ != BlockState::kLoaded ||
@@ -282,7 +282,7 @@ ByteCount BlockHandle::SpillToDisk() {
 
 void BlockHandle::InvalidateForManagerDestruction() noexcept {
   std::unique_ptr<AccountedMemory> old;
-  std::optional<std::reference_wrapper<ProcessSpillService>> spill;
+  std::optional<std::reference_wrapper<SpillCoordinator>> spill;
   SpillLocation locationToRelease;
   {
     std::lock_guard<std::mutex> l(mutex_);
@@ -325,7 +325,7 @@ bool BlockHandle::TryMarkSpillScheduled(uint64_t expectedSequence) {
   return true;
 }
 
-std::optional<ProcessSpillService::SpillRequest> BlockHandle::PrepareAsyncSpill(
+std::optional<SpillCoordinator::SpillRequest> BlockHandle::PrepareAsyncSpill(
     uint64_t expectedSequence) {
   std::lock_guard<std::mutex> l(mutex_);
   if (!IsSpillPolicy(options_.policy) ||
@@ -340,7 +340,7 @@ std::optional<ProcessSpillService::SpillRequest> BlockHandle::PrepareAsyncSpill(
   }
   state_ = BlockState::kSpilling;
   spillScheduled_ = true;
-  ProcessSpillService::SpillRequest request;
+  SpillCoordinator::SpillRequest request;
   request.owner = context->spillOwnerToken;
   request.blockId = id_;
   request.evictionSequence = expectedSequence;
@@ -355,7 +355,7 @@ ByteCount BlockHandle::CommitAsyncSpillSuccess(
     uint64_t expectedSequence,
     SpillLocation location,
     std::unique_ptr<AccountedMemory> memory) {
-  std::optional<std::reference_wrapper<ProcessSpillService>> spillToRelease;
+  std::optional<std::reference_wrapper<SpillCoordinator>> spillToRelease;
   SpillLocation staleLocation;
   ByteCount freed = memory == nullptr ? 0 : memory->Size();
   {
@@ -402,7 +402,7 @@ void BlockHandle::CommitAsyncSpillFailure(
   cv_.notify_all();
 }
 
-std::optional<ProcessSpillService::PrefetchRequest>
+std::optional<SpillCoordinator::PrefetchRequest>
 BlockHandle::PrepareAsyncPrefetch() {
   std::shared_ptr<BufferManagerContext> context;
   SpillLocation location;
@@ -444,7 +444,7 @@ BlockHandle::PrepareAsyncPrefetch() {
     throw;
   }
 
-  ProcessSpillService::PrefetchRequest request;
+  SpillCoordinator::PrefetchRequest request;
   request.owner = context->spillOwnerToken;
   request.blockId = id_;
   request.evictionSequence = sequence;
@@ -459,7 +459,7 @@ BlockHandle::PrepareAsyncPrefetch() {
 ByteCount BlockHandle::CommitAsyncPrefetchSuccess(
     uint64_t expectedSequence,
     std::unique_ptr<AccountedMemory> memory) {
-  std::optional<std::reference_wrapper<ProcessSpillService>> spillToRelease;
+  std::optional<std::reference_wrapper<SpillCoordinator>> spillToRelease;
   SpillLocation oldLocation;
   const ByteCount loadedBytes = memory == nullptr ? 0 : memory->Size();
   {

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "bolt/common/memory/bm/SpillStore.h"
+#include "bolt/common/memory/bm/SpillFileStore.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -45,7 +45,7 @@ class ScopedFd {
 
 } // namespace
 
-SpillWriteSession::SpillWriteSession(SpillStore* store, DiskKind disk)
+SpillWriteSession::SpillWriteSession(SpillFileStore* store, DiskKind disk)
     : store_(store), disk_(disk) {}
 
 SpillWriteSession::SpillWriteSession(SpillWriteSession&& other) noexcept
@@ -94,7 +94,7 @@ SpillLocation SpillWriteSession::Write(
     store_->compressSavedBytesCounter_.Add(bytes - payload.storedBytes);
   } else if (compressionAttempted) {
     store_->compressFallbackRawCounter_.Add(1);
-    BOLT_MEM_VLOG(1) << "BufferManager SpillStore compression fallback"
+    BOLT_MEM_VLOG(1) << "BufferManager SpillFileStore compression fallback"
                        << " logical=" << bytes
                        << " stored=" << payload.storedBytes
                        << " minSavingsRatio="
@@ -139,7 +139,7 @@ SpillLocation SpillWriteSession::Write(
   } else {
     store_->dedicatedFileCounter_.Add(1);
   }
-  BOLT_MEM_VLOG(1) << "BufferManager SpillStore wrote " << bytes
+  BOLT_MEM_VLOG(1) << "BufferManager SpillFileStore wrote " << bytes
       << " bytes to " << location.path
                      << " offset=" << location.offset
                      << " stored=" << location.storedBytes
@@ -154,8 +154,8 @@ SpillLocation SpillWriteSession::Write(
   return location;
 }
 
-SpillStore::SpillStore(
-    SpillStoreConfig config,
+SpillFileStore::SpillFileStore(
+    SpillFileStoreConfig config,
     MetricsRegistry* metrics,
     DiskIoScheduler* ioScheduler)
     : config_(std::move(config)),
@@ -172,7 +172,7 @@ SpillStore::SpillStore(
       metricLabels_(fmt::format("disk={}", ToString(diskProbe_.kind))),
       metrics_(EffectiveMetricsRegistry(metrics)),
       ioScheduler_(
-          ioScheduler == nullptr ? &ProcessDiskIoService::Instance().Scheduler()
+          ioScheduler == nullptr ? &DiskIoTaskExecutor::Instance().Scheduler()
                                  : ioScheduler),
       bytesWrittenCounter_(metrics_.GetCounter(
           "bm_spill_bytes_written",
@@ -219,7 +219,7 @@ SpillStore::SpillStore(
       disk_(diskProbe_.kind) {
   std::filesystem::create_directories(config_.spillDir);
   const auto& smallConfig = smallAllocator_.Config();
-  BOLT_MEM_LOG(INFO) << "BufferManager SpillStore created at "
+  BOLT_MEM_LOG(INFO) << "BufferManager SpillFileStore created at "
                      << config_.spillDir
                      << " disk=" << ToString(disk_)
                      << " small_spill=" << smallConfig.enabled
@@ -238,7 +238,7 @@ SpillStore::SpillStore(
                      << compressionConfig_.minSavingsRatio;
 }
 
-SpillStore::~SpillStore() {
+SpillFileStore::~SpillFileStore() {
   if (!config_.cleanupOnDestroy) {
     return;
   }
@@ -260,13 +260,13 @@ SpillStore::~SpillStore() {
   }
 }
 
-SpillWriteSession SpillStore::BeginWriteAttempt(
+SpillWriteSession SpillFileStore::BeginWriteAttempt(
     MemoryTag /*tag*/,
     bool /*allowCompression*/) {
   return SpillWriteSession(this, disk_);
 }
 
-SpillLocation SpillStore::Write(
+SpillLocation SpillFileStore::Write(
     MemoryTag tag,
     ConstDataPtr data,
     ByteCount bytes) {
@@ -277,7 +277,7 @@ SpillLocation SpillStore::Write(
   return session.Write(tag, data, bytes);
 }
 
-void SpillStore::Read(
+void SpillFileStore::Read(
     const SpillLocation& location,
     DataPtr dst,
     ByteCount dstCapacity) {
@@ -291,7 +291,7 @@ void SpillStore::Read(
       dstCapacity,
       location.logicalBytes);
 
-  BOLT_MEM_VLOG(1) << "BufferManager SpillStore reading "
+  BOLT_MEM_VLOG(1) << "BufferManager SpillFileStore reading "
                      << location.logicalBytes << " bytes from "
                      << location.path
                      << " offset=" << location.offset
@@ -342,7 +342,7 @@ void SpillStore::Read(
   bytesReadCounter_.Add(location.logicalBytes);
 }
 
-void SpillStore::Release(const SpillLocation& location) {
+void SpillFileStore::Release(const SpillLocation& location) {
   ScopedBmTimer timer(releaseDuration_);
   if (!location.Valid()) {
     invalidReleaseCounter_.Add(1);
@@ -372,13 +372,13 @@ void SpillStore::Release(const SpillLocation& location) {
   if (alreadyReleased) {
     doubleReleaseCounter_.Add(1);
     BOLT_MEM_LOG(WARNING)
-        << "BufferManager SpillStore double release of " << location.path;
+        << "BufferManager SpillFileStore double release of " << location.path;
     return;
   }
   if (!live) {
     invalidReleaseCounter_.Add(1);
     BOLT_USER_FAIL(
-        "BufferManager SpillStore release of unknown path {}", location.path);
+        "BufferManager SpillFileStore release of unknown path {}", location.path);
   }
   releaseCounter_.Add(1);
   if (removeFile) {
@@ -388,13 +388,13 @@ void SpillStore::Release(const SpillLocation& location) {
       BOLT_MEM_LOG(WARNING) << "Failed to remove BufferManager spill file "
                             << location.path << ": " << ec.message();
     } else {
-      BOLT_MEM_VLOG(1) << "BufferManager SpillStore released "
+      BOLT_MEM_VLOG(1) << "BufferManager SpillFileStore released "
                          << location.path;
     }
   }
 }
 
-void SpillStore::CleanupAtStartup(const SpillStoreConfig& cfg) {
+void SpillFileStore::CleanupAtStartup(const SpillFileStoreConfig& cfg) {
   std::error_code ec;
   if (cfg.spillDir.empty() || !std::filesystem::exists(cfg.spillDir, ec)) {
     return;
@@ -422,23 +422,23 @@ void SpillStore::CleanupAtStartup(const SpillStoreConfig& cfg) {
   }
 }
 
-std::string SpillStore::MakeDedicatedPath(MemoryTag tag) {
+std::string SpillFileStore::MakeDedicatedPath(MemoryTag tag) {
   return (std::filesystem::path(config_.spillDir) /
           fmt::format("bm_{}_{}.spill", ToString(tag), nextFileId_++))
       .string();
 }
 
-std::string SpillStore::LocationKey(const SpillLocation& location) const {
+std::string SpillFileStore::LocationKey(const SpillLocation& location) const {
   return LocationKey(location.path, location.offset);
 }
 
-std::string SpillStore::LocationKey(
+std::string SpillFileStore::LocationKey(
     const std::string& path,
     uint64_t offset) const {
   return fmt::format("{}:{}", path, offset);
 }
 
-SpillLocation SpillStore::AllocateDedicated(
+SpillLocation SpillFileStore::AllocateDedicated(
     MemoryTag tag,
     ByteCount logicalBytes,
     ByteCount storedBytes,
@@ -458,7 +458,7 @@ SpillLocation SpillStore::AllocateDedicated(
   return location;
 }
 
-void SpillStore::WriteToLocation(
+void SpillFileStore::WriteToLocation(
     const SpillLocation& location,
     ConstDataPtr src) {
   const auto flags =
@@ -490,12 +490,12 @@ void SpillStore::WriteToLocation(
       location.storedBytes);
 }
 
-void SpillStore::RegisterLiveFile(const std::string& path) {
+void SpillFileStore::RegisterLiveFile(const std::string& path) {
   std::lock_guard<std::mutex> l(mutex_);
   liveFiles_.insert(path);
 }
 
-bool SpillStore::ForgetLiveFile(const std::string& path) noexcept {
+bool SpillFileStore::ForgetLiveFile(const std::string& path) noexcept {
   std::lock_guard<std::mutex> l(mutex_);
   liveLocations_.erase(LocationKey(path, 0));
   return liveFiles_.erase(path) != 0;

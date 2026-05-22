@@ -64,12 +64,11 @@ std::string uniquePoolName(const std::string& configuredName) {
   return configuredName;
 }
 
-ProcessSpillServiceConfig makeProcessSpillConfig(
+SpillCoordinatorConfig makeProcessSpillConfig(
     const BufferManagerProcessServicesConfig& config) {
-  ProcessSpillServiceConfig spill;
+  SpillCoordinatorConfig spill;
   spill.spillDir = config.spill.spillDir;
   spill.forcedKind = config.spill.forcedKind;
-  spill.executionMode = config.spill.executionMode;
   spill.workerThreadCount = config.spill.workerThreadCount;
   spill.metrics = config.metrics;
   spill.unknownFallbackKind = config.spill.unknownFallbackKind;
@@ -121,25 +120,25 @@ BufferManager::BufferManager(
 void BufferManager::InitializeProcessServices(
     BufferManagerProcessServicesConfig config) {
   if (config.spill.enabled) {
-    ProcessSpillService::ConfigureDefault(makeProcessSpillConfig(config));
+    SpillCoordinator::ConfigureDefault(makeProcessSpillConfig(config));
   }
 }
 
 void BufferManager::ResetProcessServicesForTesting() {
-  ProcessSpillService::ResetForTesting();
-  ProcessDiskIoService::ResetForTesting();
+  SpillCoordinator::ResetForTesting();
+  DiskIoTaskExecutor::ResetForTesting();
 }
 
 BufferManager::~BufferManager() {
   BOLT_MEM_LOG(INFO) << "Destroying BufferManager";
-  if (spillService_.has_value()) {
+  if (spillCoordinator_.has_value()) {
     for (;;) {
       DrainSpillCompletions();
       DrainPrefetchCompletions();
-      if (!spillService_->get().HasPendingSpills(spillOwnerToken_)) {
+      if (!spillCoordinator_->get().HasPendingSpills(spillOwnerToken_)) {
         break;
       }
-      if (!spillService_->get().WaitForProgress(
+      if (!spillCoordinator_->get().WaitForProgress(
               0, config_.reserveWaitTimeout)) {
         BOLT_MEM_LOG(WARNING)
             << "BufferManager waiting for pending async spill before destroy"
@@ -164,7 +163,7 @@ BufferManager::~BufferManager() {
     context_->spill.reset();
   }
   evictor_.ClearSpillRequester();
-  spillService_.reset();
+  spillCoordinator_.reset();
   context_.reset();
   leafPool_.reset();
   rootPool_.reset();
@@ -180,7 +179,7 @@ BufferHandle BufferManager::Allocate(AllocateOptions options) {
           static_cast<bool>(options.recoveryFn),
       "kRecompute block requires recoveryFn");
   if (IsSpillPolicy(options.policy)) {
-    EnsureSpillService();
+    EnsureSpillCoordinator();
   }
   BOLT_USER_CHECK(!shuttingDown_, "BufferManager is shutting down");
 
@@ -306,16 +305,7 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
   while ((targetBytes == 0 || reclaimed < targetBytes) &&
          evictor_.TryPopAnyCandidate(node)) {
     if (node.cost == EvictionCostClass::kSpill) {
-      EnsureSpillService();
-      if (spillService_->get().ExecutionMode() ==
-          SpillExecutionMode::kOwnerThread) {
-        auto base = node.block.lock();
-        auto block = std::dynamic_pointer_cast<BlockHandle>(base);
-        if (block != nullptr) {
-          reclaimed += block->SpillToDisk();
-        }
-        continue;
-      }
+      EnsureSpillCoordinator();
       auto submit = evictor_.TryScheduleEvict(node);
       BOLT_MEM_VLOG(1) << "BufferManager reclaim spill candidate"
                          << " target=" << targetBytes
@@ -328,7 +318,7 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
       } else if (submit.kind == EvictResultKind::kFailed ||
           submit.kind == EvictResultKind::kBackpressured) {
         BOLT_MEM_LOG(WARNING)
-            << "BufferManager worker-thread spill submit did not schedule"
+            << "BufferManager async spill submit did not schedule"
             << " target=" << targetBytes
             << " result=" << ToString(submit.kind);
       }
@@ -347,14 +337,14 @@ ByteCount BufferManager::Reclaim(ByteCount targetBytes) {
 
   size_t completedSpillCount = 0;
   while (completedSpillCount < scheduledSpillCount &&
-      spillService_.has_value()) {
+      spillCoordinator_.has_value()) {
     size_t drained = 0;
     reclaimed += DrainSpillCompletions(&drained);
     completedSpillCount += drained;
     if (completedSpillCount >= scheduledSpillCount) {
       break;
     }
-    if (!spillService_->get().WaitForProgress(
+    if (!spillCoordinator_->get().WaitForProgress(
             targetBytes == 0 || reclaimed >= targetBytes
                 ? 0
                 : targetBytes - reclaimed,
@@ -402,8 +392,8 @@ PrefetchResult BufferManager::Prefetch(
       ++result.skippedCount;
       continue;
     }
-    EnsureSpillService();
-    std::optional<ProcessSpillService::PrefetchRequest> request;
+    EnsureSpillCoordinator();
+    std::optional<SpillCoordinator::PrefetchRequest> request;
     try {
       request = block->PrepareAsyncPrefetch();
     } catch (...) {
@@ -417,7 +407,7 @@ PrefetchResult BufferManager::Prefetch(
       ++result.skippedCount;
       continue;
     }
-    auto submit = spillService_->get().SubmitPrefetch(std::move(*request));
+    auto submit = spillCoordinator_->get().SubmitPrefetch(std::move(*request));
     if (submit.kind == EvictResultKind::kScheduled) {
       ++result.submittedCount;
     } else if (submit.kind == EvictResultKind::kBackpressured) {
@@ -496,12 +486,12 @@ ByteCount BufferManager::DrainSpillCompletions(size_t* completionCount) {
   if (completionCount != nullptr) {
     *completionCount = 0;
   }
-  if (!spillService_.has_value()) {
+  if (!spillCoordinator_.has_value()) {
     return 0;
   }
   ByteCount reclaimed = 0;
   auto completions =
-      spillService_->get().DrainCompletions(spillOwnerToken_);
+      spillCoordinator_->get().DrainCompletions(spillOwnerToken_);
   if (completionCount != nullptr) {
     *completionCount = completions.size();
   }
@@ -516,7 +506,7 @@ ByteCount BufferManager::DrainSpillCompletions(size_t* completionCount) {
             std::move(completion.location),
             std::move(completion.memory));
       } else {
-        spillService_->get().Release(completion.location);
+        spillCoordinator_->get().Release(completion.location);
         completion.memory.reset();
         reclaimed += memoryBytes;
         BOLT_MEM_VLOG(1)
@@ -543,12 +533,12 @@ ByteCount BufferManager::DrainPrefetchCompletions(size_t* completionCount) {
   if (completionCount != nullptr) {
     *completionCount = 0;
   }
-  if (!spillService_.has_value()) {
+  if (!spillCoordinator_.has_value()) {
     return 0;
   }
   ByteCount loaded = 0;
   auto completions =
-      spillService_->get().DrainPrefetchCompletions(spillOwnerToken_);
+      spillCoordinator_->get().DrainPrefetchCompletions(spillOwnerToken_);
   if (completionCount != nullptr) {
     *completionCount = completions.size();
   }
@@ -591,11 +581,11 @@ void BufferManager::DrainPrefetchCompletionsBeforePin(
     if (block->State() != BlockState::kLoading) {
       return;
     }
-    if (!spillService_.has_value() ||
-        !spillService_->get().HasPendingSpills(spillOwnerToken_)) {
+    if (!spillCoordinator_.has_value() ||
+        !spillCoordinator_->get().HasPendingSpills(spillOwnerToken_)) {
       return;
     }
-    if (!spillService_->get().WaitForProgress(
+    if (!spillCoordinator_->get().WaitForProgress(
             0, config_.reserveWaitTimeout)) {
       BOLT_MEM_LOG(WARNING)
           << "BufferManager waiting for async prefetch before pin"
@@ -619,16 +609,16 @@ std::shared_ptr<BlockHandle> BufferManager::FindBlockById(uint64_t blockId) {
   return nullptr;
 }
 
-void BufferManager::EnsureSpillService() {
-  if (spillService_.has_value()) {
+void BufferManager::EnsureSpillCoordinator() {
+  if (spillCoordinator_.has_value()) {
     return;
   }
   BOLT_USER_CHECK(
       config_.spillEnabled,
       "BufferManager spill is disabled but kSpillToDisk was requested");
-  spillService_ = ProcessSpillService::Instance();
-  context_->spill = spillService_;
-  evictor_.SetSpillRequester(spillService_->get());
+  spillCoordinator_ = SpillCoordinator::Instance();
+  context_->spill = spillCoordinator_;
+  evictor_.SetSpillRequester(spillCoordinator_->get());
 }
 
 } // namespace bytedance::bolt::memory::bm

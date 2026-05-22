@@ -44,22 +44,15 @@ struct PrefetchResult {
   uint64_t backpressuredCount{0};
 };
 
-// Controls which thread executes spill work. Disk I/O submission itself is
-// handled by the process-level disk service.
-enum class SpillExecutionMode : uint8_t {
-  kOwnerThread,
-  kWorkerThread,
-};
-
 // Process-level spill configuration supplied through
 // BufferManager::InitializeProcessServices(). This owns executor/process-wide
 // resources: spill directory, disk probing, disk I/O scheduling, small-block
-// layout, compression, and spill workers.
+// layout, compression, and spill task workers. BufferManager owner threads prepare
+// and commit state; process spill task workers execute the disk I/O.
 struct BufferManagerProcessSpillConfig {
   bool enabled{true};
   std::string spillDir;
   DiskKind forcedKind{DiskKind::kUnknown};
-  SpillExecutionMode executionMode{SpillExecutionMode::kWorkerThread};
   uint32_t workerThreadCount{1};
   DiskKind unknownFallbackKind{DiskKind::kHdd};
   bool cleanupOnDestroy{true};
@@ -94,7 +87,7 @@ struct BufferManagerConfig {
   MetricsRegistry* metrics{nullptr};
 
   // Whether this BufferManager may allocate blocks with
-  // EvictPolicy::kSpillToDisk. The process spill service must still be
+  // EvictPolicy::kSpillToDisk. The process spill coordinator must still be
   // initialized explicitly before such allocations.
   bool spillEnabled{true};
 };

@@ -11,7 +11,7 @@ add_executable(
   DiskProbeTest.cpp
   MemoryManagerIntegrationTest.cpp
   SpillTest.cpp
-  SpillStoreTest.cpp)
+  SpillFileStoreTest.cpp)
 
 target_compile_features(bolt_memory_bm_test PRIVATE cxx_std_20)
 

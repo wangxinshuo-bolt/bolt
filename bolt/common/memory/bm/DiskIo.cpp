@@ -48,6 +48,10 @@ void validateRequest(const DiskIoRequest& request) {
 
 void validateConfig(const DiskIoConfig& config) {
   BOLT_USER_CHECK_GT(
+      config.workerThreadCount,
+      0,
+      "Process disk IO workerThreadCount must be > 0");
+  BOLT_USER_CHECK_GT(
       config.initialQueueDepth, 0, "Disk IO initial queue depth must be > 0");
   BOLT_USER_CHECK_GT(
       config.minQueueDepth, 0, "Disk IO min queue depth must be > 0");
@@ -100,7 +104,7 @@ struct SingletonState {
   std::mutex mutex;
   bool configured{false};
   DiskIoConfig pendingConfig;
-  std::unique_ptr<ProcessDiskIoService> instance;
+  std::unique_ptr<DiskIoTaskExecutor> instance;
 };
 
 SingletonState& globalState() {
@@ -414,24 +418,30 @@ std::unique_ptr<DiskIoEngine> CreateDiskIoEngine(
   return std::make_unique<UringDiskIoEngine>(config.ringEntries);
 }
 
-ProcessDiskIoService::ProcessDiskIoService(DiskIoConfig config)
+DiskIoTaskExecutor::DiskIoTaskExecutor(DiskIoConfig config)
     : config_(config),
       scheduler_(std::make_unique<DiskIoScheduler>(
           CreateDiskIoEngine(config_),
-          config_)) {}
+          config_)) {
+  StartWorkers();
+}
 
-void ProcessDiskIoService::ConfigureDefault(DiskIoConfig config) {
+DiskIoTaskExecutor::~DiskIoTaskExecutor() {
+  StopWorkers();
+}
+
+void DiskIoTaskExecutor::ConfigureDefault(DiskIoConfig config) {
   validateConfig(config);
   auto& state = globalState();
   std::lock_guard<std::mutex> l(state.mutex);
   BOLT_USER_CHECK(
       !state.configured && state.instance == nullptr,
-      "ProcessDiskIoService::ConfigureDefault may be called only once");
+      "DiskIoTaskExecutor::ConfigureDefault may be called only once");
   state.pendingConfig = config;
   state.configured = true;
 }
 
-void ProcessDiskIoService::ConfigureDefaultIfNeeded(DiskIoConfig config) {
+void DiskIoTaskExecutor::ConfigureDefaultIfNeeded(DiskIoConfig config) {
   validateConfig(config);
   auto& state = globalState();
   std::lock_guard<std::mutex> l(state.mutex);
@@ -442,7 +452,7 @@ void ProcessDiskIoService::ConfigureDefaultIfNeeded(DiskIoConfig config) {
   state.configured = true;
 }
 
-ProcessDiskIoService& ProcessDiskIoService::Instance() {
+DiskIoTaskExecutor& DiskIoTaskExecutor::Instance() {
   auto& state = globalState();
   std::lock_guard<std::mutex> l(state.mutex);
   if (state.instance != nullptr) {
@@ -450,12 +460,12 @@ ProcessDiskIoService& ProcessDiskIoService::Instance() {
   }
   BOLT_USER_CHECK(
       state.configured,
-      "ProcessDiskIoService::Instance() called without ConfigureDefault");
-  state.instance.reset(new ProcessDiskIoService(state.pendingConfig));
+      "DiskIoTaskExecutor::Instance() called without ConfigureDefault");
+  state.instance.reset(new DiskIoTaskExecutor(state.pendingConfig));
   return *state.instance;
 }
 
-void ProcessDiskIoService::ResetForTesting() {
+void DiskIoTaskExecutor::ResetForTesting() {
   auto& state = globalState();
   std::lock_guard<std::mutex> l(state.mutex);
   state.instance.reset();
@@ -463,8 +473,79 @@ void ProcessDiskIoService::ResetForTesting() {
   state.pendingConfig = DiskIoConfig{};
 }
 
-DiskIoScheduler& ProcessDiskIoService::Scheduler() {
+bool DiskIoTaskExecutor::SubmitTask(DiskIoTask task) {
+  BOLT_USER_CHECK(
+      static_cast<bool>(task.run),
+      "DiskIoTaskExecutor requires a runnable task");
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (stopping_) {
+      return false;
+    }
+    tasks_.push_back(std::move(task));
+  }
+  cv_.notify_one();
+  return true;
+}
+
+DiskIoScheduler& DiskIoTaskExecutor::Scheduler() {
   return *scheduler_;
+}
+
+void DiskIoTaskExecutor::StartWorkers() {
+  std::lock_guard<std::mutex> l(mutex_);
+  if (!workers_.empty()) {
+    return;
+  }
+  for (uint32_t i = 0; i < config_.workerThreadCount; ++i) {
+    workers_.emplace_back([this] { WorkerLoop(); });
+  }
+}
+
+void DiskIoTaskExecutor::StopWorkers() {
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (stopping_) {
+      return;
+    }
+    stopping_ = true;
+  }
+  cv_.notify_all();
+  for (auto& worker : workers_) {
+    if (worker.joinable()) {
+      worker.join();
+    }
+  }
+  workers_.clear();
+  tasks_.clear();
+}
+
+void DiskIoTaskExecutor::WorkerLoop() {
+  for (;;) {
+    DiskIoTask task;
+    {
+      std::unique_lock<std::mutex> l(mutex_);
+      cv_.wait(l, [&] { return stopping_ || !tasks_.empty(); });
+      if (stopping_ && tasks_.empty()) {
+        return;
+      }
+      const auto next = PickNextTaskLocked();
+      task = std::move(tasks_[next]);
+      tasks_.erase(tasks_.begin() + static_cast<std::ptrdiff_t>(next));
+    }
+    task.run();
+  }
+}
+
+size_t DiskIoTaskExecutor::PickNextTaskLocked() const {
+  size_t best = 0;
+  for (size_t i = 1; i < tasks_.size(); ++i) {
+    if (priorityIndex(tasks_[i].priority) >
+        priorityIndex(tasks_[best].priority)) {
+      best = i;
+    }
+  }
+  return best;
 }
 
 } // namespace bytedance::bolt::memory::bm

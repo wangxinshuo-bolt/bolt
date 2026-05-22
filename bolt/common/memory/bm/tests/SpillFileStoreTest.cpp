@@ -11,7 +11,7 @@
 #include <gtest/gtest.h>
 
 #include "bolt/common/memory/bm/DiskIo.h"
-#include "bolt/common/memory/bm/SpillStore.h"
+#include "bolt/common/memory/bm/SpillFileStore.h"
 #include "bolt/common/memory/bm/tests/BufferManagerTestUtil.h"
 
 namespace bytedance::bolt::memory::bm {
@@ -78,7 +78,7 @@ DiskIoConfig diskIoConfig() {
     }                                                                \
   } while (false)
 
-TEST(SpillStoreTest, usesSchedulerPrioritiesWithoutFsync) {
+TEST(SpillFileStoreTest, usesSchedulerPrioritiesWithoutFsync) {
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_spill_store_disk_io_test";
   std::filesystem::remove_all(root);
@@ -87,8 +87,8 @@ TEST(SpillStoreTest, usesSchedulerPrioritiesWithoutFsync) {
   auto* raw = engine.get();
   DiskIoScheduler scheduler(std::move(engine), diskIoConfig());
 
-  SpillStore store(
-      SpillStoreConfig{.spillDir = root.string(),
+  SpillFileStore store(
+      SpillFileStoreConfig{.spillDir = root.string(),
                        .cleanupOnDestroy = true,
                        .diskProbe = ssdProbe(),
                        .smallSpill = SmallSpillConfig{},
@@ -117,7 +117,7 @@ TEST(SpillStoreTest, usesSchedulerPrioritiesWithoutFsync) {
   store.Release(location);
 }
 
-TEST(SpillStoreTest, smallBlocksShareSizeClassSlabAndReuseSlots) {
+TEST(SpillFileStoreTest, smallBlocksShareSizeClassSlabAndReuseSlots) {
   BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_small_spill_slab_test";
@@ -130,10 +130,10 @@ TEST(SpillStoreTest, smallBlocksShareSizeClassSlabAndReuseSlots) {
   small.sizeClasses = {4 << 10, 8 << 10};
   SpillCompressionConfig compression;
   compression.enabled = false;
-  ProcessDiskIoService::ConfigureDefaultIfNeeded(diskIoConfig());
+  DiskIoTaskExecutor::ConfigureDefaultIfNeeded(diskIoConfig());
 
-  SpillStore store(
-      SpillStoreConfig{.spillDir = root.string(),
+  SpillFileStore store(
+      SpillFileStoreConfig{.spillDir = root.string(),
                        .cleanupOnDestroy = true,
                        .diskProbe = ssdProbe(),
                        .smallSpill = small,
@@ -179,7 +179,7 @@ TEST(SpillStoreTest, smallBlocksShareSizeClassSlabAndReuseSlots) {
   store.Release(locD);
 }
 
-TEST(SpillStoreTest, largeRawBlockUsesDedicatedFile) {
+TEST(SpillFileStoreTest, largeRawBlockUsesDedicatedFile) {
   BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_dedicated_spill_test";
@@ -192,10 +192,10 @@ TEST(SpillStoreTest, largeRawBlockUsesDedicatedFile) {
   small.sizeClasses = {4 << 10};
   SpillCompressionConfig compression;
   compression.enabled = false;
-  ProcessDiskIoService::ConfigureDefaultIfNeeded(diskIoConfig());
+  DiskIoTaskExecutor::ConfigureDefaultIfNeeded(diskIoConfig());
 
-  SpillStore store(
-      SpillStoreConfig{.spillDir = root.string(),
+  SpillFileStore store(
+      SpillFileStoreConfig{.spillDir = root.string(),
                        .cleanupOnDestroy = true,
                        .diskProbe = ssdProbe(),
                        .smallSpill = small,
@@ -213,7 +213,7 @@ TEST(SpillStoreTest, largeRawBlockUsesDedicatedFile) {
   EXPECT_FALSE(std::filesystem::exists(location.path));
 }
 
-TEST(SpillStoreTest, compressesByDefaultAndReadsBackLogicalBytes) {
+TEST(SpillFileStoreTest, compressesByDefaultAndReadsBackLogicalBytes) {
   BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_compressed_spill_test";
@@ -224,10 +224,10 @@ TEST(SpillStoreTest, compressesByDefaultAndReadsBackLogicalBytes) {
   small.dedicatedFileThresholdBytes = 1 << 20;
   small.slabFileBytes = 64 << 10;
   small.sizeClasses = {4 << 10, 8 << 10, 16 << 10};
-  ProcessDiskIoService::ConfigureDefaultIfNeeded(diskIoConfig());
+  DiskIoTaskExecutor::ConfigureDefaultIfNeeded(diskIoConfig());
 
-  SpillStore store(
-      SpillStoreConfig{.spillDir = root.string(),
+  SpillFileStore store(
+      SpillFileStoreConfig{.spillDir = root.string(),
                        .cleanupOnDestroy = true,
                        .diskProbe = ssdProbe(),
                        .smallSpill = small,
@@ -250,7 +250,7 @@ TEST(SpillStoreTest, compressesByDefaultAndReadsBackLogicalBytes) {
   store.Release(location);
 }
 
-TEST(SpillStoreTest, fallsBackToRawWhenCompressionDoesNotSaveSpace) {
+TEST(SpillFileStoreTest, fallsBackToRawWhenCompressionDoesNotSaveSpace) {
   BOLT_BM_SKIP_IF_URING_UNAVAILABLE();
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_raw_spill_fallback_test";
@@ -259,10 +259,10 @@ TEST(SpillStoreTest, fallsBackToRawWhenCompressionDoesNotSaveSpace) {
   SpillCompressionConfig compression;
   compression.enabled = true;
   compression.minSavingsRatio = 0.95;
-  ProcessDiskIoService::ConfigureDefaultIfNeeded(diskIoConfig());
+  DiskIoTaskExecutor::ConfigureDefaultIfNeeded(diskIoConfig());
 
-  SpillStore store(
-      SpillStoreConfig{.spillDir = root.string(),
+  SpillFileStore store(
+      SpillFileStoreConfig{.spillDir = root.string(),
                        .cleanupOnDestroy = true,
                        .diskProbe = ssdProbe(),
                        .smallSpill = SmallSpillConfig{},
@@ -289,7 +289,7 @@ TEST(SpillStoreTest, fallsBackToRawWhenCompressionDoesNotSaveSpace) {
   store.Release(location);
 }
 
-TEST(SpillStoreTest, recordsMetricsForWriteReadReleaseAndCompressionPath) {
+TEST(SpillFileStoreTest, recordsMetricsForWriteReadReleaseAndCompressionPath) {
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_spill_store_metrics_test";
   std::filesystem::remove_all(root);
@@ -303,8 +303,8 @@ TEST(SpillStoreTest, recordsMetricsForWriteReadReleaseAndCompressionPath) {
   auto engine = std::make_unique<RecordingDiskIoEngine>();
   DiskIoScheduler scheduler(std::move(engine), diskIoConfig());
 
-  SpillStore store(
-      SpillStoreConfig{.spillDir = root.string(),
+  SpillFileStore store(
+      SpillFileStoreConfig{.spillDir = root.string(),
                        .cleanupOnDestroy = true,
                        .diskProbe = ssdProbe(),
                        .smallSpill = small,
@@ -343,7 +343,7 @@ TEST(SpillStoreTest, recordsMetricsForWriteReadReleaseAndCompressionPath) {
             1);
 }
 
-TEST(SpillStoreTest, recordsInvalidAndDoubleReleaseMetrics) {
+TEST(SpillFileStoreTest, recordsInvalidAndDoubleReleaseMetrics) {
   auto root = std::filesystem::temp_directory_path() /
       "bolt_bm_spill_store_release_edge_metrics_test";
   std::filesystem::remove_all(root);
@@ -352,8 +352,8 @@ TEST(SpillStoreTest, recordsInvalidAndDoubleReleaseMetrics) {
   auto engine = std::make_unique<RecordingDiskIoEngine>();
   DiskIoScheduler scheduler(std::move(engine), diskIoConfig());
 
-  SpillStore store(
-      SpillStoreConfig{.spillDir = root.string(),
+  SpillFileStore store(
+      SpillFileStoreConfig{.spillDir = root.string(),
                        .cleanupOnDestroy = true,
                        .diskProbe = ssdProbe(),
                        .smallSpill = SmallSpillConfig{},

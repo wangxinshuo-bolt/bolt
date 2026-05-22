@@ -13,6 +13,7 @@
 
 #include <gtest/gtest.h>
 
+#include "bolt/common/base/Exceptions.h"
 #include "bolt/common/memory/bm/DiskIo.h"
 
 namespace bytedance::bolt::memory::bm {
@@ -181,6 +182,12 @@ TEST(DiskIoTest, adaptiveQueueDepthUsesConfiguredWindow) {
     depth.Observe(completion);
   }
   ASSERT_LT(depth.Limit(), 8);
+}
+
+TEST(DiskIoTest, rejectsZeroProcessDiskIoWorkers) {
+  auto config = diskIoConfig();
+  config.workerThreadCount = 0;
+  EXPECT_THROW(AdaptiveQueueDepth depth(config), BoltUserError);
 }
 
 TEST(DiskIoTest, schedulerUsesWeightedPriorityOrder) {

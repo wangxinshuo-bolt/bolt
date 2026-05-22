@@ -1,261 +1,306 @@
 # Bolt BufferManager
 
-本文档描述 `bolt/common/memory/bm` 当前代码里的 BufferManager 工作原理。内容以代码实现为准。
+本文档描述 `bolt/common/memory/bm` 当前实现。它只覆盖现存机制：`BufferManager` owner thread 负责提交任务和提交状态，进程级服务负责 spill/prefetch 的磁盘执行、completion 发布、文件布局和 I/O 调度。
 
 ## 目标和边界
 
 BufferManager 是 Bolt 内部面向算子的内存块管理层。它提供：
 
-- 以 `BlockHandle` 为单位的内存分配、pin、unpin、reload。
+- 以 `BlockHandle` 为单位的分配、pin、unpin、reload、prefetch。
 - 按 `MemoryTag` 和 `ReservationKind` 统计逻辑使用量。
-- 在上层内存仲裁或 task quota 要求释放内存时，按策略 discard、recompute 或 spill。
-- 进程级 spill 服务，负责压缩、落盘、读回、释放 spill 文件。
-- 一个共享 spill 目录，一个进程级 `ProcessSpillService`，可被多个 `BufferManager` 复用。
+- 按 block policy 执行 discard、recompute、spill。
+- 通过进程级服务共享 spill 目录、spill file store、disk probe 和 disk I/O 队列。
+- owner-thread 状态提交：后台任务只生产 completion，不直接修改 `BlockHandle` 的最终状态。
 
-BufferManager 不做全局 quota 管理。外部 quota/arbitrator 决定何时调用 `Reclaim()`；BufferManager 只响应回收请求，并维护自己的使用统计。
+BufferManager 不做全局 quota 管理。外部 quota / memory arbitrator 决定何时调用 `Reclaim()`；BufferManager 只响应回收请求，并维护自身使用统计。
 
 ## 模块关系
 
 ```text
 Operator / Task
-    |
-    v
+      |
+      v
 +-----------------+
 | BufferManager   |
 +-----------------+
-    |        |        |         |
-    |        |        |         +--------------------+
-    |        |        |                              |
-    v        v        v                              v
-+--------+  +-----------------+              +---------------+
-| blocks |  | BufferAllocator |              | BlockEvictor  |
-| weak[] |  +-----------------+              +---------------+
-+--------+      |        |                           |
-                |        |                           v
-                v        v                    +---------------------+
-        +------------+  +----------------+     | ProcessSpillService|
-        | BufferPool |  | Bolt MemoryPool|     +---------------------+
-        | accounting |  | physical bytes |          |          |
-        +------------+  +----------------+          |          |
-                ^                                  v          v
-                |                          +-----------+  +-----------+
-        +----------------+                 | SpillStore|  | DiskProbe |
-        | AccountedMemory|                 +-----------+  +-----------+
-        +----------------+                      |
-                                                +--> SpillCompression
-                                                +--> SmallSpillAllocator
-                                                +--> ProcessDiskIoService
-                                                     / DiskIoScheduler
+      |
+      +-----------------------------+
+      |                             |
+      v                             v
++-------------+              +----------------+
+| BlockHandle |              | BlockEvictor   |
++-------------+              +----------------+
+      |                             |
+      | resident memory             | spill candidate
+      v                             v
++-----------------+          +---------------------+
+| AccountedMemory |          | SpillCoordinator |
++-----------------+          +---------------------+
+      |                             |
+      v                             | submit DiskIoTask
++-----------------+                 v
+| BufferAllocator |          +----------------------+
++-----------------+          | DiskIoTaskExecutor |
+      |                      +----------------------+
+      v                             |
++-----------------+                 | worker executes task
+| BufferPool      |                 v
+| accounting      |          +----------------+
++-----------------+          | SpillFileStore     |
+      |                      +----------------+
+      v                             |
++-----------------+                 +--> SpillCompression
+| Bolt MemoryPool |                 +--> SmallSpillAllocator
++-----------------+                 +--> DiskIoScheduler
+                                           |
+                                           v
+                                    UringDiskIoEngine
 ```
 
 主要职责：
 
-- `BufferManager`：对外入口，创建 block，维护 live block weak list，响应 `Reclaim()`，drain async spill completion。
-- `BlockHandle`：单个 block 的状态机，持有 resident memory 或 spill location，处理 pin/reload/evict/spill commit。
-- `BufferHandle`：RAII pin。初始写 handle 析构时 seal block，普通 pin handle 析构时只 unpin。
-- `BufferPool`：只做逻辑使用量统计，不拒绝分配，也不主动触发 reclaim。
+- `BufferManager`：对外入口；创建 block；维护 live block weak list；执行 `Reclaim()` / `Prefetch()`；drain completion；在 owner thread 提交 block 状态。
+- `BlockHandle`：单个 block 的状态机；持有 resident memory 或 spill location；提供 prepare/commit/failure 方法。
+- `BufferHandle`：RAII pin。初始写 handle 析构时 seal block，普通 pin handle 析构时 unpin。
+- `BufferPool`：逻辑使用量统计，不拒绝分配，也不主动触发 reclaim。
 - `BufferAllocator` / `AccountedMemory`：把 BufferPool 逻辑 reservation 和 Bolt `MemoryPool` 物理分配绑在一起。
-- `BlockEvictor`：按 cost 和 priority 组织 eviction candidates，并分发 cheap eviction 或 spill scheduling。
-- `ProcessSpillService`：进程级 spill worker、completion queue、progress wait、single spill store。
-- `SpillStore`：真实文件读写，默认压缩，小块 slab slot，大块 dedicated file。
-- `DiskIoScheduler`：io_uring I/O engine，带 priority deficit 和 adaptive queue depth。
+- `BlockEvictor`：按 cost class 和 priority 组织 eviction candidates。
+- `SpillCoordinator`：进程级 spill domain 服务；维护 completion queues、owner-token progress、single `SpillFileStore`。
+- `DiskIoTaskExecutor`：进程级中心 I/O task queue；执行 spill write 和 prefetch read task。
+- `SpillFileStore`：spill 文件布局、压缩、小块 slab slot、大块 dedicated file、read/write/release。
+- `DiskIoScheduler`：在单个 disk engine 上做 priority 选择、adaptive queue depth 观测和请求执行。
 
 ## 线程模型
 
-`BufferManager` 是 thread-confined：
+```text
+BufferManager owner thread
+      |
+      | public API:
+      |   Allocate / Pin / Reclaim / Prefetch / Snapshot
+      v
++-----------------------------+
+| block state prepare/commit  |
++-----------------------------+
+      |
+      | submit spill/prefetch task
+      v
++-----------------------------+
+| DiskIoTaskExecutor worker |
++-----------------------------+
+      |
+      | read/write through SpillFileStore
+      v
++-----------------------------------+
+| SpillCoordinator queues        |
+| completed_ / prefetchCompleted_   |
++-----------------------------------+
+      |
+      | owner later drains
+      v
++-----------------------------+
+| BlockHandle commit/failure  |
++-----------------------------+
+```
 
-- 非静态 public API 必须由构造它的 owner thread 调用。
+规则：
+
+- `BufferManager` 非静态 public API 必须由构造它的 owner thread 调用。
 - 多个 task 可以各自持有一个 `BufferManager`，在不同线程并发运行。
-- spill/disk 进程级服务是线程安全的。
-- async spill worker 只写盘，不直接提交 `BlockHandle` 状态；状态提交由 owner thread 在 `DrainSpillCompletions()` 中完成。
+- 进程级 `SpillCoordinator` 和 `DiskIoTaskExecutor` 是线程安全的。
+- disk worker 不持有 `BlockHandle`，不直接提交 block 最终状态。
+- completion 通过 owner token 归属到对应 BufferManager。
+- `BlockHandle` 内部仍使用 mutex / condition variable 来协调 pin、unpin、loading、spilling 和 manager destruction。
 
-`BlockHandle` 自身仍有 mutex 和 condition variable，因为：
+## 配置入口
 
-- `BufferHandle::Data()` / `MutableData()` / `Reset()` 需要保护 pin 和 state。
-- `Pin()` 可能等待 `kLoading` 或 `kSpilling`。
-- async spill prepare/commit 需要和 pin/unpin 状态协调。
+进程级服务通过以下接口初始化：
+
+```cpp
+BufferManager::InitializeProcessServices(BufferManagerProcessServicesConfig)
+```
+
+关键配置：
+
+- `spill.enabled`：是否配置进程级 spill coordinator。
+- `spill.spillDir`：spill 文件根目录。
+- `spill.workerThreadCount`：进程级 disk task worker 数，必须大于 0。
+- `spill.diskProbeDuration` / `spill.diskProbe` / `forcedKind` / `unknownFallbackKind`：磁盘分类探测。
+- `spill.diskIo`：io_uring ring entries、disk task worker、priority weights、adaptive queue depth 参数。
+- `spill.smallSpill`：小块 slab 文件策略。
+- `spill.compression`：spill payload 压缩策略。
+- `metrics`：进程级 metrics sink。
+
+每个 `BufferManager` 的构造配置包括：
+
+- `poolName`：Bolt MemoryPool 子树名称。
+- `reserveWaitTimeout`：`Reclaim()` / `Pin()` 等待 async progress 的超时时间。
+- `metrics`：该 BufferManager 的 BufferPool / BlockHandle metrics sink。
+- `spillEnabled`：是否允许分配 `EvictPolicy::kSpillToDisk` block。
+
+`EvictPolicy::kSpillToDisk` 需要进程级 spill coordinator 已初始化，否则分配会抛 `BoltUserError`。
 
 ## Allocate 流程
 
 ```text
 Operator
    |
-   | Allocate(options)
+   | BufferManager.Allocate(options)
    v
-BufferManager
++-------------------------+
+| AssertOwnerThread       |
++-------------------------+
    |
-   | AssertOwnerThread()
-   |
-   | if policy == kSpillToDisk:
-   |     EnsureSpillService()
-   |
-   | create BlockHandle(context, options)
+   | policy == kSpillToDisk ?
+   |      |
+   |      +--> EnsureSpillCoordinator()
    v
-BufferAllocator
-   |
-   +--> BufferPool.Reserve(tag, size, kind)
-   |
-   +--> Bolt MemoryPool.allocate(size)
++-------------------------+
+| create BlockHandle      |
++-------------------------+
    |
    v
-AccountedMemory
++-------------------------+
+| BufferAllocator         |
+|  - BufferPool.Reserve   |
+|  - Bolt MemoryPool alloc|
++-------------------------+
    |
    v
-BufferManager
-   |
-   +--> BlockHandle.InstallMemory(memory)
-   |
-   +--> RegisterBlock(weak_ptr)
-   |
-   +--> BlockEvictor.Enqueue(candidate)
++-------------------------+
+| AccountedMemory         |
++-------------------------+
    |
    v
-Operator receives BufferHandle(initialWrite=true)
++-------------------------+
+| BlockHandle.InstallMemory
+| state = kLoaded
+| pinCount = 1
++-------------------------+
+   |
+   v
++-------------------------+
+| RegisterBlock(weak_ptr) |
+| Enqueue eviction node   |
++-------------------------+
+   |
+   v
+BufferHandle(initialWrite=true)
 ```
 
-关键点：
-
-- `Allocate()` 返回的是初始写 `BufferHandle`，此时 `BlockHandle` 为 `kLoaded`，`pinCount == 1`，`sealed == false`。
-- 初始写 handle 的生命周期结束后，`BufferHandle::~BufferHandle()` 调用 `BlockHandle::Unpin(initialWrite=true)`，block 被 seal，变成可被回收候选。
-- `BufferPool` 的统计随 `AccountedMemory` 生命周期变化；当 resident memory 被移动出 block 并最终析构时，逻辑使用量下降。
+初始写 handle 结束时，`BufferHandle::Reset()` / 析构会调用 `BlockHandle::Unpin(initialWrite=true)`。block 被 seal 后才是正常可回收候选。
 
 ## Block 状态机
 
 ```text
-                 InstallMemory()
-        +-------------------------------+
-        |                               v
-    +----------+                    +---------+
-    | kInvalid |                    | kLoaded |
-    +----------+                    +---------+
-        ^                              |  |  |
-        |                              |  |  +-- TryEvict(kDiscard)
-        |                              |  |          |
-        |                              |  |          v
-        |                              |  |    +------------+
-        |                              |  |    | kDiscarded |
-        |                              |  |    +------------+
-        |                              |  |
-        |                              |  +-- TryEvict(kRecompute)
-        |                              |             |
-        |                              |             v
-        |                              |    +----------------------+
-        |                              |    | kEvictedRecomputable |
-        |                              |    +----------------------+
-        |                              |             |
-        |                              | Pin()/      |
-        |                              | Prefetch()  |
-        |                              v             |
-        |                         +----------+ <-----+
-        |                         | kLoading |
-        |                         +----------+
-        |                         |    |
-        | read/recompute success  |    | failure restores previous state:
-        |                         |    |   kSpilled or kEvictedRecomputable
-        |                         v    |
-        |                    +---------+
-        |                    | kLoaded |
-        |                    +---------+
-        |                         |
-        | SpillToDisk() or        |
-        | PrepareAsyncSpill()     v
-        |                    +-----------+
-        |                    | kSpilling |
-        |                    +-----------+
-        |                     |        |
-        | write success       |        | write failure
-        |                     v        v
-        |                +----------+ +---------+
-        |                | kSpilled | | kLoaded |
-        |                +----------+ +---------+
-        |                     |
-        |                     | Pin()/
-        |                     | Prefetch()
-        |                     v
-        |                +----------+
-        |                | kLoading |
-        |                +----------+
+                         InstallMemory()
+        +---------------------------------------------+
+        |                                             v
+   +----------+                                  +---------+
+   | kInvalid |                                  | kLoaded |
+   +----------+                                  +---------+
+        ^                                        /   |   \
+        |                                       /    |    \
+        |                                      /     |     \
+        |                         discard evict      |      spill prepare
+        |                                    v        |          v
+        |                              +------------+ |    +-----------+
+        |                              | kDiscarded | |    | kSpilling |
+        |                              +------------+ |    +-----------+
+        |                                             |      |       |
+        |                         recompute evict     |      |       |
+        |                                    v        |      |       |
+        |                       +----------------------+      |       |
+        |                       | kEvictedRecomputable |      |       |
+        |                       +----------------------+      |       |
+        |                                    |               |       |
+        |                                    | Pin           |       |
+        |                                    v               |       |
+        |                              +----------+          |       |
+        |                              | kLoading | <--------+       |
+        |                              +----------+   write failure  |
+        |                                    |                       |
+        |                         load/recompute success             |
+        |                                    v                       |
+        |                              +---------+                   |
+        |                              | kLoaded |                   |
+        |                              +---------+                   |
+        |                                                          |
+        |                                                          | write success
+        |                                                          v
+        |                                                     +----------+
+        |                                                     | kSpilled |
+        |                                                     +----------+
+        |                                                          |
+        |                                                          | Pin / Prefetch
+        |                                                          v
+        |                                                     +----------+
+        |                                                     | kLoading |
+        |                                                     +----------+
         |
-        +-- manager destruction from any state
+        +------------- manager destruction from any state --------+
 ```
 
-`BlockState` 的含义：
+状态含义：
 
 - `kLoaded`：resident memory 存在，可以 pin。
-- `kSpilling`：resident memory 已经从 block 移到 spill request / sync spill local 变量，仍然由 `AccountedMemory` 计入使用量，直到 commit。
-- `kSpilled`：resident memory 已释放，`spillLocation_` 指向磁盘表示。
-- `kDiscarded`：数据永久丢弃，后续 pin 返回 invalid handle。
-- `kEvictedRecomputable`：resident memory 已释放，后续 pin 通过 recoveryFn 重建。
-- `kLoading`：正在 reload 或 recompute。
+- `kSpilling`：resident memory 已从 block 移到 spill request，仍由 `AccountedMemory` 持有，等待 completion commit。
+- `kSpilled`：resident memory 已释放，block 持有 `SpillLocation`。
+- `kLoading`：正在 reload、recompute 或 prefetch。
+- `kDiscarded`：数据已永久丢弃，后续 pin 返回 invalid handle。
+- `kEvictedRecomputable`：resident memory 已释放，后续 pin 通过 `recoveryFn` 重建。
 - `kInvalid`：manager 销毁或 block 不再可用。
 
 ## Reclaim 流程
 
-`Reclaim(targetBytes)` 是 BM 响应外部回收请求的主路径。`targetBytes == 0` 表示尽力回收到队列为空。
+`Reclaim(targetBytes)` 响应外部内存回收请求。`targetBytes == 0` 表示尽力回收到没有候选为止。
 
 ```text
 Reclaim(targetBytes)
-        |
-        v
+      |
+      v
 AssertOwnerThread()
-        |
-        v
+      |
+      v
+DrainPrefetchCompletions()
 DrainSpillCompletions()
-        |
-        v
-Scan live blocks:
-  - enqueue current candidates
-  - erase expired weak_ptr
-        |
-        v
-+-------------------------+
-| reclaimed >= target ?   |  target==0 means best effort
-+-------------------------+
-   | yes                         | no
-   v                             v
-Update metrics            Evictor.TryPopAnyCandidate()
-return reclaimed                  |
-                                  v
-                      +----------------------+
-                      | got candidate node ? |
-                      +----------------------+
-                         | no                      | yes
-                         v                         v
-              wait for scheduled          +----------------+
-              async spill progress        | node.cost ?    |
-              then drain completions      +----------------+
-                         |                   |             |
-                         +-------------------+             |
-                                             |             |
-                                      kFreeOrCheap       kSpill
-                                             |             |
-                                             v             v
-                                   TryEvictNodeSync   executionMode?
-                                   discard/recompute       |
-                                             |             |
-                                             |     +----------------------+
-                                             |     | owner thread?        |
-                                             |     +----------------------+
-                                             |       | yes          | no
-                                             |       v              v
-                                             | block.SpillToDisk  TryScheduleEvict
-                                             |                    |
-                                             |               scheduled?
-                                             |                | yes
-                                             |                v
-                                             |               loop
-                                             +--------------------+
+      |
+      v
+Refresh eviction candidates from live blocks
+      |
+      v
++----------------------------+
+| need more reclaimed bytes? |
++----------------------------+
+      | no                         | yes
+      v                            v
+return reclaimed          BlockEvictor.TryPopAnyCandidate()
+                                   |
+                                   v
+                         +----------------+
+                         | candidate cost |
+                         +----------------+
+                            |           |
+                   kFreeOrCheap       kSpill
+                            |           |
+                            v           v
+                  TryEvictNodeSync   TryScheduleEvict
+                  discard/recompute       |
+                            |             |
+                            v             v
+                    reclaimed +=     scheduledSpillCount++
+                    freedBytes
+                            |             |
+                            +------+------+
+                                   |
+                                   v
+                     WaitForProgress / drain completions
 ```
 
-实际返回值是“已经真实释放的 resident bytes”，不是提交给后台任务的字节数。async spill 只有在 completion 被 owner thread commit 后，才计入 reclaimed。
+`Reclaim()` 返回的是已经真实释放的 resident bytes。提交到中心 I/O 队列的 spill write 不会立即计入 reclaimed；只有 owner thread drain completion 并 commit 成功后，resident memory 被释放，才计入返回值。
 
 ## Eviction 顺序
 
 `BlockEvictor` 使用二维 FIFO bucket：
-
-1. cost class：`kFreeOrCheap` 先于 `kSpill`。
-2. priority：`kLow` 先于 `kNormal`，再到 `kHigh`，最后 `kCritical`。
-3. 同一 bucket 内 FIFO。
 
 ```text
 Pop order:
@@ -274,137 +319,173 @@ Pop order:
 
 Within each bucket:
 
-  enqueue back  --->  [ oldest ... newest ]  --->  pop front
+  enqueue back ---> [ oldest ... newest ] ---> pop front
 ```
 
-队列允许 stale nodes。每个 `EvictionNode` 记录 `evictionSequence`，执行前重新校验：
+队列允许 stale node。执行前会重新校验 weak block、concrete type、eviction sequence、pin count 和 policy；不匹配则跳过。
 
-- block weak_ptr 是否还活着。
-- concrete type 是否是 `BlockHandle`。
-- sequence 是否仍匹配。
-- block 是否未 pinned。
-
-不匹配则 `kSkipped`，不做昂贵清理。
-
-## Owner-thread Spill 路径
-
-当 `spill.executionMode == kOwnerThread` 时，`Reclaim()` 在 BufferManager owner thread 同步调用 `BlockHandle::SpillToDisk()`。
+## Spill Write 流程
 
 ```text
-BufferManager owner thread
-        |
-        | block.SpillToDisk()
-        v
-BlockHandle
-        |
-        | lock and check:
-        |   - policy is kSpillToDisk
-        |   - state is kLoaded
-        |   - pinCount == 0
-        |   - owner thread matches
-        |
-        | state = kSpilling
-        | memory_ -> local AccountedMemory
-        v
-ProcessSpillService.Write(tag, data, size)
-        |
-        v
-SpillStore.Write()
-        |
-        | compress / choose small slot or dedicated file / write bytes
-        v
-SpillLocation
-        |
-        v
-BlockHandle
-        |
-        | spillLocation_ = location
-        | state = kSpilled
-        | destroy local AccountedMemory
-        v
-BufferPool usage decreases
-        |
-        v
-return freed bytes
-```
-
-owner-thread spill 必须在 BufferManager owner thread 执行。`BlockHandle::SpillToDisk()` 会校验 owner thread，避免后台线程直接改 block 状态。
-
-## Worker-thread Spill 路径
-
-当 `spill.executionMode == kWorkerThread` 时，worker 只负责写盘，不持有 `BlockHandle`，也不直接释放 BM 状态。它通过 block id、eviction sequence 和 owner token 交接 completion。
-
-`kWorkerThread` 要求 `workerThreadCount > 0`。如果配置为 `workerThreadCount == 0`，进程级 spill service 初始化会直接报错。worker-thread spill submit 失败或 backpressured 时，`BufferManager` 不会 fallback 到 owner-thread spill；`Reclaim()` 只返回已经真实释放的 resident bytes。
-
-```text
-Owner thread:
-
-  BufferManager
-      |
-      | TryScheduleEvict(node)
-      v
-  BlockEvictor
-      |
-      | validate node:
-      |   - weak block alive
-      |   - evictionSequence matches
-      |   - block not pinned
-      |
-      | BlockHandle.TryMarkSpillScheduled(seq)
-      v
-  ProcessSpillService.SubmitSpill(node)
-      |
-      | BlockHandle.PrepareAsyncSpill(seq)
-      |   state = kSpilling
-      |   memory_ -> SpillRequest.memory
-      |
-      v
-  ready_ queue
-
-Worker thread:
-
-  ready_ queue
-      |
-      | pop SpillRequest(owner, blockId, seq, tag, memory)
-      v
-  SpillStore.Write(memory->Data(), memory->Size())
-      |
-      v
-  SpillCompletion(owner, blockId, seq, memory, location/error)
-      |
-      v
-  completed_ queue
-      |
-      v
-  NotifyProgress()
-
-Owner thread later:
-
-  BufferManager.DrainSpillCompletions(owner)
-      |
-      | find BlockHandle by blockId
-      v
-  BlockHandle.CommitAsyncSpillSuccess(seq, location, memory)
-      |
-      | if state and seq still match:
-      |   spillLocation_ = location
-      |   state = kSpilled
-      |   destroy memory
-      |
-      v
-  BufferPool usage decreases
+Owner thread
+    |
+    | Reclaim() chooses spill candidate
+    v
++------------------------------+
+| BlockEvictor.TryScheduleEvict|
++------------------------------+
+    |
+    | validate node and mark scheduled
+    v
++------------------------------+
+| SpillCoordinator.SubmitSpill
++------------------------------+
+    |
+    | BlockHandle.PrepareAsyncSpill(seq)
+    |   - state = kSpilling
+    |   - memory_ moves into SpillRequest
+    v
++------------------------------+
+| DiskIoTaskExecutor.SubmitTask
+| priority = kHigh
++------------------------------+
+    |
+    v
+DiskIoTaskExecutor worker
+    |
+    | ExecuteSpill(request)
+    v
++------------------------------+
+| SpillFileStore.Write             |
+|  - compress or raw payload   |
+|  - choose small slot/file    |
+|  - DiskIoScheduler write     |
++------------------------------+
+    |
+    v
++------------------------------+
+| SpillCompletion              |
+| owner, blockId, seq, memory, |
+| location or error            |
++------------------------------+
+    |
+    v
+SpillCoordinator.completed_
+    |
+    v
+Owner thread later drains
+    |
+    v
++------------------------------+
+| CommitAsyncSpillSuccess      |
+|  - spillLocation_ = location |
+|  - state = kSpilled          |
+|  - memory is released        |
++------------------------------+
 ```
 
 失败路径：
 
-- worker 写盘失败：completion 带 error 和原 memory。
-- owner thread 调用 `CommitAsyncSpillFailure()`，如果 sequence 仍匹配且 block 有效，则恢复 `memory_`，状态回到 `kLoaded`，并 bump `evictionSequence`。
-- 如果 completion 到达时 block 已经死掉，BufferManager 释放 spill location 或 memory，避免泄漏。
+- task 执行失败时，completion 携带 error 和原 memory。
+- owner thread drain 后调用 `CommitAsyncSpillFailure()`，在 sequence 匹配时恢复 `memory_`，状态回到 `kLoaded`。
+- completion 到达时 block 已经不存在，BufferManager 释放 memory 或 spill location，避免泄漏。
+
+## Prefetch 流程
+
+`Prefetch(blocks)` 是 best-effort 异步 reload。它把已经 spilled 的 block 提前读回 resident memory，但不 pin block。
+
+```text
+Owner thread
+    |
+    | Prefetch(blocks)
+    v
++------------------------------+
+| for each block               |
++------------------------------+
+    |
+    +-- null / not spilled / in flight
+    |      |
+    |      +--> skippedCount++
+    |
+    +-- kLoaded
+    |      |
+    |      +--> alreadyLoadedCount++
+    |
+    +-- kSpilled
+           |
+           v
+    +--------------------------+
+    | PrepareAsyncPrefetch     |
+    |  - allocate memory       |
+    |  - state = kLoading      |
+    |  - memory -> request     |
+    +--------------------------+
+           |
+           v
+    +--------------------------+
+    | SpillCoordinator      |
+    | SubmitPrefetch           |
+    +--------------------------+
+           |
+           v
+    +--------------------------+
+    | DiskIoTaskExecutor     |
+    | SubmitTask(priority=Low) |
+    +--------------------------+
+```
+
+```text
+DiskIoTaskExecutor worker
+    |
+    | ExecutePrefetch(request)
+    v
++------------------------------+
+| SpillFileStore.Read              |
+|  - DiskIoScheduler read      |
+|  - decompress if needed      |
++------------------------------+
+    |
+    v
++------------------------------+
+| PrefetchCompletion           |
+| owner, blockId, seq, memory, |
+| error                        |
++------------------------------+
+    |
+    v
+SpillCoordinator.prefetchCompleted_
+    |
+    v
+Owner thread drains:
+  - Prefetch({})
+  - Pin()
+  - Reclaim()
+  - BufferManager destruction
+    |
+    v
++------------------------------+
+| CommitAsyncPrefetchSuccess   |
+|  - memory moves to block     |
+|  - state = kLoaded           |
+|  - old spill location release|
+|  - pinCount unchanged        |
++------------------------------+
+```
+
+`Prefetch({})` 是显式 drain-only 调用。非空 `Prefetch(blocks)` 的返回值只描述本次提交结果，不混入已经完成但尚未 drain 的 completion。
+
+`Pin()` 在调用 `BlockHandle::Pin()` 前会先 drain prefetch completions；如果目标 block 正处于 prefetch 的 `kLoading`，owner thread 会等待中心 I/O progress 并继续 drain，避免重复读盘。
 
 ## Pin / Reload 流程
 
 ```text
 Pin(block)
+    |
+    v
+BufferManager.DrainPrefetchCompletionsBeforePin(block)
+    |
+    v
+BlockHandle.Pin()
     |
     v
 +----------------+
@@ -413,18 +494,16 @@ Pin(block)
     |
     +-- kLoaded
     |      |
-    |      +--> pinCount++
-    |      +--> return BufferHandle
+    |      +--> pinCount++ -> return BufferHandle
     |
     +-- kSpilled
     |      |
     |      +--> state = kLoading
     |      +--> allocate resident memory
-    |      +--> ProcessSpillService.Read(location)
+    |      +--> SpillCoordinator.Read(location)
     |      +--> state = kLoaded
     |      +--> release old spill location
-    |      +--> pinCount++
-    |      +--> return BufferHandle
+    |      +--> pinCount++ -> return BufferHandle
     |
     +-- kEvictedRecomputable
     |      |
@@ -432,120 +511,61 @@ Pin(block)
     |      +--> allocate resident memory
     |      +--> recoveryFn(data, size)
     |      +--> state = kLoaded
-    |      +--> pinCount++
-    |      +--> return BufferHandle
+    |      +--> pinCount++ -> return BufferHandle
     |
     +-- kSpilling / kLoading
     |      |
-    |      +--> wait on cv_
-    |      +--> retry from current state
+    |      +--> wait on cv_ -> retry
     |
     +-- kDiscarded / kInvalid
            |
            +--> return invalid BufferHandle
 ```
 
-并发 reload 使用 `loadGeneration_` 和 `lastLoadError_`：
+`loadGeneration_` 和 `lastLoadError_` 用于让同一代 reload 的等待者看到一致的失败结果。
 
-- 同一代 reload 失败时，等待者看到同一个异常。
-- reload 成功后 `spillLocation_` 会被清空，并通过 spill service release 原 spill 文件/slot。
+## SpillFileStore 文件布局
 
-## Prefetch 流程
-
-`Prefetch(blocks)` 是 best-effort 异步 reload 接口，用于把已经 spilled 的 block 提前读回 resident memory，但不 pin 住 block。它复用 `kLoading` 状态和 async completion 机制，因此和 `Pin()` 不会重复发起同一个 block 的读盘。
+写 spill 时先准备 payload：
 
 ```text
-Prefetch(blocks)
+logical bytes
     |
-    +--> DrainPrefetchCompletions()
-    |
-    +--> for each block:
-            |
-            +-- kLoaded
-            |      |
-            |      +--> alreadyLoadedCount++
-            |
-            +-- kSpilled
-            |      |
-            |      +--> BlockHandle.PrepareAsyncPrefetch()
-            |      |      - allocate resident AccountedMemory
-            |      |      - state = kLoading
-            |      |      - memory moves into PrefetchRequest
-            |      |
-            |      +--> ProcessSpillService.SubmitPrefetch(request)
-            |      +--> submittedCount++
-            |
-            +-- other states
-                   |
-                   +--> skippedCount++
-
-ProcessSpillService worker
-    |
-    +--> Read(spillLocation, request.memory)
-    +--> PrefetchCompletion(owner, blockId, seq, memory, error)
-    +--> NotifyProgress()
-
-Owner thread later:
-
-Prefetch({})
-    |
-    +--> DrainPrefetchCompletions()
-    +--> CommitAsyncPrefetchSuccess()
-           - memory moves back to BlockHandle
-           - state = kLoaded
-           - old spill location is released
-           - block is resident but pinCount is unchanged
-```
-
-`Prefetch({})` 是显式 drain-only 调用。带 block 的 `Prefetch(blocks)` 不会把“已经完成但还没 drain 的 prefetch completion”混入本次提交结果，避免 repeated prefetch 的去重语义变成竞态。
-
-## SpillStore 落盘路径
-
-每次写 spill 都会先准备 payload：
-
-1. 如果配置启用 zstd 且满足 `minBytes`，尝试压缩。
-2. 如果压缩后没有达到 `minSavingsRatio`，回退 raw payload。
-3. 用 `storedBytes` 选择小块 slot 或 dedicated file。
-4. 通过 `DiskIoScheduler::SubmitAndWait()` 执行写。
-
-```text
-SpillStore.Write(logical bytes)
-        |
-        v
+    v
 +--------------------------------------------+
 | compression enabled and bytes >= minBytes? |
 +--------------------------------------------+
-        | yes                         | no
-        v                             v
-try ZSTD compress                 raw payload
-        |
-        v
-+-------------------------------+
-| compressed and saved enough ? |
-+-------------------------------+
-        | yes                         | no
-        v                             v
-zstd payload                    raw payload
-storedBytes = compressed size   storedBytes = logical size
-        |                             |
-        +-------------+---------------+
-                      |
-                      v
-        +-----------------------------------------+
-        | storedBytes fits a small size class ?   |
-        +-----------------------------------------+
-             | yes                         | no
-             v                             v
-  SmallSpillAllocator slot          dedicated file
-  path + offset + slotBytes         bm_<tag>_<id>.spill
-             |                             |
-             +-------------+---------------+
-                           |
-                           v
+      | yes                         | no
+      v                             v
+try zstd compression             raw payload
+      |
+      v
++------------------------------+
+| saved enough by ratio?       |
++------------------------------+
+      | yes                         | no
+      v                             v
+zstd payload                  raw payload
+storedBytes = compressed      storedBytes = logical
+      |                             |
+      +--------------+--------------+
+                     |
+                     v
++--------------------------------------+
+| storedBytes fits a small size class? |
++--------------------------------------+
+      | yes                         | no
+      v                             v
+SmallSpillAllocator slot       dedicated file
+path + offset + slotBytes      bm_<tag>_<id>.spill
+      |                             |
+      +--------------+--------------+
+                     |
+                     v
               DiskIoScheduler write
-                           |
-                           v
-                   return SpillLocation
+                     |
+                     v
+              SpillLocation
 ```
 
 `SpillLocation` 记录：
@@ -559,75 +579,79 @@ storedBytes = compressed size   storedBytes = logical size
 - `compressionCodec`
 - `disk`
 
-## 小块 Spill 文件布局
-
-默认小块策略由磁盘类型决定：
-
-- dedicated file threshold 默认 4 MiB。
-- size classes 默认：4 KiB、8 KiB、16 KiB、32 KiB、64 KiB、128 KiB、256 KiB、512 KiB、1 MiB、2 MiB、4 MiB。
-- slab file size 默认：
-  - NVME：256 MiB
-  - SSD：128 MiB
-  - HDD / NetworkFS / Unknown：64 MiB
-
-小块写入时：
-
-- 根据 `storedBytes` 找第一个 `slotBytes >= storedBytes` 的 size class。
-- 从该 class 的 slab 文件中找 free slot 或 next slot。
-- 没有可用 slot 时新建 `bm_small_<slotBytes>_<id>.spill`。
-- release 时 slot 进入 free list；如果 slab 所有 slot 都释放，整个 slab file 会删除。
-
-大块或不匹配 size class 的写入使用 dedicated file：
-
-```text
-bm_<tag>_<id>.spill
-```
+小块 spill 使用 size class slab 文件；release 时 slot 回到 free list，如果 slab 文件所有 slot 都释放，整个文件会删除。大块 spill 使用 dedicated file，release 时删除对应文件。
 
 ## Disk Probe 和 Disk I/O
 
-`ProcessSpillService` 初始化时创建 `SpillStore`，并先执行 `ProbeDisk()`：
+`SpillCoordinator` 初始化 `SpillFileStore` 前会执行 disk probe：
 
-- 如果 `forcedKind != kUnknown`，直接使用 forced kind。
-- 如果 `diskProbeDuration <= 0`，不做 active probe，使用 fallback kind。
-- 否则用 `O_DIRECT` 临时文件测写/读 IOPS，并按阈值分类：
-  - min(writeIops, readIops) >= `nvmeMinIops`：NVME
-  - >= `ssdMinIops`：SSD
-  - 否则 HDD
-
-Disk I/O 层：
-
-- I/O engine 固定使用 io_uring，不再提供 sync backend。
-- `DiskIoScheduler` 有 priority weights，读默认 high，写默认 low。
-- `AdaptiveQueueDepth` 根据窗口内 latency percentile 和 throughput 变化调节 queue depth。当前 `SubmitAndWait()` 是同步执行请求，但 scheduler 仍记录 completion 并维护 adaptive 状态。
-
-## 配置入口
-
-进程级服务通过：
-
-```cpp
-BufferManager::InitializeProcessServices(BufferManagerProcessServicesConfig)
+```text
+forcedKind != kUnknown ?
+    |
+    +-- yes --> use forced kind
+    |
+    +-- no
+         |
+         v
+diskProbeDuration <= 0 ?
+    |
+    +-- yes --> use fallback kind
+    |
+    +-- no
+         |
+         v
+active O_DIRECT probe
+    |
+    v
+classify by min(writeIops, readIops)
 ```
 
-配置内容包括：
+I/O 执行层：
 
-- spill 是否启用。
-- spill execution mode：owner thread 或 worker thread。
-- spill directory。
-- worker thread count。
-- disk probe。
-- disk I/O ring entries 和 queue depth。
-- small spill policy。
-- compression policy。
-- metrics sink。
+```text
+DiskIoTaskExecutor
+    |
+    | central task queue
+    |   - spill write task: priority High
+    |   - prefetch read task: priority Low
+    v
+worker thread
+    |
+    v
+SpillFileStore.Read / Write
+    |
+    v
+DiskIoScheduler.SubmitAndWait(request)
+    |
+    | priority weights
+    | adaptive queue depth Observe()
+    v
+UringDiskIoEngine.Execute(request)
+```
 
-每个 `BufferManager` 自己的构造配置包括：
+`DiskIoTaskExecutor` 控制 task 入口；`DiskIoScheduler` 控制单个 engine 上的 request 选择和 completion 观测。
 
-- pool name。
-- reclaim 等待 async progress 的 timeout。
-- metrics sink。
-- 是否允许 spill policy block。
+## Completion 和生命周期
 
-`EvictPolicy::kSpillToDisk` 需要进程级 spill service 先初始化，否则分配会抛 `BoltUserError`。
+```text
+DiskIoTaskExecutor task
+    |
+    v
+SpillCoordinator completion queue
+    |
+    v
+owner thread drain
+    |
+    +-- block alive and sequence matches
+    |      |
+    |      +--> commit success/failure
+    |
+    +-- block gone or sequence stale
+           |
+           +--> drop memory / release spill location
+```
+
+BufferManager 析构时会持续 drain spill 和 prefetch completion，并等待该 owner token 的 active task 完成，然后再 invalidate live blocks。
 
 ## Metrics 和日志
 
@@ -643,11 +667,15 @@ BufferManager::InitializeProcessServices(BufferManagerProcessServicesConfig)
 - `bm_spill_submit_total`
 - `bm_spill_scheduled_total`
 - `bm_spill_backpressured_total`
+- `bm_spill_skipped_total`
+- `bm_spill_failed_total`
 - `bm_spill_executed_total`
 - `bm_spill_freed_bytes_total`
+- `bm_spill_queue_depth`
 - `bm_spill_bytes_written{disk=...}`
 - `bm_spill_bytes_stored{disk=...}`
 - `bm_spill_bytes_read{disk=...}`
+- `bm_spill_release_total{disk=...}`
 - `bm_spill_small_slot_total{disk=...}`
 - `bm_spill_dedicated_file_total{disk=...}`
 - `bm_spill_compress_attempt_total{disk=...}`
@@ -656,19 +684,19 @@ BufferManager::InitializeProcessServices(BufferManagerProcessServicesConfig)
 
 日志分层：
 
-- `INFO`：BufferManager 创建/销毁，Reclaim 汇总，ProcessSpillService/SpillStore 初始化，DiskProbe 结果。
-- `VLOG(1)`：block allocate/pin/unpin/enqueue/spill、SpillStore 写入细节、压缩 fallback 等高频路径。
-- `WARNING`：reload/spill 失败、cleanup 失败、double release 等异常但可恢复事件。
+- `INFO`：BufferManager 创建/销毁，Reclaim 汇总，SpillCoordinator / SpillFileStore 初始化，DiskProbe 结果。
+- `VLOG(1)`：block allocate/pin/unpin/enqueue/spill/prefetch、SpillFileStore 写入细节、压缩 fallback 等高频路径。
+- `WARNING`：reload/spill/prefetch 失败、cleanup 失败、double release 等异常但可恢复事件。
 
-## 当前行为和注意点
+## 当前行为要点
 
-1. `BufferPool` 只统计，不限额。真正的“是否该释放内存”由外部 quota/arbitrator 通过 `Reclaim()` 触发。
-2. `BufferManager` 是单线程使用模型；不要从非 owner thread 调它的 public API。
-3. worker-thread spill worker 不提交 block 状态，必须由 owner thread drain completion 后释放 resident bytes。
-4. `Reclaim()` 返回实际释放字节，不返回已提交 spill 的字节。
-5. `kPinnedForever` 不进入 eviction queue，使用 `ReservationKind::kPinned` 统计。
-6. `kDiscard` 被回收后 pin 返回 invalid handle；`kRecompute` 被回收后 pin 调 recoveryFn。
-7. 默认 spill 会尝试压缩，但达不到节省比例会 raw fallback。
-8. 小块 spill 按压缩后的 `storedBytes` 选择 slot，因此压缩会影响小块/大块路径。
-9. `spill.executionMode == kWorkerThread` 要求 `workerThreadCount > 0`，并且不会 fallback 到 owner-thread spill。
-10. `Snapshot().usedLoadedBytes / usedSpilledBytes` 是按 live block 状态额外汇总；`usedTotalBytes` 来自 BufferPool，表示当前 resident logical bytes。
+1. `BufferPool` 只统计，不限额。
+2. `BufferManager` public API 是 owner-thread confined。
+3. `Reclaim()` 返回实际释放字节，不返回已提交 I/O 的字节。
+4. `Prefetch()` 是 best-effort；成功后 block resident，但不 pin。
+5. spill write 和 prefetch read 都通过 `DiskIoTaskExecutor` 的中心 task queue 执行。
+6. `SpillCoordinator` 保存 completion，owner thread 负责 commit block 状态。
+7. `workerThreadCount > 0` 是必需配置。
+8. `kPinnedForever` 不进入 eviction queue，使用 `ReservationKind::kPinned` 统计。
+9. `kDiscard` 被回收后 pin 返回 invalid handle；`kRecompute` 被回收后 pin 调 `recoveryFn`。
+10. `Snapshot().usedLoadedBytes / usedSpilledBytes` 来自 live block 状态扫描；`usedTotalBytes` 来自 BufferPool resident usage。

@@ -58,10 +58,10 @@ bolt_add_library(
   bm/Evictor.cpp
   bm/MemoryTypes.cpp
   bm/Metrics.cpp
-  bm/ProcessSpillService.cpp
+  bm/SpillCoordinator.cpp
   bm/SmallSpillAllocator.cpp
   bm/SpillCompression.cpp
-  bm/SpillStore.cpp
+  bm/SpillFileStore.cpp
   bm/SpillTypes.cpp
   MemoryPool.cpp
   MemoryPoolForGluten.cpp

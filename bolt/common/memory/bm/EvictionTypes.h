@@ -46,14 +46,14 @@ enum class BlockState : uint8_t {
 // Outcome of a single eviction attempt.
 //   kFreed         memory was actually released back to BufferPool; freedBytes
 //                  is the number of bytes the caller may treat as reclaimed.
-//   kScheduled     spill submitted to the spill service; freedBytes is 0
+//   kScheduled     spill submitted to the spill coordinator; freedBytes is 0
 //                  because the bytes are not yet released.
-//   kBackpressured spill service could not accept more async I/O now.
+//   kBackpressured spill coordinator could not accept more async I/O now.
 //   kSkipped       candidate is stale (block expired, evictionSequence moved
 //                  on, block currently pinned, or policy mismatches the path)
 //                  – the caller should drop the node and pop the next one.
 //   kFailed        evict could not run due to shutdown, missing requester,
-//                  or fatal spill service state. Always paired with
+//                  or fatal spill coordinator state. Always paired with
 //                  freedBytes==0.
 enum class EvictResultKind : uint8_t {
   kFreed,
@@ -102,20 +102,20 @@ struct EvictionNode {
 };
 
 // Abstract contract through which BlockEvictor pushes spill candidates and
-// blocks on backpressure. ProcessSpillService is the production
+// blocks on backpressure. SpillCoordinator is the production
 // implementation; tests may inject fakes to drive deterministic scenarios.
 class SpillRequester {
  public:
   virtual ~SpillRequester() = default;
-  // Hands an evict candidate to the spill service. Return contract:
+  // Hands an evict candidate to the spill coordinator. Return contract:
   //   kScheduled     – node accepted, will run asynchronously.
   //   kBackpressured – async spill is temporarily unavailable.
-  //   kFailed        – spill service is stopping or gone.
+  //   kFailed        – spill coordinator is stopping or gone.
   //   kSkipped       – the weak_ptr is already expired.
   // Implementations must never silently drop a node – Reserve's slow path
   // would spin-wait forever.
   virtual EvictResult SubmitSpill(EvictionNode node) = 0;
-  // Blocks until the spill service observes progress (spill success/failure,
+  // Blocks until the spill coordinator observes progress (spill success/failure,
   // inflight bytes drop, token release, shutdown) or 'timeout' elapses.
   // 'bytesNeeded' is advisory – some implementations may return early when
   // enough memory has been freed; the default contract returns true on any

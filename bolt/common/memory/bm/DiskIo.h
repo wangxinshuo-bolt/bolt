@@ -6,10 +6,14 @@
 #pragma once
 
 #include <array>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 namespace bytedance::bolt::memory::bm {
@@ -39,6 +43,7 @@ struct AdaptiveQueueDepthConfig {
 
 struct DiskIoConfig {
   uint32_t ringEntries{128};
+  uint32_t workerThreadCount{1};
   int initialQueueDepth{16};
   int minQueueDepth{1};
   int maxQueueDepth{128};
@@ -63,6 +68,11 @@ struct DiskIoCompletion {
   int64_t result{0};
   size_t requestedSize{0};
   uint64_t latencyUs{0};
+};
+
+struct DiskIoTask {
+  DiskIoPriority priority{DiskIoPriority::kMedium};
+  std::function<void()> run;
 };
 
 class DiskIoEngine {
@@ -139,20 +149,34 @@ class DiskIoScheduler {
   std::array<int64_t, 3> deficit_{{0, 0, 0}};
 };
 
-class ProcessDiskIoService {
+class DiskIoTaskExecutor {
  public:
   static void ConfigureDefault(DiskIoConfig config);
   static void ConfigureDefaultIfNeeded(DiskIoConfig config);
-  static ProcessDiskIoService& Instance();
+  static DiskIoTaskExecutor& Instance();
   static void ResetForTesting();
 
+  bool SubmitTask(DiskIoTask task);
   DiskIoScheduler& Scheduler();
 
  private:
-  explicit ProcessDiskIoService(DiskIoConfig config);
+  explicit DiskIoTaskExecutor(DiskIoConfig config);
+  ~DiskIoTaskExecutor();
+
+  friend struct std::default_delete<DiskIoTaskExecutor>;
+
+  void StartWorkers();
+  void StopWorkers();
+  void WorkerLoop();
+  size_t PickNextTaskLocked() const;
 
   DiskIoConfig config_;
   std::unique_ptr<DiskIoScheduler> scheduler_;
+  mutable std::mutex mutex_;
+  std::condition_variable cv_;
+  std::deque<DiskIoTask> tasks_;
+  bool stopping_{false};
+  std::vector<std::thread> workers_;
 };
 
 std::unique_ptr<DiskIoEngine> CreateDiskIoEngine(const DiskIoConfig& config);

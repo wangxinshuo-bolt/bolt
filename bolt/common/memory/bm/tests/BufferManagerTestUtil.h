@@ -177,15 +177,14 @@ inline bool uringAvailableForTesting(std::string* reason = nullptr) {
 // callers reuse the same configuration so the tests stay isolated from each
 // other while respecting the "initialize once" contract. Returns the root
 // directory the suite is rooted in.
-inline std::string ensureTestSpillService() {
+inline std::string ensureTestSpillCoordinator() {
   static std::once_flag flag;
   static std::string root;
   std::call_once(flag, [&] {
     root = testSpillDir("bolt_bm_test_spill_root");
     BufferManagerProcessServicesConfig config;
     config.spill.spillDir = root;
-    config.spill.executionMode = SpillExecutionMode::kOwnerThread;
-    config.spill.workerThreadCount = 0; // deterministic owner-thread spill
+    config.spill.workerThreadCount = 1;
     config.spill.cleanupOnDestroy = true;
     config.spill.diskProbeDuration = std::chrono::milliseconds(0);
     config.spill.diskIo.initialQueueDepth = 4;

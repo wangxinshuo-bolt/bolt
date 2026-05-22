@@ -17,7 +17,7 @@
 #include "bolt/common/memory/bm/BufferManagerConfig.h"
 #include "bolt/common/memory/bm/BufferPool.h"
 #include "bolt/common/memory/bm/Evictor.h"
-#include "bolt/common/memory/bm/ProcessSpillService.h"
+#include "bolt/common/memory/bm/SpillCoordinator.h"
 
 namespace bytedance::bolt::memory {
 class MemoryManager;
@@ -28,7 +28,7 @@ namespace bytedance::bolt::memory::bm {
 
 struct BufferManagerContext {
   BufferAllocator& allocator;
-  std::optional<std::reference_wrapper<ProcessSpillService>> spill;
+  std::optional<std::reference_wrapper<SpillCoordinator>> spill;
   std::shared_ptr<SpillOwnerToken> spillOwnerToken;
   std::thread::id ownerThreadId;
   bool valid{true};
@@ -38,12 +38,12 @@ struct BufferManagerContext {
 //   * a dedicated subtree of Bolt's MemoryPool for physical bytes
 //   * a BufferPool that tracks logical usage
 //   * a BufferAllocator pairing the two
-//   * a BlockEvictor wired to the process-wide spill service when needed
+//   * a BlockEvictor wired to the process-wide spill coordinator when needed
 //
 // Threading: BufferManager is thread-confined. All non-static public APIs
 // except the destructor must be called from the thread that constructed the
 // BufferManager. Multiple BufferManagers may be used concurrently by different
-// threads, and process-level spill/disk services are shared and thread-safe.
+// threads, and process-level spill/disk components are shared and thread-safe.
 // BufferManager must outlive every BufferHandle and BlockHandle it produces;
 // the destructor invalidates outstanding blocks first to keep dangling pins
 // from triggering use-after-free.
@@ -186,7 +186,7 @@ class BufferManager {
       const std::shared_ptr<BlockHandle>& block);
   std::shared_ptr<BlockHandle> FindBlockById(uint64_t blockId);
 
-  void EnsureSpillService();
+  void EnsureSpillCoordinator();
 
   MemoryManager& memoryManager_;
   const std::thread::id ownerThreadId_;
@@ -205,7 +205,7 @@ class BufferManager {
   BufferAllocator allocator_;
   std::shared_ptr<SpillOwnerToken> spillOwnerToken_;
   std::shared_ptr<BufferManagerContext> context_;
-  std::optional<std::reference_wrapper<ProcessSpillService>> spillService_;
+  std::optional<std::reference_wrapper<SpillCoordinator>> spillCoordinator_;
   BlockEvictor evictor_;
   bool shuttingDown_{false};
   std::vector<std::weak_ptr<BlockHandle>> blocks_;

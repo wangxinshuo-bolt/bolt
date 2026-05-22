@@ -13,7 +13,7 @@
 namespace bytedance::bolt::memory::bm {
 
 // Coarse storage disk classification used to select spill defaults.
-// kUnknown only appears as an intermediate value; after SpillStore
+// kUnknown only appears as an intermediate value; after SpillFileStore
 // construction, Disk() returns a concrete kind selected from forced, probed,
 // or fallback configuration.
 enum class DiskKind : uint8_t {

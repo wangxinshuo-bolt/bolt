@@ -44,25 +44,25 @@ DEFINE_uint64(
 DEFINE_uint32(
     bm_sort_benchmark_spill_worker_threads,
     4,
-    "ProcessSpillService worker thread count. Use 0 to benchmark explicit "
-    "owner-thread spill mode.");
+    "SpillCoordinator worker thread count. Must be greater than zero; "
+    "BufferManager owner threads submit requests and commit completions.");
 DEFINE_uint32(
     bm_sort_benchmark_disk_io_initial_queue_depth,
     16,
-    "Initial disk I/O queue depth used by the spill service.");
+    "Initial disk I/O queue depth used by the spill coordinator.");
 DEFINE_uint32(
     bm_sort_benchmark_disk_io_min_queue_depth,
     1,
-    "Minimum adaptive disk I/O queue depth used by the spill service.");
+    "Minimum adaptive disk I/O queue depth used by the spill coordinator.");
 DEFINE_uint32(
     bm_sort_benchmark_disk_io_max_queue_depth,
     64,
-    "Maximum adaptive disk I/O queue depth used by the spill service.");
+    "Maximum adaptive disk I/O queue depth used by the spill coordinator.");
 DEFINE_string(
     bm_sort_benchmark_disk_kind,
     "probe",
     "Disk kind policy: probe, nvme, ssd, hdd, network_fs, or unknown. "
-    "Non-probe values force the spill service disk kind.");
+    "Non-probe values force the spill coordinator disk kind.");
 DEFINE_string(
     bm_sort_benchmark_weighted_block_sizes_kb,
     "1:4,4:8,16:8,64:8,256:8,1024:6,4096:4,8192:3,16384:2,32768:2,65536:1,131072:1",
@@ -845,10 +845,6 @@ BufferManagerProcessServicesConfig makeProcessServicesConfig(
   config.metrics = &metrics;
   config.spill.spillDir = FLAGS_bm_sort_benchmark_spill_dir;
   config.spill.forcedKind = parseDiskKind();
-  config.spill.executionMode =
-      FLAGS_bm_sort_benchmark_spill_worker_threads == 0
-          ? SpillExecutionMode::kOwnerThread
-          : SpillExecutionMode::kWorkerThread;
   config.spill.workerThreadCount =
       FLAGS_bm_sort_benchmark_spill_worker_threads;
   config.spill.cleanupOnDestroy = FLAGS_bm_sort_benchmark_cleanup;
@@ -1188,7 +1184,7 @@ class ConcurrentSortBenchmark {
         snapshot.usedTotalBytes,
         snapshot.usedLoadedBytes,
         snapshot.usedSpilledBytes,
-        ProcessSpillService::Instance().UsedDiskBytes());
+        SpillCoordinator::Instance().UsedDiskBytes());
   }
 
   uint64_t dataBytes_;

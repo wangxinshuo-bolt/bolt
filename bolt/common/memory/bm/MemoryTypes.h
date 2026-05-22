@@ -46,7 +46,7 @@ enum class ReservationKind : uint8_t {
 
 // Per-block externalization strategy selected at Allocate() time:
 //   kSpillToDisk        – evictable: body bytes are written through
-//                         ProcessSpillService and reloaded on Pin().
+//                         SpillCoordinator and reloaded on Pin().
 //   kDiscard            – evictable: body bytes are dropped permanently;
 //                         further Pin() returns an invalid BufferHandle.
 //   kRecompute          – evictable: body bytes are dropped and reproduced

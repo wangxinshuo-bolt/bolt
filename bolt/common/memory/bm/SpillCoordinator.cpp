@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "bolt/common/memory/bm/ProcessSpillService.h"
+#include "bolt/common/memory/bm/SpillCoordinator.h"
 
 #include <algorithm>
 #include <csignal>
@@ -25,8 +25,8 @@ namespace {
 struct SingletonState {
   std::mutex mutex;
   bool configured{false};
-  ProcessSpillServiceConfig pendingConfig;
-  std::unique_ptr<ProcessSpillService> instance;
+  SpillCoordinatorConfig pendingConfig;
+  std::unique_ptr<SpillCoordinator> instance;
 };
 
 SingletonState& globalState() {
@@ -34,21 +34,15 @@ SingletonState& globalState() {
   return state;
 }
 
-void validateSpillExecutionConfig(const ProcessSpillServiceConfig& config) {
-  if (config.executionMode == SpillExecutionMode::kWorkerThread) {
-    BOLT_USER_CHECK(
-        config.workerThreadCount > 0,
-        "worker-thread spill requires workerThreadCount > 0");
-  } else {
-    BOLT_USER_CHECK(
-        config.workerThreadCount == 0,
-        "owner-thread spill does not use ProcessSpillService workers");
-  }
+void validateSpillCoordinatorConfig(const SpillCoordinatorConfig& config) {
+  BOLT_USER_CHECK(
+      config.workerThreadCount > 0,
+      "BufferManager spill requires workerThreadCount > 0");
 }
 
 } // namespace
 
-ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
+SpillCoordinator::SpillCoordinator(SpillCoordinatorConfig config)
     : config_(std::move(config)),
       metrics_(EffectiveMetricsRegistry(config_.metrics)),
       submitCounter_(metrics_.GetCounter("bm_spill_submit_total", "")),
@@ -65,12 +59,12 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
           metrics_.GetHistogram("bm_spill_execute_duration_us", "")),
       waitForProgressDuration_(
           metrics_.GetHistogram("bm_wait_for_spill_progress_duration_us", "")) {
-  validateSpillExecutionConfig(config_);
+  validateSpillCoordinatorConfig(config_);
   BOLT_USER_CHECK(
       !config_.spillDir.empty(),
-      "ProcessSpillService requires a spill directory");
+      "SpillCoordinator requires a spill directory");
   CleanupStaleDirsAtStartup();
-  SpillStoreConfig storeCfg;
+  SpillFileStoreConfig storeCfg;
   storeCfg.spillDir = config_.spillDir;
   storeCfg.cleanupOnDestroy = config_.cleanupOnDestroy;
   storeCfg.forcedKind = config_.forcedKind;
@@ -83,17 +77,13 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
   probeConfig.forcedKind = storeCfg.forcedKind;
   probeConfig.fallbackKind = storeCfg.unknownFallbackKind;
   storeCfg.diskProbe = ProbeDisk(probeConfig);
-  ProcessDiskIoService::ConfigureDefaultIfNeeded(config_.diskIo);
-  SpillStore::CleanupAtStartup(storeCfg);
-  store_ = std::make_unique<SpillStore>(storeCfg, config_.metrics);
-  StartWorkers();
-  BOLT_MEM_LOG(INFO) << "ProcessSpillService initialized"
+  auto diskIoConfig = config_.diskIo;
+  diskIoConfig.workerThreadCount = config_.workerThreadCount;
+  DiskIoTaskExecutor::ConfigureDefaultIfNeeded(diskIoConfig);
+  SpillFileStore::CleanupAtStartup(storeCfg);
+  store_ = std::make_unique<SpillFileStore>(storeCfg, config_.metrics);
+  BOLT_MEM_LOG(INFO) << "SpillCoordinator initialized"
                      << " spillDir=" << config_.spillDir
-                     << " executionMode="
-                     << (config_.executionMode ==
-                             SpillExecutionMode::kWorkerThread
-                         ? "worker_thread"
-                         : "owner_thread")
                      << " workerThreadCount=" << config_.workerThreadCount
                      << " cleanupOnDestroy=" << config_.cleanupOnDestroy
                      << " diskKind=" << ToString(storeCfg.diskProbe.kind)
@@ -102,12 +92,12 @@ ProcessSpillService::ProcessSpillService(ProcessSpillServiceConfig config)
                      << " readIops=" << storeCfg.diskProbe.readIops;
 }
 
-ProcessSpillService::~ProcessSpillService() {
-  StopWorkers();
+SpillCoordinator::~SpillCoordinator() {
+  StopAsyncTasks();
   store_.reset();
 }
 
-ProcessSpillService& ProcessSpillService::Instance() {
+SpillCoordinator& SpillCoordinator::Instance() {
   auto& state = globalState();
   std::lock_guard<std::mutex> l(state.mutex);
   if (state.instance != nullptr) {
@@ -115,55 +105,52 @@ ProcessSpillService& ProcessSpillService::Instance() {
   }
   BOLT_USER_CHECK(
       state.configured,
-      "ProcessSpillService::Instance() called without ConfigureDefault");
+      "SpillCoordinator::Instance() called without ConfigureDefault");
   state.instance.reset(
-      new ProcessSpillService(std::move(state.pendingConfig)));
+      new SpillCoordinator(std::move(state.pendingConfig)));
   return *state.instance;
 }
 
-void ProcessSpillService::ConfigureDefault(ProcessSpillServiceConfig config) {
+void SpillCoordinator::ConfigureDefault(SpillCoordinatorConfig config) {
   auto& state = globalState();
   std::lock_guard<std::mutex> l(state.mutex);
   BOLT_USER_CHECK(
       !state.configured && state.instance == nullptr,
-      "ProcessSpillService::ConfigureDefault may be called only once");
+      "SpillCoordinator::ConfigureDefault may be called only once");
   BOLT_USER_CHECK(
       !config.spillDir.empty(),
-      "ProcessSpillServiceConfig.spillDir must not be empty");
-  validateSpillExecutionConfig(config);
+      "SpillCoordinatorConfig.spillDir must not be empty");
+  validateSpillCoordinatorConfig(config);
   state.pendingConfig = std::move(config);
   state.configured = true;
 }
 
-void ProcessSpillService::ResetForTesting() {
+void SpillCoordinator::ResetForTesting() {
   auto& state = globalState();
-  std::unique_ptr<ProcessSpillService> dying;
+  std::unique_ptr<SpillCoordinator> dying;
   {
     std::lock_guard<std::mutex> l(state.mutex);
     dying = std::move(state.instance);
     state.configured = false;
-    state.pendingConfig = ProcessSpillServiceConfig{};
+    state.pendingConfig = SpillCoordinatorConfig{};
   }
   // Destroy outside the singleton mutex so worker threads can join cleanly.
   dying.reset();
 }
 
-std::unique_ptr<ProcessSpillService> ProcessSpillService::CreateForTesting(
-    ProcessSpillServiceConfig config) {
-  return std::unique_ptr<ProcessSpillService>(
-      new ProcessSpillService(std::move(config)));
+std::unique_ptr<SpillCoordinator> SpillCoordinator::CreateForTesting(
+    SpillCoordinatorConfig config) {
+  return std::unique_ptr<SpillCoordinator>(
+      new SpillCoordinator(std::move(config)));
 }
 
-EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
+EvictResult SpillCoordinator::SubmitSpill(EvictionNode node) {
   ScopedBmTimer timer(submitDuration_);
   submitCounter_.Add(1);
   if (node.block.expired()) {
     skippedCounter_.Add(1);
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
-  BOLT_USER_CHECK(
-      config_.executionMode == SpillExecutionMode::kWorkerThread,
-      "ProcessSpillService::SubmitSpill requires worker-thread spill mode");
   auto base = node.block.lock();
   if (base == nullptr) {
     skippedCounter_.Add(1);
@@ -179,7 +166,6 @@ EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
     skippedCounter_.Add(1);
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
-  size_t queueDepth = 0;
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (stopping_) {
@@ -188,18 +174,31 @@ EvictResult ProcessSpillService::SubmitSpill(EvictionNode node) {
       failedCounter_.Add(1);
       return EvictResult{EvictResultKind::kFailed, 0};
     }
-    ready_.push_back(std::move(*request));
-    queueDepth = ready_.size();
-    queueDepthGauge_.Set(static_cast<int64_t>(queueDepth));
   }
+  auto spillRequest =
+      std::make_shared<SpillRequest>(std::move(*request));
+  AddActiveOwner(spillRequest->owner);
+  const bool submitted = DiskIoTaskExecutor::Instance().SubmitTask(DiskIoTask{
+      DiskIoPriority::kHigh,
+      [this, request = spillRequest]() mutable {
+        ExecuteSpill(std::move(*request));
+        NotifyProgress();
+      }});
+  if (!submitted) {
+    CompleteActiveOwner(spillRequest->owner);
+    handle->CommitAsyncSpillFailure(
+        node.evictionSequence, std::move(spillRequest->memory));
+    failedCounter_.Add(1);
+    return EvictResult{EvictResultKind::kFailed, 0};
+  }
+  queueDepthGauge_.Set(0);
   scheduledCounter_.Add(1);
-  BOLT_MEM_VLOG(1) << "ProcessSpillService scheduled spill submit"
-                     << " queueDepth=" << queueDepth;
-  cv_.notify_one();
+  BOLT_MEM_VLOG(1) << "SpillCoordinator scheduled spill submit"
+                     << " queueDepth=central_disk_io";
   return EvictResult{EvictResultKind::kScheduled, 0};
 }
 
-bool ProcessSpillService::WaitForProgress(
+bool SpillCoordinator::WaitForProgress(
     ByteCount /*bytesNeeded*/,
     std::chrono::milliseconds timeout) {
   ScopedBmTimer timer(waitForProgressDuration_);
@@ -209,8 +208,8 @@ bool ProcessSpillService::WaitForProgress(
       l, timeout, [&] { return stopping_ || progressEpoch_ != startEpoch; });
 }
 
-std::vector<ProcessSpillService::SpillCompletion>
-ProcessSpillService::DrainCompletions(
+std::vector<SpillCoordinator::SpillCompletion>
+SpillCoordinator::DrainCompletions(
     const std::shared_ptr<SpillOwnerToken>& owner) {
   std::vector<SpillCompletion> completions;
   std::lock_guard<std::mutex> l(mutex_);
@@ -225,8 +224,8 @@ ProcessSpillService::DrainCompletions(
   return completions;
 }
 
-std::vector<ProcessSpillService::PrefetchCompletion>
-ProcessSpillService::DrainPrefetchCompletions(
+std::vector<SpillCoordinator::PrefetchCompletion>
+SpillCoordinator::DrainPrefetchCompletions(
     const std::shared_ptr<SpillOwnerToken>& owner) {
   std::vector<PrefetchCompletion> completions;
   std::lock_guard<std::mutex> l(mutex_);
@@ -241,21 +240,9 @@ ProcessSpillService::DrainPrefetchCompletions(
   return completions;
 }
 
-bool ProcessSpillService::HasPendingSpills(
+bool SpillCoordinator::HasPendingSpills(
     const std::shared_ptr<SpillOwnerToken>& owner) const {
   std::lock_guard<std::mutex> l(mutex_);
-  for (const auto& request : ready_) {
-    if (!request.owner.owner_before(owner) &&
-        !owner.owner_before(request.owner)) {
-      return true;
-    }
-  }
-  for (const auto& request : prefetchReady_) {
-    if (!request.owner.owner_before(owner) &&
-        !owner.owner_before(request.owner)) {
-      return true;
-    }
-  }
   for (const auto& completion : completed_) {
     if (!completion.owner.owner_before(owner) &&
         !owner.owner_before(completion.owner)) {
@@ -272,7 +259,7 @@ bool ProcessSpillService::HasPendingSpills(
   return active != activeByOwner_.end() && active->second != 0;
 }
 
-SpillLocation ProcessSpillService::Write(
+SpillLocation SpillCoordinator::Write(
     MemoryTag tag,
     ConstDataPtr src,
     ByteCount bytes) {
@@ -283,14 +270,14 @@ SpillLocation ProcessSpillService::Write(
   return location;
 }
 
-void ProcessSpillService::Read(
+void SpillCoordinator::Read(
     const SpillLocation& location,
     DataPtr dst,
     ByteCount dstCapacity) {
   store_->Read(location, dst, dstCapacity);
 }
 
-void ProcessSpillService::Release(const SpillLocation& location) noexcept {
+void SpillCoordinator::Release(const SpillLocation& location) noexcept {
   if (!location.Valid()) {
     return;
   }
@@ -307,110 +294,29 @@ void ProcessSpillService::Release(const SpillLocation& location) noexcept {
   }
 }
 
-void ProcessSpillService::StartWorkers() {
-  std::lock_guard<std::mutex> l(mutex_);
-  if (started_) {
-    return;
-  }
-  started_ = true;
-  if (config_.executionMode == SpillExecutionMode::kOwnerThread) {
-    queueDepthGauge_.Set(0);
-    return;
-  }
-  const auto workerCount = config_.workerThreadCount;
-  for (uint32_t i = 0; i < workerCount; ++i) {
-    workers_.emplace_back([this] { WorkerLoop(); });
-  }
-  queueDepthGauge_.Set(0);
-  if (workerCount != 0) {
-    BOLT_MEM_LOG(INFO) << "ProcessSpillService started " << workerCount
-                       << " spill workers";
-  }
-}
-
-void ProcessSpillService::StopWorkers() {
+void SpillCoordinator::StopAsyncTasks() {
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (stopping_) {
       return;
     }
     stopping_ = true;
-    while (!ready_.empty()) {
-      auto request = std::move(ready_.front());
-      ready_.pop_front();
-      completed_.push_back(SpillCompletion{
-          request.owner,
-          request.blockId,
-          request.evictionSequence,
-          request.tag,
-          std::move(request.memory),
-          SpillLocation{},
-          "ProcessSpillService stopped before write"});
-    }
-    while (!prefetchReady_.empty()) {
-      auto request = std::move(prefetchReady_.front());
-      prefetchReady_.pop_front();
-      prefetchCompleted_.push_back(PrefetchCompletion{
-          request.owner,
-          request.blockId,
-          request.evictionSequence,
-          request.tag,
-          std::move(request.memory),
-          "ProcessSpillService stopped before read"});
-    }
     queueDepthGauge_.Set(0);
   }
-  cv_.notify_all();
-  for (auto& worker : workers_) {
-    if (worker.joinable()) {
-      worker.join();
+  for (;;) {
+    std::unique_lock<std::mutex> l(mutex_);
+    if (activeByOwner_.empty()) {
+      break;
     }
+    progressCv_.wait_for(
+        l,
+        std::chrono::milliseconds(100),
+        [&] { return activeByOwner_.empty(); });
   }
-  workers_.clear();
   NotifyProgress();
 }
 
-void ProcessSpillService::WorkerLoop() {
-  for (;;) {
-    SpillRequest request;
-    PrefetchRequest prefetch;
-    bool hasSpill = false;
-    bool hasPrefetch = false;
-    {
-      std::unique_lock<std::mutex> l(mutex_);
-      cv_.wait(l, [&] {
-        return stopping_ || !ready_.empty() || !prefetchReady_.empty();
-      });
-      if (stopping_) {
-        return;
-      }
-      if (!ready_.empty()) {
-        request = std::move(ready_.front());
-        ready_.pop_front();
-        hasSpill = true;
-      } else {
-        prefetch = std::move(prefetchReady_.front());
-        prefetchReady_.pop_front();
-        hasPrefetch = true;
-      }
-      const auto ownerToken =
-          hasSpill ? request.owner.lock() : prefetch.owner.lock();
-      if (ownerToken) {
-        ++activeByOwner_[ownerToken];
-      }
-      queueDepthGauge_.Set(
-          static_cast<int64_t>(ready_.size() + prefetchReady_.size()));
-    }
-    if (hasSpill) {
-      ExecuteSpill(std::move(request));
-    } else if (hasPrefetch) {
-      ExecutePrefetch(std::move(prefetch));
-    }
-    NotifyProgress();
-  }
-}
-
-void ProcessSpillService::ExecuteSpill(SpillRequest request) {
+void SpillCoordinator::ExecuteSpill(SpillRequest request) {
   ScopedBmTimer timer(executeDuration_);
   SpillCompletion completion;
   completion.owner = request.owner;
@@ -426,53 +332,54 @@ void ProcessSpillService::ExecuteSpill(SpillRequest request) {
         Write(completion.tag, completion.memory->Data(), bytes);
     executedCounter_.Add(1);
     freedBytesCounter_.Add(bytes);
-    BOLT_MEM_VLOG(1) << "ProcessSpillService wrote async spill bytes="
+    BOLT_MEM_VLOG(1) << "SpillCoordinator wrote async spill bytes="
                      << bytes;
   } catch (const std::exception& e) {
     completion.error = e.what();
     failedCounter_.Add(1);
-    BOLT_MEM_LOG(WARNING) << "ProcessSpillService failed async spill: "
+    BOLT_MEM_LOG(WARNING) << "SpillCoordinator failed async spill: "
                           << e.what();
   }
   {
     std::lock_guard<std::mutex> l(mutex_);
-    if (auto owner = completion.owner.lock()) {
-      auto active = activeByOwner_.find(owner);
-      if (active != activeByOwner_.end()) {
-        if (active->second <= 1) {
-          activeByOwner_.erase(active);
-        } else {
-          --active->second;
-        }
-      }
-    }
     completed_.push_back(std::move(completion));
   }
+  CompleteActiveOwner(request.owner);
 }
 
-EvictResult ProcessSpillService::SubmitPrefetch(PrefetchRequest request) {
+EvictResult SpillCoordinator::SubmitPrefetch(PrefetchRequest request) {
   if (request.owner.expired()) {
     return EvictResult{EvictResultKind::kSkipped, 0};
   }
   BOLT_USER_CHECK_NOT_NULL(
-      request.memory, "ProcessSpillService prefetch requires resident memory");
+      request.memory, "SpillCoordinator prefetch requires resident memory");
   BOLT_USER_CHECK(
       request.location.Valid(),
-      "ProcessSpillService prefetch requires a valid spill location");
+      "SpillCoordinator prefetch requires a valid spill location");
   {
     std::lock_guard<std::mutex> l(mutex_);
     if (stopping_) {
       return EvictResult{EvictResultKind::kFailed, 0};
     }
-    prefetchReady_.push_back(std::move(request));
-    queueDepthGauge_.Set(
-        static_cast<int64_t>(ready_.size() + prefetchReady_.size()));
   }
-  cv_.notify_one();
+  auto prefetchRequest =
+      std::make_shared<PrefetchRequest>(std::move(request));
+  AddActiveOwner(prefetchRequest->owner);
+  const bool submitted = DiskIoTaskExecutor::Instance().SubmitTask(DiskIoTask{
+      DiskIoPriority::kLow,
+      [this, request = prefetchRequest]() mutable {
+        ExecutePrefetch(std::move(*request));
+        NotifyProgress();
+      }});
+  if (!submitted) {
+    CompleteActiveOwner(prefetchRequest->owner);
+    return EvictResult{EvictResultKind::kFailed, 0};
+  }
+  queueDepthGauge_.Set(0);
   return EvictResult{EvictResultKind::kScheduled, 0};
 }
 
-void ProcessSpillService::ExecutePrefetch(PrefetchRequest request) {
+void SpillCoordinator::ExecutePrefetch(PrefetchRequest request) {
   ScopedBmTimer timer(executeDuration_);
   PrefetchCompletion completion;
   completion.owner = request.owner;
@@ -485,31 +392,45 @@ void ProcessSpillService::ExecutePrefetch(PrefetchRequest request) {
         completion.memory, "Async prefetch request has no resident memory");
     Read(request.location, completion.memory->Data(), completion.memory->Size());
     executedCounter_.Add(1);
-    BOLT_MEM_VLOG(1) << "ProcessSpillService read async prefetch bytes="
+    BOLT_MEM_VLOG(1) << "SpillCoordinator read async prefetch bytes="
                      << completion.memory->Size();
   } catch (const std::exception& e) {
     completion.error = e.what();
     failedCounter_.Add(1);
-    BOLT_MEM_LOG(WARNING) << "ProcessSpillService failed async prefetch: "
+    BOLT_MEM_LOG(WARNING) << "SpillCoordinator failed async prefetch: "
                           << e.what();
   }
   {
     std::lock_guard<std::mutex> l(mutex_);
-    if (auto owner = completion.owner.lock()) {
-      auto active = activeByOwner_.find(owner);
-      if (active != activeByOwner_.end()) {
-        if (active->second <= 1) {
-          activeByOwner_.erase(active);
-        } else {
-          --active->second;
-        }
-      }
-    }
     prefetchCompleted_.push_back(std::move(completion));
+  }
+  CompleteActiveOwner(request.owner);
+}
+
+void SpillCoordinator::AddActiveOwner(
+    const std::weak_ptr<SpillOwnerToken>& owner) {
+  if (auto ownerToken = owner.lock()) {
+    std::lock_guard<std::mutex> l(mutex_);
+    ++activeByOwner_[ownerToken];
   }
 }
 
-void ProcessSpillService::NotifyProgress() {
+void SpillCoordinator::CompleteActiveOwner(
+    const std::weak_ptr<SpillOwnerToken>& owner) {
+  if (auto ownerToken = owner.lock()) {
+    std::lock_guard<std::mutex> l(mutex_);
+    auto active = activeByOwner_.find(ownerToken);
+    if (active != activeByOwner_.end()) {
+      if (active->second <= 1) {
+        activeByOwner_.erase(active);
+      } else {
+        --active->second;
+      }
+    }
+  }
+}
+
+void SpillCoordinator::NotifyProgress() {
   {
     std::lock_guard<std::mutex> l(mutex_);
     ++progressEpoch_;
@@ -517,7 +438,7 @@ void ProcessSpillService::NotifyProgress() {
   progressCv_.notify_all();
 }
 
-void ProcessSpillService::CleanupStaleDirsAtStartup() {
+void SpillCoordinator::CleanupStaleDirsAtStartup() {
   // For each configured spill dir, scan its parent for sibling
   // bolt_spill_<pid>_* directories whose pid is no longer alive and remove
   // them. Best-effort and never throws.
@@ -566,11 +487,11 @@ void ProcessSpillService::CleanupStaleDirsAtStartup() {
       std::filesystem::remove_all(entry.path(), rmEc);
       if (rmEc) {
         BOLT_MEM_LOG(WARNING)
-            << "ProcessSpillService failed to clean stale dir "
+            << "SpillCoordinator failed to clean stale dir "
             << entry.path().string() << ": " << rmEc.message();
       } else {
         BOLT_MEM_VLOG(1)
-            << "ProcessSpillService cleaned stale dir "
+            << "SpillCoordinator cleaned stale dir "
             << entry.path().string();
       }
     }

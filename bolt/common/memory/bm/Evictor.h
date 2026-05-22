@@ -29,7 +29,7 @@ class BufferManager;
 // The contract splits sync and async paths to keep the locking simple:
 //   * TryEvictNodeSync handles cheap policies (kFreeOrCheap).
 //     Returns kFreed/kSkipped/kFailed only.
-//   * TryScheduleEvict hands kSpill nodes off to the spill service.
+//   * TryScheduleEvict hands kSpill nodes off to the spill coordinator.
 //     Returns kScheduled/kBackpressured/kSkipped/kFailed only.
 //   * WaitForProgress blocks until the spill subsystem makes forward
 //     progress (kFreed bytes) or the timeout elapses.
@@ -97,7 +97,7 @@ class BlockEvictor : public Evictor {
 
   // Installs or detaches the SpillRequester used by TryScheduleEvict and
   // WaitForProgress. The requester is a non-owning reference to a
-  // process-owned spill service.
+  // process-owned spill coordinator.
   void SetSpillRequester(SpillRequester& requester);
   void ClearSpillRequester();
 

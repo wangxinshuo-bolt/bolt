@@ -55,6 +55,32 @@
 #include <cstdint>
 namespace bytedance::bolt::exec {
 namespace {
+constexpr int64_t kInitialAppendOnlyRowsBufferSize = 1 << 20; // 1MB
+constexpr int64_t kMaxAppendOnlyRowsBufferSize = 32 << 20; // 32MB
+
+class AppendOnlyByteStreamArena : public StreamArena {
+ public:
+  explicit AppendOnlyByteStreamArena(memory::MemoryPool* pool)
+      : StreamArena(pool) {}
+
+  void newRange(int32_t bytes, ByteRange* /*lastRange*/, ByteRange* range)
+      override {
+    buffers_.push_back(AlignedBuffer::allocate<char>(bytes, pool()));
+    range->buffer =
+        reinterpret_cast<uint8_t*>(buffers_.back()->asMutable<char>());
+    range->size = buffers_.back()->size();
+    range->position = 0;
+  }
+
+  void newTinyRange(int32_t bytes, ByteRange* lastRange, ByteRange* range)
+      override {
+    newRange(bytes, lastRange, range);
+  }
+
+ private:
+  std::vector<BufferPtr> buffers_;
+};
+
 template <TypeKind Kind>
 static int32_t kindSize() {
   return sizeof(typename KindToFlatVector<Kind>::HashRowType);
@@ -340,6 +366,22 @@ RowContainer::RowContainer(
   }
 }
 
+RowContainer::RowContainer(const RowContainerParam& param)
+    : RowContainer(
+          param.keyTypes,
+          param.nullableKeys,
+          param.accumulators,
+          param.dependentTypes,
+          param.hasNext,
+          param.isJoinBuild,
+          param.hasProbedFlag,
+          param.hasNormalizedKeys,
+          param.useListRowIndex,
+          param.pool,
+          param.stringAllocator) {
+  appendOnly_ = param.appendOnly;
+}
+
 RowContainer::~RowContainer() {
   clear();
 }
@@ -348,7 +390,41 @@ char* RowContainer::newRow() {
   BOLT_DCHECK(mutable_, "Can't add row into an immutable row container");
   ++numRows_;
   char* row;
-  if (firstFreeRow_) {
+  if (appendOnly_) {
+    const auto size = fixedRowSize_ + normalizedKeySize_;
+    if (currRowsBufferPosition_ &&
+        currRowsBufferPosition_ + size < currRowsBufferEnd_) {
+      row = currRowsBufferPosition_ + normalizedKeySize_;
+      currRowsBufferPosition_ += size;
+    } else {
+      if (!rowsBuffers_.empty() &&
+          rowsBuffers_.back()->size() < kMaxAppendOnlyRowsBufferSize) {
+        auto& buffer = rowsBuffers_.back();
+        const auto usedBytes =
+            currRowsBufferPosition_ - buffer->asMutable<char>();
+        const auto newSize =
+            std::max<int64_t>(buffer->size() * 2, usedBytes + size);
+        AlignedBuffer::reallocate<char>(&buffer, newSize);
+        currRowsBufferPosition_ = buffer->asMutable<char>() + usedBytes;
+        currRowsBufferEnd_ = buffer->asMutable<char>() + buffer->size();
+      } else {
+        rowsBuffers_.push_back(AlignedBuffer::allocate<char>(
+            std::max<int64_t>(kInitialAppendOnlyRowsBufferSize, size),
+            rows_.pool()));
+        currRowsBufferPosition_ = rowsBuffers_.back()->asMutable<char>();
+        currRowsBufferEnd_ =
+            currRowsBufferPosition_ + rowsBuffers_.back()->size();
+      }
+      row = currRowsBufferPosition_ + normalizedKeySize_;
+      currRowsBufferPosition_ += size;
+    }
+    if (normalizedKeySize_) {
+      ++numRowsWithNormalizedKey_;
+    }
+    if (useListRowIndex_) {
+      rowPointers_.push_back(row);
+    }
+  } else if (firstFreeRow_) {
     row = firstFreeRow_;
     BOLT_CHECK(bits::isBitSet(row, freeFlagOffset_));
     firstFreeRow_ = nextFree(row);
@@ -387,6 +463,69 @@ char* RowContainer::initializeRow(char* row, bool reuse) {
   }
   bits::clearBit(row, freeFlagOffset_);
   return row;
+}
+
+char* RowContainer::allocateAppendOnlyString(int32_t size) {
+  using Header = HashStringAllocator::Header;
+  const auto allocationSize =
+      bits::roundUp<int32_t>(sizeof(Header) + size, alignof(Header));
+  if (!currStringPosition_ ||
+        currStringPosition_ + allocationSize >= currStringBufferEnd_) {
+    if (!stringBuffers_.empty() &&
+        stringBuffers_.back()->size() < kMaxAppendOnlyRowsBufferSize) {
+      auto& buffer = stringBuffers_.back();
+      const auto usedBytes = currStringPosition_ - buffer->asMutable<char>();
+      const auto newSize =
+          std::max<int64_t>(buffer->size() * 2, usedBytes + allocationSize);
+      AlignedBuffer::reallocate<char>(&buffer, newSize);
+      currStringPosition_ = buffer->asMutable<char>() + usedBytes;
+      currStringBufferEnd_ = buffer->asMutable<char>() + buffer->size();
+    } else {
+      stringBuffers_.push_back(AlignedBuffer::allocate<char>(
+          std::max<int64_t>(kInitialAppendOnlyRowsBufferSize, allocationSize),
+          rows_.pool()));
+      currStringPosition_ = stringBuffers_.back()->asMutable<char>();
+      currStringBufferEnd_ =
+          currStringPosition_ + stringBuffers_.back()->size();
+    }
+  }
+
+  auto* header = new (currStringPosition_) Header(size);
+  currStringPosition_ += allocationSize;
+  return header->begin();
+}
+
+void RowContainer::storeStringView(StringView value, char* row, int32_t offset) {
+  if (appendOnly_) {
+    storeStringViewAppendOnly(value, row, offset);
+  } else {
+    storeStringViewWithAllocator(value, row, offset);
+  }
+}
+
+void RowContainer::storeStringViewAppendOnly(
+    StringView value,
+    char* row,
+    int32_t offset) {
+  if (value.isInline()) {
+    valueAt<StringView>(row, offset) = value;
+    return;
+  }
+
+  auto* data = allocateAppendOnlyString(value.size());
+  memcpy(data, value.data(), value.size());
+  valueAt<StringView>(row, offset) = StringView(data, value.size());
+  if (rowSizeOffset_) {
+    incrementRowSize(row, value.size());
+  }
+}
+
+void RowContainer::storeStringViewWithAllocator(
+    StringView value,
+    char* row,
+    int32_t offset) {
+  RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
+  stringAllocator_->copyMultipart(value, row, offset);
 }
 
 void RowContainer::eraseRows(folly::Range<char**> rows) {
@@ -446,28 +585,30 @@ int32_t RowContainer::findRows(folly::Range<char**> rows, char** result) {
 }
 
 void RowContainer::eraseRowsSkippingKeys(folly::Range<char**> rows) {
-  for (auto i = 0; i < types_.size(); ++i) {
-    if (i < keyTypes_.size()) {
-      continue;
-    }
-    switch (typeKinds_[i]) {
-      case TypeKind::VARCHAR:
-      case TypeKind::VARBINARY:
-      case TypeKind::ROW:
-      case TypeKind::ARRAY:
-      case TypeKind::MAP: {
-        auto column = columnAt(i);
-        for (auto row : rows) {
-          if (!isNullAt(row, column.nullByte(), column.nullMask())) {
-            StringView view = valueAt<StringView>(row, column.offset());
-            if (!view.isInline()) {
-              stringAllocator_->free(
-                  HashStringAllocator::headerOf(view.data()));
+  if (!appendOnly_) {
+    for (auto i = 0; i < types_.size(); ++i) {
+      if (i < keyTypes_.size()) {
+        continue;
+      }
+      switch (typeKinds_[i]) {
+        case TypeKind::VARCHAR:
+        case TypeKind::VARBINARY:
+        case TypeKind::ROW:
+        case TypeKind::ARRAY:
+        case TypeKind::MAP: {
+          auto column = columnAt(i);
+          for (auto row : rows) {
+            if (!isNullAt(row, column.nullByte(), column.nullMask())) {
+              StringView view = valueAt<StringView>(row, column.offset());
+              if (!view.isInline()) {
+                stringAllocator_->free(
+                    HashStringAllocator::headerOf(view.data()));
+              }
             }
           }
-        }
-      } break;
-      default:;
+        } break;
+        default:;
+      }
     }
   }
 
@@ -483,6 +624,10 @@ void RowContainer::eraseRowsSkippingKeys(folly::Range<char**> rows) {
 }
 
 void RowContainer::freeVariableWidthFields(folly::Range<char**> rows) {
+  if (appendOnly_) {
+    return;
+  }
+
   for (auto i = 0; i < types_.size(); ++i) {
     switch (typeKinds_[i]) {
       case TypeKind::VARCHAR:
@@ -645,21 +790,29 @@ int32_t RowContainer::storeVariableSizeAt(
   const auto size = *reinterpret_cast<const int32_t*>(data);
 
   if (typeKind == TypeKind::VARCHAR || typeKind == TypeKind::VARBINARY) {
-    valueAt<StringView>(row, rowColumn.offset()) = StringView(data + 4, size);
     if (size > 0) {
-      stringAllocator_->copyMultipart(
-          StringView(data + 4, size), row, rowColumn.offset());
+      storeStringView(StringView(data + 4, size), row, rowColumn.offset());
     } else {
       valueAt<StringView>(row, rowColumn.offset()) = StringView();
     }
   } else {
     if (size > 0) {
-      ByteOutputStream stream(stringAllocator_.get(), false, false);
-      const auto position = stringAllocator_->newWrite(stream);
-      stream.appendStringView(std::string_view(data + 4, size));
-      stringAllocator_->finishWrite(stream, 0);
-      valueAt<std::string_view>(row, rowColumn.offset()) =
-          std::string_view(reinterpret_cast<char*>(position.position), size);
+      if (appendOnly_) {
+        auto* position = allocateAppendOnlyString(size);
+        memcpy(position, data + 4, size);
+        valueAt<std::string_view>(row, rowColumn.offset()) =
+            std::string_view(position, size);
+        if (rowSizeOffset_) {
+          incrementRowSize(row, size);
+        }
+      } else {
+        ByteOutputStream stream(stringAllocator_.get(), false, false);
+        const auto position = stringAllocator_->newWrite(stream);
+        stream.appendStringView(std::string_view(data + 4, size));
+        stringAllocator_->finishWrite(stream, 0);
+        valueAt<std::string_view>(row, rowColumn.offset()) =
+            std::string_view(reinterpret_cast<char*>(position.position), size);
+      }
     } else {
       valueAt<std::string_view>(row, rowColumn.offset()) = std::string_view();
     }
@@ -772,24 +925,37 @@ void RowContainer::copySerializedRow(
       StringView& sv =
           *reinterpret_cast<StringView*>(serializedRow + rowColumn.offset());
       if (!sv.isInline()) {
+        if (appendOnly_) {
+          storeStringViewAppendOnly(sv, newRow, rowColumn.offset());
+        } else {
+          *(int32_t*)(newRow + rowSizeOffset_) += sv.size();
+          ByteOutputStream stream(stringAllocator_.get(), false, false);
+          const auto position = stringAllocator_->newWrite(stream);
+          stream.appendStringView(sv);
+          stringAllocator_->finishWrite(stream, 0);
+          valueAt<StringView>(newRow, rowColumn.offset()) =
+              StringView(reinterpret_cast<char*>(position.position), sv.size());
+        }
+      }
+    } else {
+      auto& sv = *reinterpret_cast<std::string_view*>(
+          serializedRow + rowColumn.offset());
+      if (appendOnly_) {
+        auto* position = allocateAppendOnlyString(sv.size());
+        memcpy(position, sv.data(), sv.size());
+        valueAt<std::string_view>(newRow, rowColumn.offset()) =
+            std::string_view(position, sv.size());
+        incrementRowSize(newRow, sv.size());
+      } else {
         *(int32_t*)(newRow + rowSizeOffset_) += sv.size();
         ByteOutputStream stream(stringAllocator_.get(), false, false);
         const auto position = stringAllocator_->newWrite(stream);
         stream.appendStringView(sv);
         stringAllocator_->finishWrite(stream, 0);
-        valueAt<StringView>(newRow, rowColumn.offset()) =
-            StringView(reinterpret_cast<char*>(position.position), sv.size());
+        valueAt<std::string_view>(newRow, rowColumn.offset()) =
+            std::string_view(
+                reinterpret_cast<char*>(position.position), sv.size());
       }
-    } else {
-      auto& sv = *reinterpret_cast<std::string_view*>(
-          serializedRow + rowColumn.offset());
-      *(int32_t*)(newRow + rowSizeOffset_) += sv.size();
-      ByteOutputStream stream(stringAllocator_.get(), false, false);
-      const auto position = stringAllocator_->newWrite(stream);
-      stream.appendStringView(sv);
-      stringAllocator_->finishWrite(stream, 0);
-      valueAt<std::string_view>(newRow, rowColumn.offset()) = std::string_view(
-          reinterpret_cast<char*>(position.position), sv.size());
     }
   }
 }
@@ -806,7 +972,10 @@ void RowContainer::storeSerializedRow(
   memcpy(row + rowColumns_[0].nullByte(), serialized.data(), nullBytes);
   offset += nullBytes;
 
-  RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
+  std::optional<RowSizeTracker<char>> tracker;
+  if (!appendOnly_) {
+    tracker.emplace(row[rowSizeOffset_], *stringAllocator_);
+  }
   for (auto i = 0; i < types_.size(); ++i) {
     const auto& type = types_[i];
     if (type->isFixedWidth()) {
@@ -854,6 +1023,26 @@ void RowContainer::storeComplexType(
     return;
   }
   // RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
+  if (appendOnly_) {
+    AppendOnlyByteStreamArena arena(rows_.pool());
+    ByteOutputStream stream(&arena, false, false);
+    stream.startWrite(128);
+    ContainerRowSerdeOptions options{.isKey = isKey};
+    ContainerRowSerde::serialize(
+        *decoded.base(), decoded.index(index), stream, options);
+
+    auto input = stream.inputStream();
+    const auto size = input->size();
+    input->seekp(0);
+    auto* position = allocateAppendOnlyString(size);
+    input->readBytes(position, size);
+    valueAt<std::string_view>(row, offset) = std::string_view(position, size);
+    if (rowSizeOffset_) {
+      incrementRowSize(row, size);
+    }
+    return;
+  }
+
   ByteOutputStream stream(stringAllocator_.get(), false, false);
   auto position = stringAllocator_->newWrite(stream);
   ContainerRowSerdeOptions options{.isKey = isKey};
@@ -1061,6 +1250,12 @@ void RowContainer::clear() {
     }
   }
   rows_.clear();
+  rowsBuffers_.clear();
+  currRowsBufferPosition_ = nullptr;
+  currRowsBufferEnd_ = nullptr;
+  stringBuffers_.clear();
+  currStringPosition_ = nullptr;
+  currStringBufferEnd_ = nullptr;
   rowPointers_.clear();
   rowPointers_.shrink_to_fit();
   if (!sharedStringAllocator) {
@@ -1074,6 +1269,40 @@ void RowContainer::clear() {
   normalizedKeySize_ = originalNormalizedKeySize_;
   numFreeRows_ = 0;
   firstFreeRow_ = nullptr;
+}
+
+uint64_t RowContainer::rowBufferAllocatedBytes() const {
+  uint64_t size = 0;
+  for (const auto& buffer : rowsBuffers_) {
+    size += buffer->size();
+  }
+  return size;
+}
+
+uint64_t RowContainer::rowBufferUsedBytes() const {
+  if (rowsBuffers_.empty()) {
+    return 0;
+  }
+
+  return rowBufferAllocatedBytes() -
+      (currRowsBufferEnd_ - currRowsBufferPosition_);
+}
+
+uint64_t RowContainer::stringBufferAllocatedBytes() const {
+  uint64_t size = 0;
+  for (const auto& buffer : stringBuffers_) {
+    size += buffer->size();
+  }
+  return size;
+}
+
+uint64_t RowContainer::stringBufferUsedBytes() const {
+  if (stringBuffers_.empty()) {
+    return 0;
+  }
+
+  return stringBufferAllocatedBytes() -
+      (currStringBufferEnd_ - currStringPosition_);
 }
 
 void RowContainer::setProbedFlag(char** rows, int32_t numRows) {
@@ -1124,6 +1353,13 @@ std::optional<int64_t> RowContainer::estimateRowSize() const {
   if (numRows_ == 0) {
     return std::nullopt;
   }
+  if (appendOnly_) {
+    const auto usedSize = usedBytes() - rowPointers_.capacity() * sizeof(char*);
+    auto rowSize = usedSize / numRows_;
+    BOLT_CHECK_GT(
+        rowSize, 0, "Estimated row size of the RowContainer must be positive.");
+    return rowSize;
+  }
   int64_t freeBytes = rows_.freeBytes() + fixedRowSize_ * numFreeRows_;
   int64_t usedSize = rows_.allocatedBytes() - freeBytes +
       stringAllocator_->retainedSize() - stringAllocator_->freeSpace() -
@@ -1141,6 +1377,20 @@ int64_t RowContainer::sizeIncrement(
   // minimum increment is a huge page.
   constexpr int32_t kAllocUnit = memory::AllocationTraits::kHugePageSize;
   int32_t needRows = std::max<int64_t>(0, numRows - numFreeRows_);
+  if (appendOnly_) {
+    const auto rowFreeBytes = currRowsBufferEnd_ && currRowsBufferPosition_
+        ? currRowsBufferEnd_ - currRowsBufferPosition_
+        : 0;
+    const auto stringFreeBytes = currStringBufferEnd_ && currStringPosition_
+        ? currStringBufferEnd_ - currStringPosition_
+        : 0;
+    const auto needRowBytes = std::max<int64_t>(
+        0, needRows * (fixedRowSize_ + normalizedKeySize_) - rowFreeBytes);
+    const auto needStringBytes =
+        std::max<int64_t>(0, variableLengthBytes - stringFreeBytes);
+    return bits::roundUp(needRowBytes, kAllocUnit) +
+        bits::roundUp(needStringBytes, kAllocUnit);
+  }
   int64_t needBytes =
       std::max<int64_t>(0, variableLengthBytes - stringAllocator_->freeSpace());
   return bits::roundUp(needRows * fixedRowSize_, kAllocUnit) +

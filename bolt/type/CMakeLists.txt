@@ -53,7 +53,9 @@ bolt_add_library(
   FloatingPointUtil.cpp
   HugeInt.cpp
   StringView.cpp
+  StringViewBase.cpp
   StringView.h
+  StringViewBase.h
   Subfield.cpp
   Timestamp.cpp
   TimestampConversion.cpp

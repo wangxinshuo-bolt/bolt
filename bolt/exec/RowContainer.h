@@ -107,6 +107,22 @@ class Accumulator {
   const Aggregate* aggregate_;
 };
 
+struct RowContainerParam {
+  const std::vector<TypePtr>& keyTypes;
+  std::vector<Accumulator>& accumulators;
+  std::vector<TypePtr>& dependentTypes;
+  bool nullableKeys;
+  bool hasNext;
+  bool isJoinBuild;
+  bool hasProbedFlag;
+  bool hasNormalizedKeys;
+  bool useListRowIndex;
+
+  bool appendOnly;
+  memory::MemoryPool* pool;
+  std::shared_ptr<HashStringAllocator> stringAllocator;
+};
+
 using normalized_key_t = uint64_t;
 
 typedef int8_t (*RowRowCompare)(const char*, const char*);
@@ -284,6 +300,8 @@ class RowContainer {
       bool useListRowIndex,
       memory::MemoryPool* FOLLY_NONNULL pool,
       std::shared_ptr<HashStringAllocator> stringAllocator = nullptr);
+
+  RowContainer(const RowContainerParam& param);
 
   /// Allocates a new row and initializes possible aggregates to null.
   char* FOLLY_NONNULL newRow();
@@ -752,10 +770,16 @@ class RowContainer {
       uint64_t* FOLLY_NONNULL result);
 
   uint64_t allocatedBytes() const {
+    if (appendOnly_) {
+      return rowBufferAllocatedBytes() + stringBufferAllocatedBytes();
+    }
     return rows_.allocatedBytes() + stringAllocator_->retainedSize();
   }
 
   uint64_t usedBytes() const {
+    if (appendOnly_) {
+      return rowBufferUsedBytes() + stringBufferUsedBytes();
+    }
     return rows_.allocatedBytes() - rows_.freeBytes() +
         stringAllocator_->retainedSize() - stringAllocator_->freeSpace();
   }
@@ -764,6 +788,18 @@ class RowContainer {
   /// growing the container and the number of unused bytes of reserved storage
   /// for variable length data.
   std::pair<uint64_t, uint64_t> freeSpace() const {
+    if (appendOnly_) {
+      const auto rowSize = fixedRowSize_ + normalizedKeySize_;
+      const auto rowFreeBytes = currRowsBufferEnd_ && currRowsBufferPosition_
+          ? currRowsBufferEnd_ - currRowsBufferPosition_
+          : 0;
+      const auto stringFreeBytes = currStringBufferEnd_ && currStringPosition_
+          ? currStringBufferEnd_ - currStringPosition_
+          : 0;
+      return std::make_pair<uint64_t, uint64_t>(
+          rowSize == 0 ? 0 : rowFreeBytes / rowSize,
+          stringFreeBytes);
+    }
     return std::make_pair<uint64_t, uint64_t>(
         rows_.freeBytes() / fixedRowSize_ + numFreeRows_,
         stringAllocator_->freeSpace());
@@ -1055,8 +1091,7 @@ class RowContainer {
       return;
     }
     if constexpr (std::is_same_v<T, StringView>) {
-      RowSizeTracker tracker(row[rowSizeOffset_], *stringAllocator_);
-      stringAllocator_->copyMultipart(decoded.valueAt<T>(index), row, offset);
+      storeStringView(decoded.valueAt<T>(index), row, offset);
     } else {
       *reinterpret_cast<T*>(row + offset) = decoded.valueAt<T>(index);
     }
@@ -1071,8 +1106,7 @@ class RowContainer {
       int32_t offset) {
     using T = typename TypeTraits<Kind>::NativeType;
     if constexpr (std::is_same_v<T, StringView>) {
-      RowSizeTracker tracker(group[rowSizeOffset_], *stringAllocator_);
-      stringAllocator_->copyMultipart(decoded.valueAt<T>(index), group, offset);
+      storeStringView(decoded.valueAt<T>(index), group, offset);
     } else {
       *reinterpret_cast<T*>(group + offset) = decoded.valueAt<T>(index);
     }
@@ -1430,6 +1464,22 @@ class RowContainer {
   // Free any aggregates associated with the 'rows'.
   void freeAggregates(folly::Range<char**> rows);
 
+  char* allocateAppendOnlyString(int32_t size);
+
+  void storeStringView(StringView value, char* row, int32_t offset);
+
+  void storeStringViewAppendOnly(StringView value, char* row, int32_t offset);
+
+  void storeStringViewWithAllocator(StringView value, char* row, int32_t offset);
+
+  uint64_t rowBufferAllocatedBytes() const;
+
+  uint64_t rowBufferUsedBytes() const;
+
+  uint64_t stringBufferAllocatedBytes() const;
+
+  uint64_t stringBufferUsedBytes() const;
+
   const bool checkFree_ = false;
 
   const std::vector<TypePtr> keyTypes_;
@@ -1441,6 +1491,8 @@ class RowContainer {
   // after user calls 'getRowPartitions()' to create 'rowPartitions' object for
   // parallel join build.
   bool mutable_{true};
+
+  bool appendOnly_{false};
 
   std::vector<Accumulator> accumulators_;
 
@@ -1495,6 +1547,13 @@ class RowContainer {
   memory::AllocationPool rows_;
   std::shared_ptr<HashStringAllocator> stringAllocator_;
   std::vector<char*, StlAllocator<char*>> rowPointers_;
+
+  std::vector<BufferPtr> rowsBuffers_;
+  char* currRowsBufferPosition_{nullptr};
+  char* currRowsBufferEnd_{nullptr};
+  std::vector<BufferPtr> stringBuffers_;
+  char* currStringPosition_{nullptr};
+  char* currStringBufferEnd_{nullptr};
 
   int alignment_ = 1;
 };

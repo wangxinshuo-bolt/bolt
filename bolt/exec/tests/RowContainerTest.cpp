@@ -349,6 +349,32 @@ class RowContainerTest : public exec::test::RowContainerTestBase,
     return rowContainer;
   }
 
+  std::unique_ptr<RowContainer> roundTripAppendOnly(const VectorPtr& input) {
+    std::vector<TypePtr> types{input->type()};
+    std::vector<Accumulator> accumulators;
+    std::vector<TypePtr> dependentTypes;
+    RowContainerParam param{
+        types,
+        accumulators,
+        dependentTypes,
+        true, // nullableKeys
+        false, // hasNext
+        false, // isJoinBuild
+        false, // hasProbedFlag
+        false, // hasNormalizedKeys
+        false, // useListRowIndex
+        true, // appendOnly
+        pool_.get(),
+        nullptr};
+    auto rowContainer = std::make_unique<RowContainer>(param);
+
+    auto size = input->size();
+    DecodedVector decoded(*input);
+    auto rows = store(*rowContainer, decoded, size);
+    testExtractColumn(*rowContainer, rows, 0, input);
+    return rowContainer;
+  }
+
   void storeAndExtract(const VectorPtr& input) {
     // Create row container.
     std::vector<TypePtr> types{input->type()};
@@ -775,6 +801,58 @@ TEST_F(RowContainerTest, storeExtractArrayOfBoolean) {
   elements[1].emplace_back(bools[3]);
   auto input = vectorMaker.arrayVector<bool>(elements);
   roundTrip(input);
+}
+
+TEST_F(RowContainerTest, storeExtractVarchar) {
+  std::vector<std::string> strings{
+      "varchar_value_longer_than_twenty_chars",
+      "another_string_definitely_over_20"};
+
+  auto input = vectorMaker_.flatVector<StringView>(
+      strings.size(), [&](auto row) { return StringView(strings[row]); });
+
+  roundTrip(input);
+}
+
+TEST_F(RowContainerTest, storeExtractArrayOfDouble) {
+  bytedance::bolt::test::VectorMaker vectorMaker{pool_.get()};
+  std::vector<double> doubles{1.25, 2.5, 3.75, 5.0};
+  std::vector<std::vector<double>> elements(2);
+  elements[0].emplace_back(doubles[0]);
+  elements[0].emplace_back(doubles[1]);
+  elements[1].emplace_back(doubles[2]);
+  elements[1].emplace_back(doubles[3]);
+  auto input = vectorMaker.arrayVector<double>(elements);
+  roundTrip(input);
+}
+
+TEST_F(RowContainerTest, appendOnlyStoreExtractVarchar) {
+  std::vector<std::string> strings{
+      "short",
+      "varchar_value_longer_than_inline_storage",
+      "another_long_varchar_value_for_append_only"};
+
+  auto input = vectorMaker_.flatVector<StringView>(
+      strings.size(), [&](auto row) { return StringView(strings[row]); });
+
+  roundTripAppendOnly(input);
+}
+
+TEST_F(RowContainerTest, appendOnlyStoreExtractComplexType) {
+  std::vector<std::string> strings{
+      "array_value_longer_than_inline_storage",
+      "another_array_value_longer_than_inline_storage",
+      "short",
+      "yet_another_array_value_longer_than_inline_storage"};
+  std::vector<std::vector<StringView>> elements(2);
+  elements[0].emplace_back(strings[0]);
+  elements[0].emplace_back(strings[1]);
+  elements[1].emplace_back(strings[2]);
+  elements[1].emplace_back(strings[3]);
+
+  auto input = vectorMaker_.arrayVector<StringView>(elements);
+
+  roundTripAppendOnly(input);
 }
 
 TEST_P(RowContainerTest, types) {

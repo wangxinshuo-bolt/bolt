@@ -34,133 +34,8 @@
 #include "bolt/common/base/SimdUtil.h"
 #include "bolt/common/memory/RawVector.h"
 #include "bolt/common/time/Timer.h"
-#include "bolt/type/StringViewBase.h"
 #include "bolt/type/Type.h"
 using namespace bytedance::bolt;
-
-template <size_t kPrefixLen>
-void assertStringViewBaseBasicBehavior() {
-  using View = StringViewBase<kPrefixLen>;
-
-  const std::string shortText = "inline-value";
-  View inlineView(shortText.data(), shortText.size());
-  EXPECT_TRUE(inlineView.isInline());
-  EXPECT_EQ(inlineView.size(), shortText.size());
-  EXPECT_EQ(inlineView.materialize(), shortText);
-  EXPECT_NE(inlineView.data(), shortText.data());
-  EXPECT_EQ(inlineView.value(), nullptr);
-
-  const std::string longText(View::kInlineSize + 5, 'x');
-  View outlineView(longText.data(), longText.size());
-  EXPECT_FALSE(outlineView.isInline());
-  EXPECT_EQ(outlineView.size(), longText.size());
-  EXPECT_EQ(outlineView.materialize(), longText);
-  EXPECT_EQ(outlineView.data(), longText.data());
-  EXPECT_EQ(outlineView.value(), longText.data());
-}
-
-template <size_t kPrefixLen>
-void assertStringViewBaseComparisonAndSearch() {
-  using View = StringViewBase<kPrefixLen>;
-
-  EXPECT_LT(View("abc"), View("abd"));
-  EXPECT_LT(View("abc"), View("abc0"));
-  EXPECT_GT(View("same-prefix-z"), View("same-prefix-a"));
-  EXPECT_EQ(View("same").compare(View("same")), 0);
-
-  std::vector<std::string> texts = {
-      "", "a", "abcd", "abcdefghijkl", std::string(View::kInlineSize + 3, 'q')};
-  std::vector<View> views;
-  views.reserve(texts.size());
-  for (const auto& text : texts) {
-    views.emplace_back(text.data(), text.size());
-  }
-
-  EXPECT_EQ(View::linearSearch(View("abcd"), views.data(), nullptr, views.size()), 2);
-
-  const int32_t indices[] = {4, 3, 2, 1, 0};
-  EXPECT_EQ(
-      View::linearSearch(View("abcdefghijkl"), views.data(), indices, views.size()),
-      1);
-}
-
-int32_t normalizeCompareResult(int32_t value) {
-  if (value < 0) {
-    return -1;
-  }
-  if (value > 0) {
-    return 1;
-  }
-  return 0;
-}
-
-template <size_t kPrefixLen>
-void assertStringViewBaseCompareAndEquality() {
-  using View = StringViewBase<kPrefixLen>;
-
-  std::vector<std::string> texts = {
-      "",
-      "a",
-      "abc",
-      "abcd",
-      "abcde",
-      "abcdefgh",
-      "abcdefghi",
-      "abcdefghijkl",
-      "abcdefghijklm",
-      std::string(View::kInlineSize, 'i'),
-      std::string(View::kInlineSize + 1, 'j'),
-      "same-prefix-a",
-      "same-prefix-b",
-      "same-prefix-0-tail",
-      "same-prefix-1-tail",
-      "abcdefghijklmnop",
-      "abcdefghijklmnoq",
-      "abcdefghijklmnopqrstuv",
-      "abcdefghijklmnopqrstuw"
-    };
-
-  for (const auto& text : texts) {
-    std::string copy = text;
-    View lhs(text.data(), text.size());
-    View rhs(copy.data(), copy.size());
-
-    EXPECT_TRUE(lhs == rhs) << "text=" << text;
-    EXPECT_FALSE(lhs != rhs) << "text=" << text;
-    EXPECT_EQ(lhs.compare(rhs), 0) << "text=" << text;
-    EXPECT_EQ(rhs.compare(lhs), 0) << "text=" << text;
-  }
-
-  for (const auto& lhsText : texts) {
-    for (const auto& rhsText : texts) {
-      View lhs(lhsText.data(), lhsText.size());
-      View rhs(rhsText.data(), rhsText.size());
-
-      const bool expectedEqual = lhsText == rhsText;
-      const int32_t expectedCompare =
-          normalizeCompareResult(static_cast<int32_t>(lhsText.compare(rhsText)));
-      const int32_t actualCompare = normalizeCompareResult(lhs.compare(rhs));
-      const int32_t reverseCompare = normalizeCompareResult(rhs.compare(lhs));
-
-      EXPECT_EQ(lhs == rhs, expectedEqual)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-      EXPECT_EQ(lhs != rhs, !expectedEqual)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-      EXPECT_EQ(actualCompare, expectedCompare)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-      EXPECT_EQ(reverseCompare, -expectedCompare)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-      EXPECT_EQ(lhs < rhs, lhsText < rhsText)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-      EXPECT_EQ(lhs <= rhs, lhsText <= rhsText)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-      EXPECT_EQ(lhs > rhs, lhsText > rhsText)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-      EXPECT_EQ(lhs >= rhs, lhsText >= rhsText)
-          << "lhs=" << lhsText << ", rhs=" << rhsText;
-    }
-  }
-}
 
 TEST(StringView, basic) {
   std::string text = "We are stardust, we are golden...";
@@ -317,21 +192,6 @@ TEST(StringView, implicitConstructionAndConversion) {
 TEST(StringView, negativeSizes) {
   EXPECT_THROW(StringView("abc", -10), BoltException);
   EXPECT_NO_THROW(StringView(nullptr, 0));
-}
-
-TEST(StringViewBase, basic) {
-  assertStringViewBaseBasicBehavior<4>();
-  assertStringViewBaseBasicBehavior<12>();
-}
-
-TEST(StringViewBase, comparisonAndSearch) {
-  assertStringViewBaseComparisonAndSearch<4>();
-  assertStringViewBaseComparisonAndSearch<12>();
-}
-
-TEST(StringViewBase, compareAndEquality) {
-  assertStringViewBaseCompareAndEquality<4>();
-  assertStringViewBaseCompareAndEquality<12>();
 }
 
 int32_t linearSearchSimple(

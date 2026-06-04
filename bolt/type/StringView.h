@@ -292,16 +292,6 @@ struct StringView {
     return value_.data;
   }
 
-  int64_t offset() const noexcept {
-    static constexpr uint64_t kOffsetFlag = uint64_t{1} << 63;
-    static constexpr uint64_t kOffsetMask = ~kOffsetFlag;
-    const auto offset = static_cast<uint64_t>(value_.offset);
-    if (isInline() || (offset & kOffsetFlag) == 0) {
-      return -1;
-    }
-    return offset & kOffsetMask;
-  }
-
  private:
   inline int64_t sizeAndPrefixAsInt64() const {
     return reinterpret_cast<const int64_t*>(this)[0];
@@ -322,7 +312,6 @@ struct StringView {
   union {
     char inlined[8];
     const char* data;
-    int64_t offset;
   } value_{.data = nullptr};
 };
 

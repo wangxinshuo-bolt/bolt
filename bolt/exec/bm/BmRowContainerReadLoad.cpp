@@ -41,7 +41,8 @@ void BmRowContainer::synchronizeLoadedSegmentGeneration(SegmentData& segment) {
   if (!segment.meta.partitionId.has_value()) {
     return;
   }
-  segment.meta.generation = partitionGenerations_[*segment.meta.partitionId];
+  segment.meta.generation =
+      partitionLeaseStates_[*segment.meta.partitionId]->generation;
 }
 
 bool BmRowContainer::canBulkRead(

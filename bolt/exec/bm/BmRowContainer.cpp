@@ -23,15 +23,29 @@ BmRowContainer::BmRowContainer(
           heapBlockSize),
       blockLoader_(bufferManager_, &layout_, &segments_),
       rowCopier_(&types_, &layout_, &segments_),
-      partitionGenerations_(kMaxPartitions, 0),
-      partitionLeaseCounts_(kMaxPartitions, 0) {
+      partitionLeaseStates_(kMaxPartitions) {
   BOLT_CHECK_NOT_NULL(bufferManager_);
+  for (PartitionId partition = 0; partition < kMaxPartitions; ++partition) {
+    auto state = std::make_shared<BmRoundLeaseState>();
+    state->owner = this;
+    state->partition = partition;
+    partitionLeaseStates_[partition] = std::move(state);
+  }
+}
+
+BmRowContainer::~BmRowContainer() {
+  for (auto& state : partitionLeaseStates_) {
+    if (state != nullptr) {
+      state->ownerAlive = false;
+      state->owner = nullptr;
+    }
+  }
 }
 
 RowWriteContext BmRowContainer::appendRow(PartitionId partition) {
   checkNoLiveLeaseForPartition(partition);
   auto& segment = segments_.activeSegment(partition);
-  segment.meta.generation = partitionGenerations_[partition];
+  segment.meta.generation = partitionLeaseStates_[partition]->generation;
   auto* row = segments_.newRowInSegment(segment);
   BOLT_DCHECK_NOT_NULL(segment.writeCursor.chunk);
   auto& chunk = *segment.writeCursor.chunk;

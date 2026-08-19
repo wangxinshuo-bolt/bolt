@@ -68,7 +68,7 @@ void BmRowContainer::appendBatch(
     rows->reserve(rows->size() + input->size());
   }
   auto& segment = segments_.activeSegment(partition);
-  segment.meta.generation = partitionGenerations_[partition];
+  segment.meta.generation = partitionLeaseStates_[partition]->generation;
   segments_.reserveRowsInBatch(segment, 0, input->size(), ranges, rows);
 
   SelectivityVector allRows(input->size());
@@ -130,7 +130,7 @@ void BmRowContainer::appendBatchSelected(
   }
 
   auto& segment = segments_.activeSegment(partition);
-  segment.meta.generation = partitionGenerations_[partition];
+  segment.meta.generation = partitionLeaseStates_[partition]->generation;
   segments_.reserveRowsInBatch(
       segment, 0, selectedCount, reservedRanges, &reservedRows);
   auto ranges =

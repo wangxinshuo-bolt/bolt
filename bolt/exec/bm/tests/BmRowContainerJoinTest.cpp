@@ -8,6 +8,7 @@
 #include "bolt/type/Timestamp.h"
 
 #include <cmath>
+#include <memory>
 #include <numeric>
 #include <optional>
 #include <string>
@@ -27,13 +28,13 @@ struct BmRowContainerTestPeer {
   static uint64_t partitionGeneration(
       const BmRowContainer& container,
       PartitionId partition) {
-    return container.partitionGenerations_[partition];
+    return container.partitionLeaseStates_[partition]->generation;
   }
 
   static uint32_t partitionLeaseCount(
       const BmRowContainer& container,
       PartitionId partition) {
-    return container.partitionLeaseCounts_[partition];
+    return container.partitionLeaseStates_[partition]->activeLeaseCount;
   }
 
   static uint64_t segmentGeneration(
@@ -60,6 +61,11 @@ struct BmRowContainerTestPeer {
 
   static void setLeaseGeneration(BmRoundLease& lease, uint64_t generation) {
     lease.generation_ = generation;
+  }
+
+  static std::shared_ptr<BmRoundLeaseState> leaseState(
+      const BmRoundLease& lease) {
+    return lease.state_;
   }
 };
 
@@ -669,17 +675,22 @@ TEST_F(BmRowContainerTest, RoundLeaseDestructorAndMoveAssignmentReleaseOwnership
 
   {
     auto first = container.acquireRoundLease(kDefaultPartition);
+    auto control = BmRowContainerTestPeer::leaseState(first);
     EXPECT_EQ(
         1,
         BmRowContainerTestPeer::partitionLeaseCount(container, kDefaultPartition));
-    BmRoundLease second;
-    second = std::move(first);
+    BmRoundLease second(std::move(first));
     EXPECT_FALSE(first.active());
     EXPECT_TRUE(second.active());
+    BmRoundLease third;
+    third = std::move(second);
+    EXPECT_FALSE(second.active());
+    EXPECT_TRUE(third.active());
     EXPECT_EQ(
         1,
         BmRowContainerTestPeer::partitionLeaseCount(container, kDefaultPartition));
     expectRowsRemainReadableAndEqual(container, rows, input);
+    EXPECT_EQ(1, control->activeLeaseCount);
   }
 
   EXPECT_EQ(
@@ -691,6 +702,24 @@ TEST_F(BmRowContainerTest, RoundLeaseDestructorAndMoveAssignmentReleaseOwnership
   EXPECT_THROW(
       container.equalsDecoded(rows[0], 0, decodeAll(*input->childAt(0)), 0, true),
       BoltRuntimeError);
+}
+
+TEST_F(BmRowContainerTest, RoundLeaseExplicitReleaseIsIdempotent) {
+  BmRowContainer container(
+      {BIGINT(), VARCHAR()}, {false, false}, bufferManager_, MemoryTag::kTesting);
+  auto lease = container.acquireRoundLease(kDefaultPartition);
+  auto control = BmRowContainerTestPeer::leaseState(lease);
+  const auto generationBefore = control->generation;
+
+  container.releaseRoundLease(lease);
+  EXPECT_FALSE(lease.active());
+  EXPECT_EQ(0, control->activeLeaseCount);
+  EXPECT_EQ(generationBefore + 1, control->generation);
+
+  container.releaseRoundLease(lease);
+  EXPECT_FALSE(lease.active());
+  EXPECT_EQ(0, control->activeLeaseCount);
+  EXPECT_EQ(generationBefore + 1, control->generation);
 }
 
 TEST_F(BmRowContainerTest, RoundLeaseRejectsStaleTokenRelease) {
@@ -720,6 +749,60 @@ TEST_F(BmRowContainerTest, RoundLeaseRejectsStaleTokenRelease) {
   EXPECT_EQ(
       0,
       BmRowContainerTestPeer::partitionLeaseCount(container, kDefaultPartition));
+}
+
+TEST_F(
+    BmRowContainerTest,
+    RoundLeaseMoveAssignmentPropagatesReleaseFailureWithoutStateCorruption) {
+  BmRowContainer leftContainer(
+      {BIGINT(), VARCHAR()}, {false, false}, bufferManager_, MemoryTag::kTesting);
+  BmRowContainer rightContainer(
+      {BIGINT(), VARCHAR()}, {false, false}, bufferManager_, MemoryTag::kTesting);
+  auto leftLease = leftContainer.acquireRoundLease(kDefaultPartition);
+  auto rightLease = rightContainer.acquireRoundLease(kDefaultPartition);
+  auto leftControl = BmRowContainerTestPeer::leaseState(leftLease);
+  auto rightControl = BmRowContainerTestPeer::leaseState(rightLease);
+  const auto leftGeneration = leftControl->generation;
+  const auto rightGeneration = rightControl->generation;
+
+  BmRowContainerTestPeer::setLeaseGeneration(leftLease, leftGeneration - 1);
+  EXPECT_THROW(leftLease = std::move(rightLease), BoltRuntimeError);
+
+  EXPECT_TRUE(leftLease.active());
+  EXPECT_TRUE(rightLease.active());
+  EXPECT_EQ(1, leftControl->activeLeaseCount);
+  EXPECT_EQ(1, rightControl->activeLeaseCount);
+  EXPECT_EQ(leftGeneration, leftControl->generation);
+  EXPECT_EQ(rightGeneration, rightControl->generation);
+
+  BmRowContainerTestPeer::setLeaseGeneration(leftLease, leftGeneration);
+  leftContainer.releaseRoundLease(leftLease);
+  rightContainer.releaseRoundLease(rightLease);
+}
+
+TEST_F(BmRowContainerTest, RoundLeaseDestructorIsSafeAfterContainerDestruction) {
+  std::shared_ptr<BmRoundLeaseState> control;
+  uint64_t generationBefore = 0;
+  std::optional<BmRoundLease> lease;
+
+  {
+    auto container = std::make_unique<BmRowContainer>(
+        std::vector<TypePtr>{BIGINT(), VARCHAR()},
+        std::vector<bool>{false, false},
+        bufferManager_,
+        MemoryTag::kTesting);
+    lease.emplace(container->acquireRoundLease(kDefaultPartition));
+    control = BmRowContainerTestPeer::leaseState(*lease);
+    generationBefore = control->generation;
+    ASSERT_TRUE(static_cast<bool>(control));
+    EXPECT_EQ(1, control->activeLeaseCount);
+    container.reset();
+    EXPECT_EQ(1, control->activeLeaseCount);
+  }
+
+  lease.reset();
+  EXPECT_EQ(0, control->activeLeaseCount);
+  EXPECT_EQ(generationBefore + 1, control->generation);
 }
 
 TEST_F(

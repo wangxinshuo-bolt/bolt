@@ -94,7 +94,7 @@ std::vector<char*> BmRowContainer::loadPartitionRows(PartitionId partition) {
   auto rows = loadAllRows({segments.data(), segments.size()});
   for (auto segment : segments) {
     auto& data = segments_.segmentData(segment);
-    data.meta.generation = partitionGenerations_[partition];
+    data.meta.generation = partitionLeaseStates_[partition]->generation;
     for (auto& chunkPtr : data.chunks) {
       auto& chunk = *chunkPtr;
       if (chunk.consumed || !chunk.rowBlock.handle.valid()) {
@@ -113,34 +113,43 @@ std::vector<char*> BmRowContainer::loadPartitionRows(PartitionId partition) {
 
 BmRoundLease BmRowContainer::acquireRoundLease(PartitionId partition) {
   BOLT_CHECK_LT(partition, kMaxPartitions);
+  auto& state = partitionLeaseStates_[partition];
   BOLT_CHECK_EQ(
-      partitionLeaseCounts_[partition],
+      state->activeLeaseCount,
       0,
       "Partition {} already has a live BM round lease",
       partition);
-  ++partitionLeaseCounts_[partition];
-  return BmRoundLease(this, partition, partitionGenerations_[partition]);
+  ++state->activeLeaseCount;
+  return BmRoundLease(state, state->generation);
 }
 
 void BmRowContainer::releaseRoundLease(BmRoundLease& lease) {
   if (!lease.active()) {
     return;
   }
-  BOLT_CHECK(lease.container_ == this, "Lease does not belong to this container");
+  auto state = lease.state_;
+  BOLT_CHECK_NOT_NULL(state);
+  BOLT_CHECK(state->ownerAlive, "Lease owner has already been destroyed");
+  BOLT_CHECK(state->owner == this, "Lease does not belong to this container");
   const auto partition = lease.partition_;
   BOLT_CHECK_LT(partition, kMaxPartitions);
+  BOLT_CHECK(
+      state.get() == partitionLeaseStates_[partition].get(),
+      "Lease state does not match partition {}",
+      partition);
   BOLT_CHECK_EQ(
       lease.generation_,
-      partitionGenerations_[partition],
+      state->generation,
       "Lease generation {} is stale for partition {} current generation {}",
       lease.generation_,
       partition,
-      partitionGenerations_[partition]);
-  BOLT_CHECK_GT(partitionLeaseCounts_[partition], 0);
-  --partitionLeaseCounts_[partition];
-  lease.container_ = nullptr;
+      state->generation);
+  BOLT_CHECK_GT(state->activeLeaseCount, 0);
+  --state->activeLeaseCount;
+  lease.state_.reset();
   invalidatePartitionRows(partition);
-  lease.generation_ = partitionGenerations_[partition];
+  lease.partition_ = kDefaultPartition;
+  lease.generation_ = 0;
 }
 
 void BmRowContainer::releaseSegment(SegmentId segment) {
@@ -314,7 +323,7 @@ void BmRowContainer::checkRowPointerReadable(const char* row) const {
         const auto partition = *data.meta.partitionId;
         BOLT_CHECK_EQ(
             data.meta.generation,
-            partitionGenerations_[partition],
+            partitionLeaseStates_[partition]->generation,
             "BM row pointer belongs to stale partition epoch");
       }
       return;
@@ -326,7 +335,7 @@ void BmRowContainer::checkRowPointerReadable(const char* row) const {
 void BmRowContainer::checkNoLiveLeaseForPartition(PartitionId partition) const {
   BOLT_CHECK_LT(partition, kMaxPartitions);
   BOLT_CHECK_EQ(
-      partitionLeaseCounts_[partition],
+      partitionLeaseStates_[partition]->activeLeaseCount,
       0,
       "Partition {} has a live BM round lease",
       partition);
@@ -368,7 +377,7 @@ void BmRowContainer::checkNoLiveLeaseForPopFrontRows(uint64_t rowCount) const {
 
 void BmRowContainer::invalidatePartitionRows(PartitionId partition) {
   BOLT_CHECK_LT(partition, kMaxPartitions);
-  ++partitionGenerations_[partition];
+  ++partitionLeaseStates_[partition]->generation;
 }
 
 } // namespace bytedance::bolt::exec::bm

@@ -1047,17 +1047,12 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
       // ones with a null join key.
       matchColumn() = createConstantFalse(numOut, pool());
     } else {
-      if (nullAware_) {
-        table_->rows()->extractProbedFlags(
-            outputTableRows_.data(),
-            numOut,
-            true,
-            probeSideHasNullKeys_,
-            matchColumn());
-      } else {
-        table_->extractJoinProbedFlags(
-            outputTableRows_.data(), numOut, matchColumn());
-      }
+      table_->extractJoinProbedFlags(
+          outputTableRows_.data(),
+          numOut,
+          nullAware_,
+          nullAware_ && probeSideHasNullKeys_,
+          matchColumn());
     }
   }
 

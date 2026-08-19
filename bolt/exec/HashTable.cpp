@@ -2341,8 +2341,15 @@ template <bool ignoreNullKeys>
 void HashTable<ignoreNullKeys>::extractJoinProbedFlags(
     const char* const* rows,
     int32_t numRows,
+    bool setNullForNullKeysRow,
+    bool setNullForNonProbedRow,
     const VectorPtr& result) const {
-  rows_->extractProbedFlags(rows, numRows, false, false, result);
+  rows_->extractProbedFlags(
+      rows,
+      numRows,
+      setNullForNullKeysRow,
+      setNullForNonProbedRow,
+      result);
 }
 
 template <bool ignoreNullKeys>

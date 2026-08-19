@@ -3665,6 +3665,40 @@ TEST_F(HashJoinTest, nullAwareRightSemiProjectOverScan) {
       .run();
 }
 
+TEST_F(HashJoinTest, nullAwareRightSemiProjectPreservesNullMatchSemantics) {
+  auto probe = makeRowVector(
+      {"t0"},
+      {
+          makeNullableFlatVector<int32_t>({1, std::nullopt}),
+      });
+
+  auto build = makeRowVector(
+      {"u0"},
+      {
+          makeNullableFlatVector<int32_t>({1, 2, std::nullopt}),
+      });
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probe})
+                  .hashJoin(
+                      {"t0"},
+                      {"u0"},
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({build})
+                          .planNode(),
+                      "",
+                      {"u0", "match"},
+                      core::JoinType::kRightSemiProject,
+                      true /*nullAware*/)
+                  .planNode();
+
+  AssertQueryBuilder(plan).assertResults(makeRowVector({
+      makeNullableFlatVector<int32_t>({1, 2, std::nullopt}),
+      makeNullableFlatVector<bool>({true, std::nullopt, std::nullopt}),
+  }));
+}
+
 TEST_F(HashJoinTest, duplicateJoinKeys) {
   auto leftVectors = makeBatches(3, [&](int32_t /*unused*/) {
     return makeRowVector({

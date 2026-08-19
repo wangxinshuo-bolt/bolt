@@ -271,6 +271,8 @@ class BaseHashTable {
   virtual void extractJoinProbedFlags(
       const char* const* rows,
       int32_t numRows,
+      bool setNullForNullKeysRow,
+      bool setNullForNonProbedRow,
       const VectorPtr& result) const = 0;
 
   virtual uint64_t joinRowCount() const = 0;
@@ -699,6 +701,8 @@ class HashTable : public BaseHashTable {
   void extractJoinProbedFlags(
       const char* const* rows,
       int32_t numRows,
+      bool setNullForNullKeysRow,
+      bool setNullForNonProbedRow,
       const VectorPtr& result) const override;
 
   uint64_t joinRowCount() const override;

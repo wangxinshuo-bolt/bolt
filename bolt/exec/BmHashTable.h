@@ -4,9 +4,7 @@
 #include "bolt/exec/HashTable.h"
 #include "bolt/exec/bm/BmRowContainer.h"
 
-#include <functional>
 #include <memory>
-#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -27,8 +25,6 @@ class BmHashTable : public BaseHashTable {
     uint64_t restoreCount{0};
   };
 
-  using HashOverride = std::optional<std::function<uint64_t(uint64_t)>>;
-
   static std::unique_ptr<BmHashTable> createForJoin(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
       const std::vector<TypePtr>& dependentTypes,
@@ -37,8 +33,7 @@ class BmHashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       std::shared_ptr<memory::bm::BufferManager> bufferManager,
-      bool jitRowEqVectors,
-      HashOverride hashOverride = std::nullopt) {
+      bool jitRowEqVectors) {
     return std::make_unique<BmHashTable>(
         std::move(hashers),
         dependentTypes,
@@ -47,8 +42,7 @@ class BmHashTable : public BaseHashTable {
         minTableSizeForParallelJoinBuild,
         pool,
         std::move(bufferManager),
-        jitRowEqVectors,
-        std::move(hashOverride));
+        jitRowEqVectors);
   }
 
   BmHashTable(
@@ -59,8 +53,7 @@ class BmHashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       std::shared_ptr<memory::bm::BufferManager> bufferManager,
-      bool jitRowEqVectors,
-      HashOverride hashOverride = std::nullopt);
+      bool jitRowEqVectors);
 
   ~BmHashTable() override = default;
 
@@ -144,18 +137,18 @@ class BmHashTable : public BaseHashTable {
   }
 
   uint64_t numDistinct() const override {
-    return numRows_;
+    return numDistinctKeys_;
   }
 
   float getDistinctRatio() const override {
-    return numProbeInputs_ == 0 ? 0 : numRows_ * 1.0 / numProbeInputs_;
+    return numProbeInputs_ == 0 ? 0 : numDistinctKeys_ * 1.0 / numProbeInputs_;
   }
 
   HashTableStats stats() const override {
     return HashTableStats{
         static_cast<int64_t>(capacity_),
         static_cast<int64_t>(numRehashes_),
-        static_cast<int64_t>(numRows_),
+        static_cast<int64_t>(numDistinctKeys_),
         0};
   }
 
@@ -193,6 +186,8 @@ class BmHashTable : public BaseHashTable {
   }
 
  private:
+  static constexpr bool kTestingHashOverrideEnabled = false;
+
   struct DistinctHead {
     char* head{nullptr};
   };
@@ -211,7 +206,8 @@ class BmHashTable : public BaseHashTable {
       const std::vector<TypePtr>& dependentTypes);
 
   void unsupported(folly::StringPiece method) const;
-  uint64_t applyHashOverride(uint64_t hash) const;
+  uint64_t maybeApplyTestHashOverride(uint64_t hash) const;
+  void testingSetHashOverride(uint64_t (*override)(uint64_t));
   void maybeGrowDirectory(uint64_t requiredRows);
   uint64_t nextCapacity(uint64_t requiredRows) const;
   char* insertOrFindGroup(char* row, uint64_t hash, bool& insertedNewKey);
@@ -232,7 +228,7 @@ class BmHashTable : public BaseHashTable {
   bool joinBuildNoDuplicates_{false};
   bool hasProbedFlag_{false};
   bool enableJit_{false};
-  HashOverride hashOverride_;
+  uint64_t (*testHashOverride_)(uint64_t){nullptr};
 
   std::unordered_map<uint64_t, BucketEntry> buckets_;
   uint64_t capacity_{0};

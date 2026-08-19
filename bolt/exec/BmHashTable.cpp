@@ -43,8 +43,7 @@ BmHashTable<ignoreNullKeys>::BmHashTable(
     uint32_t minTableSizeForParallelJoinBuild,
     memory::MemoryPool* pool,
     std::shared_ptr<memory::bm::BufferManager> bufferManager,
-    bool jitRowEqVectors,
-    HashOverride hashOverride)
+    bool jitRowEqVectors)
     : BaseHashTable(std::move(hashers)),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
       pool_(pool),
@@ -53,8 +52,7 @@ BmHashTable<ignoreNullKeys>::BmHashTable(
       dependentTypes_(dependentTypes),
       joinBuildNoDuplicates_(!allowDuplicates),
       hasProbedFlag_(hasProbedFlag),
-      enableJit_(jitRowEqVectors),
-      hashOverride_(std::move(hashOverride)) {
+      enableJit_(jitRowEqVectors) {
   BOLT_CHECK(ignoreNullKeys, "Task 5 only supports ignore-null-key inner join");
   BOLT_CHECK_NOT_NULL(pool_);
   BOLT_CHECK_NOT_NULL(bufferManager_);
@@ -86,8 +84,15 @@ void BmHashTable<ignoreNullKeys>::unsupported(folly::StringPiece method) const {
 }
 
 template <bool ignoreNullKeys>
-uint64_t BmHashTable<ignoreNullKeys>::applyHashOverride(uint64_t hash) const {
-  return hashOverride_ ? (*hashOverride_)(hash) : hash;
+uint64_t BmHashTable<ignoreNullKeys>::maybeApplyTestHashOverride(
+    uint64_t hash) const {
+  return testHashOverride_ ? testHashOverride_(hash) : hash;
+}
+
+template <bool ignoreNullKeys>
+void BmHashTable<ignoreNullKeys>::testingSetHashOverride(
+    uint64_t (*override)(uint64_t)) {
+  testHashOverride_ = override;
 }
 
 template <bool ignoreNullKeys>
@@ -113,10 +118,7 @@ void BmHashTable<ignoreNullKeys>::maybeGrowDirectory(uint64_t requiredRows) {
 
 template <bool ignoreNullKeys>
 auto BmHashTable<ignoreNullKeys>::bucketForHash(uint64_t hash) -> BucketEntry& {
-  auto [it, inserted] = buckets_.try_emplace(hash, BucketEntry{.hash = hash});
-  if (inserted) {
-    maybeGrowDirectory(numDistinctKeys_ + 1);
-  }
+  auto [it, inserted] = buckets_.try_emplace(hash, BucketEntry{hash, {}});
   return it->second;
 }
 
@@ -179,9 +181,9 @@ char* BmHashTable<ignoreNullKeys>::insertOrFindGroup(
   }
 
   insertedNewKey = true;
+  maybeGrowDirectory(numDistinctKeys_ + 1);
   bucket.heads.push_back(DistinctHead{.head = row});
   ++numDistinctKeys_;
-  maybeGrowDirectory(numDistinctKeys_);
   return row;
 }
 
@@ -216,7 +218,7 @@ void BmHashTable<ignoreNullKeys>::appendJoinRows(
 
   for (auto i = 0; i < appended.size(); ++i) {
     bool insertedNewKey = false;
-    auto hash = applyHashOverride(hashes[i]);
+    auto hash = maybeApplyTestHashOverride(hashes[i]);
     insertOrFindGroup(appended[i], hash, insertedNewKey);
   }
 
@@ -231,7 +233,7 @@ template <bool ignoreNullKeys>
 void BmHashTable<ignoreNullKeys>::joinProbe(HashLookup& lookup) {
   numProbeInputs_ += lookup.rows.size();
   for (auto row : lookup.rows) {
-    auto hash = applyHashOverride(lookup.hashes[row]);
+    auto hash = maybeApplyTestHashOverride(lookup.hashes[row]);
     const auto it = buckets_.find(hash);
     if (it == buckets_.end()) {
       lookup.hits[row] = nullptr;

@@ -37,7 +37,6 @@ class BmHashTableTest : public testing::Test,
                         public bytedance::bolt::test::VectorTestBase {
  protected:
   using BmTable = BmHashTable<true>;
-  using HashOverride = typename BmTable::HashOverride;
 
   struct ProbeResults {
     std::vector<vector_size_t> selectedRows;
@@ -45,6 +44,10 @@ class BmHashTableTest : public testing::Test,
     std::map<vector_size_t, int32_t> hitCounts;
     std::vector<std::string> resultRows;
   };
+
+  static uint64_t constantCollisionHash(uint64_t /*hash*/) {
+    return 0;
+  }
 
   static void SetUpTestCase() {
     memory::MemoryManager::testingSetInstance(memory::MemoryManager::Options{});
@@ -96,8 +99,7 @@ class BmHashTableTest : public testing::Test,
 
   std::unique_ptr<BmTable> makeBmTable(
       const RowTypePtr& type,
-      int32_t numKeys,
-      HashOverride hashOverride = std::nullopt) {
+      int32_t numKeys) {
     std::vector<TypePtr> dependents;
     for (auto i = numKeys; i < type->size(); ++i) {
       dependents.push_back(type->childAt(i));
@@ -110,8 +112,7 @@ class BmHashTableTest : public testing::Test,
         0,
         pool(),
         bufferManager_,
-        false,
-        std::move(hashOverride));
+        false);
   }
 
   void appendBuildRows(
@@ -237,12 +238,13 @@ class BmHashTableTest : public testing::Test,
       const RowVectorPtr& build,
       const RowVectorPtr& probe,
       int32_t numKeys,
-      HashOverride bmHashOverride = std::nullopt) {
+      uint64_t (*bmHashOverride)(uint64_t) = nullptr) {
     const auto buildType = std::dynamic_pointer_cast<const RowType>(build->type());
     ASSERT_NE(buildType, nullptr);
 
     auto legacy = makeLegacyTable(buildType, numKeys);
-    auto bm = makeBmTable(buildType, numKeys, std::move(bmHashOverride));
+    auto bm = makeBmTable(buildType, numKeys);
+    bm->testingSetHashOverride(bmHashOverride);
     appendBuildRows(*legacy, build, numKeys);
     appendBuildRows(*bm, build, numKeys);
 
@@ -308,7 +310,7 @@ TEST_F(BmHashTableTest, HashCollisionStillChecksKeys) {
       makeFlatVector<int64_t>({1, 3, 3, 5}),
       makeFlatVector<std::string>({"aa", "cc", "xx", "miss"}),
   });
-  expectParity(build, probe, 2, [](uint64_t /*hash*/) { return 0; });
+  expectParity(build, probe, 2, &BmHashTableTest::constantCollisionHash);
 }
 
 TEST_F(BmHashTableTest, DuplicateKeysSpanOutputBatches) {
@@ -322,7 +324,25 @@ TEST_F(BmHashTableTest, DuplicateKeysSpanOutputBatches) {
   const auto probe = makeRowVector({
       makeFlatVector<int64_t>({7, 8}),
   });
-  expectParity(build, probe, 1);
+  const auto buildType = std::dynamic_pointer_cast<const RowType>(build->type());
+  ASSERT_NE(buildType, nullptr);
+  auto legacy = makeLegacyTable(buildType, 1);
+  auto bm = makeBmTable(buildType, 1);
+  appendBuildRows(*legacy, build, 1);
+  appendBuildRows(*bm, build, 1);
+
+  EXPECT_EQ(legacy->joinRowCount(), 3000);
+  EXPECT_EQ(bm->joinRowCount(), 3000);
+  EXPECT_EQ(bm->numDistinct(), 1);
+  EXPECT_EQ(bm->stats().numDistinct, 1);
+
+  const auto legacyResults = probeAndCollect(*legacy, build, probe);
+  const auto bmResults = probeAndCollect(*bm, build, probe);
+  EXPECT_FLOAT_EQ(bm->getDistinctRatio(), 0.5);
+  EXPECT_EQ(legacyResults.selectedRows, bmResults.selectedRows);
+  EXPECT_EQ(legacyResults.hasFirstHit, bmResults.hasFirstHit);
+  EXPECT_EQ(legacyResults.hitCounts, bmResults.hitCounts);
+  EXPECT_EQ(legacyResults.resultRows, bmResults.resultRows);
 }
 
 TEST_F(BmHashTableTest, CompositeKeyAndNullsMatchLegacy) {
@@ -362,7 +382,11 @@ TEST_F(BmHashTableTest, RehashPreservesHits) {
   appendBuildRows(*bm, build, 2);
 
   EXPECT_GT(bm->capacity(), 2048);
+  EXPECT_EQ(bm->joinRowCount(), size);
+  EXPECT_EQ(bm->numDistinct(), size);
+  EXPECT_EQ(bm->stats().numDistinct, size);
   EXPECT_GT(bm->stats().numRehashes, 0);
+  EXPECT_EQ(bm->stats().numRehashes, 2);
 
   const auto legacyResults = probeAndCollect(*legacy, build, probe);
   const auto bmResults = probeAndCollect(*bm, build, probe);

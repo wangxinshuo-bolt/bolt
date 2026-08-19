@@ -66,6 +66,24 @@ struct ColumnStorePlan {
   StoreValueFn storeFn{nullptr};
 };
 
+struct BmJoinLayoutOptions {
+  uint32_t numKeys{0};
+  bool hasNext{false};
+  bool hasProbedFlag{false};
+  bool hasNormalizedKey{false};
+};
+
+struct JoinRuntimeLayout {
+  uint32_t offset{0};
+  uint32_t size{0};
+  uint32_t nextOffset{0};
+  uint32_t probedOffset{0};
+  uint32_t normalizedKeyOffset{0};
+  bool hasNext{false};
+  bool hasProbedFlag{false};
+  bool hasNormalizedKey{false};
+};
+
 // Computes the fixed row layout used by BmRowContainer. This class owns no row
 // memory; it only describes offsets, widths, and null-bit placement.
 class BmRowLayout {
@@ -75,7 +93,8 @@ class BmRowLayout {
   BmRowLayout(
       const std::vector<TypePtr>& types,
       const std::vector<bool>& nullable,
-      uint32_t rowBlockSize);
+      uint32_t rowBlockSize,
+      BmJoinLayoutOptions joinOptions = {});
 
   FOLLY_ALWAYS_INLINE const ColumnLayout& column(int32_t column) const {
     return columns_[column];
@@ -98,39 +117,57 @@ class BmRowLayout {
     return fixedRowSize_;
   }
 
+  FOLLY_ALWAYS_INLINE uint32_t persistedRowSize() const {
+    return persistedRowSize_;
+  }
+
+  FOLLY_ALWAYS_INLINE const BmJoinLayoutOptions& joinOptions() const {
+    return joinOptions_;
+  }
+
+  FOLLY_ALWAYS_INLINE const JoinRuntimeLayout& joinRuntimeLayout() const {
+    return joinRuntimeLayout_;
+  }
+
   // BM owns variable-width payloads at chunk/block granularity, so nullable
   // null cells leave their fixed payload bytes undefined. Readers must check
   // null bits before reading payload cells.
   FOLLY_ALWAYS_INLINE void initializeNulls(char* row) const {
     if (FOLLY_LIKELY(nullBytes_ == 1)) {
       *row = 0;
-      return;
+    } else if (nullBytes_ > 1) {
+      std::memset(row, 0, nullBytes_);
     }
-    if (nullBytes_ == 0) {
-      return;
-    }
-    std::memset(row, 0, nullBytes_);
+    resetJoinRuntimeMetadata(row);
   }
 
   FOLLY_ALWAYS_INLINE void initializeNullsRange(
       char* rowBegin,
       vector_size_t count,
       uint32_t rowStride) const {
-    if (nullBytes_ == 0) {
-      return;
-    }
     auto* row = rowBegin;
     if (FOLLY_LIKELY(nullBytes_ == 1)) {
       for (vector_size_t i = 0; i < count; ++i) {
         *row = 0;
+        resetJoinRuntimeMetadata(row);
         row += rowStride;
       }
       return;
     }
     for (vector_size_t i = 0; i < count; ++i) {
-      std::memset(row, 0, nullBytes_);
+      if (nullBytes_ > 1) {
+        std::memset(row, 0, nullBytes_);
+      }
+      resetJoinRuntimeMetadata(row);
       row += rowStride;
     }
+  }
+
+  FOLLY_ALWAYS_INLINE void resetJoinRuntimeMetadata(char* row) const {
+    if (joinRuntimeLayout_.size == 0) {
+      return;
+    }
+    std::memset(row + joinRuntimeLayout_.offset, 0, joinRuntimeLayout_.size);
   }
 
   FOLLY_ALWAYS_INLINE bool isNull(const char* row, int32_t column) const {
@@ -176,7 +213,10 @@ class BmRowLayout {
   std::vector<ColumnLayout> columns_;
   std::vector<StringColumnLayout> stringColumns_;
   std::vector<ColumnStorePlan> storePlans_;
+  BmJoinLayoutOptions joinOptions_;
+  JoinRuntimeLayout joinRuntimeLayout_;
   uint32_t nullBytes_{0};
+  uint32_t persistedRowSize_{0};
   uint32_t fixedRowSize_{0};
 };
 

@@ -7,6 +7,7 @@ add_executable(
   BmMergeReadSessionTest.cpp
   BmPartitionTest.cpp
   BmRowContainerBatchTest.cpp
+  BmRowContainerJoinTest.cpp
   BmRowContainerReadTest.cpp
   BmRowContainerResidentTest.cpp
   BmSegmentCollectionTest.cpp

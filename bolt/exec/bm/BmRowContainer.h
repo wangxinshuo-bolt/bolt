@@ -35,7 +35,8 @@ class BmRowContainer {
       uint32_t rowBlockSize = static_cast<uint32_t>(
           memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
       uint32_t heapBlockSize = static_cast<uint32_t>(
-          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)));
+          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
+      BmJoinLayoutOptions joinOptions = {});
 
   // Allocates one row in the active segment for partition. The caller must fill
   // columns with store() before treating the row as complete.
@@ -46,6 +47,13 @@ class BmRowContainer {
   // keeps its separate row-wise path.
   void appendBatch(
       const RowVectorPtr& input,
+      PartitionId partition = kDefaultPartition,
+      std::vector<char*>* rows = nullptr,
+      BmBatchStringStoreMode stringStoreMode = BmBatchStringStoreMode::kCopy);
+
+  void appendBatchSelected(
+      const RowVectorPtr& input,
+      const SelectivityVector& selectedRows,
       PartitionId partition = kDefaultPartition,
       std::vector<char*>* rows = nullptr,
       BmBatchStringStoreMode stringStoreMode = BmBatchStringStoreMode::kCopy);
@@ -78,6 +86,46 @@ class BmRowContainer {
 
   FOLLY_ALWAYS_INLINE bool isNull(const char* row, int32_t column) const {
     return layout_.isNull(row, column);
+  }
+
+  FOLLY_ALWAYS_INLINE char* next(const char* row) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNext);
+    return *reinterpret_cast<char* const*>(row + runtime.nextOffset);
+  }
+
+  FOLLY_ALWAYS_INLINE void setNext(char* row, char* nextRow) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNext);
+    *reinterpret_cast<char**>(row + runtime.nextOffset) = nextRow;
+  }
+
+  FOLLY_ALWAYS_INLINE bool probed(const char* row) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasProbedFlag);
+    return *reinterpret_cast<const bool*>(row + runtime.probedOffset);
+  }
+
+  FOLLY_ALWAYS_INLINE void setProbed(char* row, bool value) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasProbedFlag);
+    *reinterpret_cast<bool*>(row + runtime.probedOffset) = value;
+  }
+
+  FOLLY_ALWAYS_INLINE uint64_t normalizedKey(const char* row) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNormalizedKey);
+    return *reinterpret_cast<const uint64_t*>(row + runtime.normalizedKeyOffset);
+  }
+
+  FOLLY_ALWAYS_INLINE void setNormalizedKey(char* row, uint64_t value) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNormalizedKey);
+    *reinterpret_cast<uint64_t*>(row + runtime.normalizedKeyOffset) = value;
+  }
+
+  FOLLY_ALWAYS_INLINE void resetJoinRuntimeMetadata(char* row) const {
+    layout_.resetJoinRuntimeMetadata(row);
   }
 
   void extractColumnResident(
@@ -217,6 +265,11 @@ class BmRowContainer {
       folly::Range<const BatchAppendRange*> ranges,
       const ColumnStorePlan& column,
       BmBatchStringStoreMode stringStoreMode);
+  static std::vector<BatchAppendRange> selectedRanges(
+      const std::vector<BatchAppendRange>& reservedRanges,
+      const SelectivityVector& selectedRows,
+      std::vector<char*>* rows,
+      uint32_t rowStride);
   template <TypeKind Kind>
   void extractColumnTyped(
       const char* const* rows,

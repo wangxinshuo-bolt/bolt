@@ -101,6 +101,68 @@ void BmRowContainer::appendBatch(
   }
 }
 
+void BmRowContainer::appendBatchSelected(
+    const RowVectorPtr& input,
+    const SelectivityVector& selectedRows,
+    PartitionId partition,
+    std::vector<char*>* rows,
+    BmBatchStringStoreMode stringStoreMode) {
+  BOLT_CHECK_NOT_NULL(input);
+  BOLT_CHECK_EQ(input->childrenSize(), types_.size());
+  auto* inputRow = input->as<RowVector>();
+  BOLT_CHECK_NOT_NULL(inputRow);
+  BOLT_CHECK_EQ(input->size(), selectedRows.size());
+
+  const auto selectedCount = selectedRows.countSelected();
+  if (selectedCount == 0) {
+    return;
+  }
+
+  std::vector<BatchAppendRange> reservedRanges;
+  reservedRanges.reserve(selectedCount);
+  std::vector<char*> reservedRows;
+  reservedRows.reserve(selectedCount);
+  if (rows != nullptr) {
+    rows->reserve(rows->size() + selectedCount);
+  }
+
+  auto& segment = segments_.activeSegment(partition);
+  segments_.reserveRowsInBatch(
+      segment, 0, selectedCount, reservedRanges, &reservedRows);
+  auto ranges =
+      selectedRanges(reservedRanges, selectedRows, rows, segments_.rowStride());
+
+  for (auto column = 0; column < inputRow->childrenSize(); ++column) {
+    const auto& child = inputRow->childAt(column);
+    BOLT_CHECK_EQ(child->type(), types_[column]);
+    DecodedVector decoded(*child, selectedRows);
+    const auto& plan = layout_.storePlan(column);
+    const folly::Range<const BatchAppendRange*> rangeView(
+        ranges.data(), ranges.size());
+    if (plan.stringKind) {
+      storeStringColumnBatchRanges(
+          decoded, rangeView, plan, stringStoreMode);
+      continue;
+    }
+
+    if (plan.nullable) {
+      BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
+          storeFixedColumnBatchRangesWithNullsTyped,
+          plan.kind,
+          decoded,
+          rangeView,
+          plan);
+    } else {
+      BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
+          storeFixedColumnBatchRangesNoNullsTyped,
+          plan.kind,
+          decoded,
+          rangeView,
+          plan);
+    }
+  }
+}
+
 template <TypeKind Kind>
 void BmRowContainer::storeFixedColumnBatchRangesNoNullsTyped(
     const DecodedVector& decoded,

@@ -10,9 +10,10 @@ BmRowContainer::BmRowContainer(
     std::shared_ptr<memory::bm::BufferManager> bufferManager,
     memory::bm::MemoryTag tag,
     uint32_t rowBlockSize,
-    uint32_t heapBlockSize)
+    uint32_t heapBlockSize,
+    BmJoinLayoutOptions joinOptions)
     : types_(std::move(types)),
-      layout_(types_, nullable, rowBlockSize),
+      layout_(types_, nullable, rowBlockSize, joinOptions),
       bufferManager_(std::move(bufferManager)),
       segments_(
           bufferManager_,

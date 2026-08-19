@@ -18,18 +18,6 @@ target_link_libraries(
 
 gtest_add_tests(bolt_exec_bm_storage_link_test "" AUTO)
 
-target_sources(
-  bolt_exec_bm_storage_link_test
-  PRIVATE $<TARGET_OBJECTS:bolt_type_base>
-          $<TARGET_OBJECTS:bolt_status>
-          $<TARGET_OBJECTS:bolt_type_tz>
-          $<TARGET_OBJECTS:bolt_serialization>
-          $<TARGET_OBJECTS:bolt_encode>
-          $<TARGET_OBJECTS:bolt_exception>
-          $<TARGET_OBJECTS:bolt_flag_definitions>
-          $<TARGET_OBJECTS:bolt_process>
-)
-
 add_executable(
   bolt_exec_bm_test
   ../benchmarks/BmRowContainerBenchmarkProfiles.cpp

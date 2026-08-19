@@ -1,5 +1,4 @@
-add_library(
-  bolt_exec_bm_storage
+set(BOLT_EXEC_BM_STORAGE_SOURCES
   BmRowContainer.cpp
   BmRowContainerBatch.cpp
   BmBulkReadSession.cpp
@@ -19,6 +18,34 @@ add_library(
   BmRowContainerReorder.cpp
   BmRowContainerStore.cpp
   BmRowContainerSegmentLifecycle.cpp
+)
+
+bolt_add_library(
+  bolt_exec_bm_storage_object
+  ${BOLT_EXEC_BM_STORAGE_SOURCES}
+)
+
+target_compile_features(bolt_exec_bm_storage_object PRIVATE cxx_std_20)
+
+target_link_libraries(
+  bolt_exec_bm_storage_object
+  bolt_memory_bm
+  bolt_vector
+  bolt_common_base
+)
+
+add_library(
+  bolt_exec_bm_storage
+  STATIC
+  $<TARGET_OBJECTS:bolt_exec_bm_storage_object>
+  $<TARGET_OBJECTS:bolt_type_base>
+  $<TARGET_OBJECTS:bolt_status>
+  $<TARGET_OBJECTS:bolt_type_tz>
+  $<TARGET_OBJECTS:bolt_serialization>
+  $<TARGET_OBJECTS:bolt_encode>
+  $<TARGET_OBJECTS:bolt_exception>
+  $<TARGET_OBJECTS:bolt_flag_definitions>
+  $<TARGET_OBJECTS:bolt_process>
 )
 
 target_compile_features(bolt_exec_bm_storage PUBLIC cxx_std_20)

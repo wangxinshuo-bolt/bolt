@@ -8,6 +8,17 @@
 #include <vector>
 
 namespace bytedance::bolt::exec::bm {
+struct BmRowContainerTestPeer {
+  static std::vector<BatchAppendRange> selectedRanges(
+      const std::vector<BatchAppendRange>& reservedRanges,
+      const SelectivityVector& selectedRows,
+      std::vector<char*>* rows,
+      uint32_t rowStride) {
+    return BmRowContainer::selectedRanges(
+        reservedRanges, selectedRows, rows, rowStride);
+  }
+};
+
 namespace {
 
 using bytedance::bolt::memory::bm::MemoryTag;
@@ -202,6 +213,86 @@ TEST_F(BmRowContainerTest, AppendBatchSelectedPreservesSelectionOrder) {
   EXPECT_EQ("twenty", varcharFlat->valueAt(0).str());
   EXPECT_EQ("forty", varcharFlat->valueAt(1).str());
   EXPECT_EQ("fifty", varcharFlat->valueAt(2).str());
+}
+
+TEST_F(BmRowContainerTest, SelectedRangesCoalescesContiguousRows) {
+  ChunkData firstChunk;
+  firstChunk.meta.id = 11;
+  ChunkData secondChunk;
+  secondChunk.meta.id = 12;
+
+  std::vector<char> firstStorage(32);
+  std::vector<char> secondStorage(16);
+  const uint32_t rowStride = 8;
+  std::vector<BatchAppendRange> reservedRanges{
+      BatchAppendRange{&firstChunk, firstStorage.data(), 0, 3},
+      BatchAppendRange{&secondChunk, secondStorage.data(), 3, 2},
+  };
+
+  SelectivityVector selected(8, false);
+  selected.setValid(1, true);
+  selected.setValid(2, true);
+  selected.setValid(3, true);
+  selected.setValid(6, true);
+  selected.setValid(7, true);
+  selected.updateBounds();
+
+  std::vector<char*> rows;
+  auto ranges = BmRowContainerTestPeer::selectedRanges(
+      reservedRanges, selected, &rows, rowStride);
+
+  ASSERT_EQ(2, ranges.size());
+  EXPECT_EQ(&firstChunk, ranges[0].chunk);
+  EXPECT_EQ(firstStorage.data(), ranges[0].rowBegin);
+  EXPECT_EQ(1, ranges[0].sourceBegin);
+  EXPECT_EQ(3, ranges[0].rowCount);
+
+  EXPECT_EQ(&secondChunk, ranges[1].chunk);
+  EXPECT_EQ(secondStorage.data(), ranges[1].rowBegin);
+  EXPECT_EQ(6, ranges[1].sourceBegin);
+  EXPECT_EQ(2, ranges[1].rowCount);
+
+  ASSERT_EQ(5, rows.size());
+  EXPECT_EQ(firstStorage.data(), rows[0]);
+  EXPECT_EQ(firstStorage.data() + rowStride, rows[1]);
+  EXPECT_EQ(firstStorage.data() + 2 * rowStride, rows[2]);
+  EXPECT_EQ(secondStorage.data(), rows[3]);
+  EXPECT_EQ(secondStorage.data() + rowStride, rows[4]);
+}
+
+TEST_F(BmRowContainerTest, SelectedRangesRespectsReservedRangeBoundaries) {
+  ChunkData firstChunk;
+  firstChunk.meta.id = 21;
+  ChunkData secondChunk;
+  secondChunk.meta.id = 22;
+
+  std::vector<char> firstStorage(16);
+  std::vector<char> secondStorage(16);
+  const uint32_t rowStride = 8;
+  std::vector<BatchAppendRange> reservedRanges{
+      BatchAppendRange{&firstChunk, firstStorage.data(), 0, 2},
+      BatchAppendRange{&secondChunk, secondStorage.data(), 2, 2},
+  };
+
+  SelectivityVector selected(5, false);
+  selected.setValid(1, true);
+  selected.setValid(2, true);
+  selected.setValid(3, true);
+  selected.updateBounds();
+
+  auto ranges = BmRowContainerTestPeer::selectedRanges(
+      reservedRanges, selected, nullptr, rowStride);
+
+  ASSERT_EQ(2, ranges.size());
+  EXPECT_EQ(&firstChunk, ranges[0].chunk);
+  EXPECT_EQ(firstStorage.data(), ranges[0].rowBegin);
+  EXPECT_EQ(1, ranges[0].sourceBegin);
+  EXPECT_EQ(2, ranges[0].rowCount);
+
+  EXPECT_EQ(&secondChunk, ranges[1].chunk);
+  EXPECT_EQ(secondStorage.data(), ranges[1].rowBegin);
+  EXPECT_EQ(3, ranges[1].sourceBegin);
+  EXPECT_EQ(1, ranges[1].rowCount);
 }
 
 TEST_F(BmRowContainerTest, AppendBatchSelectedPreservesNullsAndLongDecimal) {

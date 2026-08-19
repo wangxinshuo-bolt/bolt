@@ -25,6 +25,8 @@
 
 namespace bytedance::bolt::exec::bm {
 
+struct BmRowContainerTestPeer;
+
 class BmRowContainer {
  public:
   BmRowContainer(
@@ -216,6 +218,7 @@ class BmRowContainer {
 
  private:
   friend class BmRowLayout;
+  friend struct BmRowContainerTestPeer;
 
   int32_t compareNonNull(
       const char* left,

@@ -22,20 +22,37 @@ std::vector<BatchAppendRange> BmRowContainer::selectedRanges(
 
   size_t reservedRangeIndex = 0;
   vector_size_t reservedOffset = 0;
-  selectedRows.applyToSelected([&](vector_size_t source) {
+  auto advanceReserved = [&]() {
     while (reservedRangeIndex < reservedRanges.size() &&
            reservedOffset == reservedRanges[reservedRangeIndex].rowCount) {
       ++reservedRangeIndex;
       reservedOffset = 0;
     }
+  };
+
+  selectedRows.applyToSelected([&](vector_size_t source) {
+    advanceReserved();
     BOLT_DCHECK_LT(reservedRangeIndex, reservedRanges.size());
-    const auto& reserved = reservedRanges[reservedRangeIndex];
-    auto* row = reserved.rowBegin + reservedOffset * rowStride;
-    selected.push_back(BatchAppendRange{reserved.chunk, row, source, 1});
+    const auto rangeIndex = reservedRangeIndex;
+    const auto rangeOffset = reservedOffset;
+    auto* row = reservedRanges[rangeIndex].rowBegin + rangeOffset * rowStride;
     if (rows != nullptr) {
       rows->push_back(row);
     }
     ++reservedOffset;
+
+    if (!selected.empty()) {
+      auto& last = selected.back();
+      const auto* expectedRow = last.rowBegin + last.rowCount * rowStride;
+      if (last.chunk == reservedRanges[rangeIndex].chunk &&
+          last.sourceBegin + last.rowCount == source && expectedRow == row) {
+        ++last.rowCount;
+        return;
+      }
+    }
+
+    selected.push_back(
+        BatchAppendRange{reservedRanges[rangeIndex].chunk, row, source, 1});
   });
 
   BOLT_DCHECK_EQ(selected.size(), selectedCount);

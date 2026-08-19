@@ -22,7 +22,6 @@ std::vector<BatchAppendRange> BmRowContainer::selectedRanges(
 
   size_t reservedRangeIndex = 0;
   vector_size_t reservedOffset = 0;
-  vector_size_t totalSelectedRows = 0;
   bool hasLastReservedRangeIndex = false;
   size_t lastReservedRangeIndex = 0;
   auto advanceReserved = [&]() {
@@ -43,7 +42,6 @@ std::vector<BatchAppendRange> BmRowContainer::selectedRanges(
       rows->push_back(row);
     }
     ++reservedOffset;
-    ++totalSelectedRows;
 
     if (!selected.empty()) {
       auto& last = selected.back();
@@ -62,7 +60,11 @@ std::vector<BatchAppendRange> BmRowContainer::selectedRanges(
     hasLastReservedRangeIndex = true;
   });
 
-  BOLT_DCHECK_EQ(totalSelectedRows, selectedCount);
+  vector_size_t totalRowCount = 0;
+  for (const auto& range : selected) {
+    totalRowCount += range.rowCount;
+  }
+  BOLT_DCHECK_EQ(totalRowCount, selectedCount);
   return selected;
 }
 

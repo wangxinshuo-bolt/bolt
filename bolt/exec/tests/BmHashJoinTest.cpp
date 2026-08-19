@@ -523,5 +523,92 @@ TEST_F(BmHashJoinTest, duplicateCompositeKeysSpanOutputBatchesOnBmBackend) {
   OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
 }
 
+TEST_F(BmHashJoinTest, dateAndDecimalAliasesUseBmBackend) {
+  const auto dateType = DATE();
+  const auto shortDecimalType = DECIMAL(10, 2);
+  const auto longDecimalType = DECIMAL(30, 8);
+  ASSERT_TRUE(dateType->isDate());
+  ASSERT_TRUE(shortDecimalType->isShortDecimal());
+  ASSERT_TRUE(longDecimalType->isLongDecimal());
+  ASSERT_EQ(TypeKind::INTEGER, dateType->kind());
+  ASSERT_EQ(TypeKind::BIGINT, shortDecimalType->kind());
+  ASSERT_EQ(TypeKind::HUGEINT, longDecimalType->kind());
+
+  auto probe = makeRowVector(
+      {"t_date", "t_short", "t_long", "t_payload"},
+      {
+          makeFlatVector<int32_t>(
+              {DATE()->toDays("2024-01-01"),
+               DATE()->toDays("2024-01-02"),
+               DATE()->toDays("2024-01-03")},
+              dateType),
+          makeFlatVector<int64_t>({12345, 22222, 33333}, shortDecimalType),
+          makeFlatVector<int128_t>(
+              {static_cast<int128_t>(900000000000000000LL),
+               static_cast<int128_t>(800000000000000000LL),
+               static_cast<int128_t>(700000000000000000LL)},
+              longDecimalType),
+          makeFlatVector<int32_t>({10, 20, 30}),
+      });
+  auto build = makeRowVector(
+      {"u_date", "u_short", "u_long", "u_payload_short", "u_payload_long"},
+      {
+          makeFlatVector<int32_t>(
+              {DATE()->toDays("2024-01-03"),
+               DATE()->toDays("2024-01-01"),
+               DATE()->toDays("2024-01-04")},
+              dateType),
+          makeFlatVector<int64_t>({33333, 12345, 44444}, shortDecimalType),
+          makeFlatVector<int128_t>(
+              {static_cast<int128_t>(700000000000000000LL),
+               static_cast<int128_t>(900000000000000000LL),
+               static_cast<int128_t>(600000000000000000LL)},
+              longDecimalType),
+          makeFlatVector<int64_t>({30303, 10101, 40404}, shortDecimalType),
+          makeFlatVector<int128_t>(
+              {static_cast<int128_t>(707070700000000000LL),
+               static_cast<int128_t>(101010100000000000LL),
+               static_cast<int128_t>(404040400000000000LL)},
+              longDecimalType),
+      });
+  auto expected = makeRowVector(
+      {"t_date", "t_short", "t_long", "t_payload", "u_payload_short", "u_payload_long"},
+      {
+          makeFlatVector<int32_t>(
+              {DATE()->toDays("2024-01-01"),
+               DATE()->toDays("2024-01-03")},
+              dateType),
+          makeFlatVector<int64_t>({12345, 33333}, shortDecimalType),
+          makeFlatVector<int128_t>(
+              {static_cast<int128_t>(900000000000000000LL),
+               static_cast<int128_t>(700000000000000000LL)},
+              longDecimalType),
+          makeFlatVector<int32_t>({10, 30}),
+          makeFlatVector<int64_t>({10101, 30303}, shortDecimalType),
+          makeFlatVector<int128_t>(
+              {static_cast<int128_t>(101010100000000000LL),
+               static_cast<int128_t>(707070700000000000LL)},
+              longDecimalType),
+      });
+
+  auto task = runPlan(
+      makePlanForVectors(
+          probe,
+          build,
+          {"t_date", "t_short", "t_long"},
+          {"u_date", "u_short", "u_long"},
+          {"t_date",
+           "t_short",
+           "t_long",
+           "t_payload",
+           "u_payload_short",
+           "u_payload_long"}),
+      expected,
+      true);
+
+  expectBmBackend(*task);
+  OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
+}
+
 } // namespace
 } // namespace bytedance::bolt::exec::test

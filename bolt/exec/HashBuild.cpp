@@ -100,8 +100,37 @@ const char* bmFallbackReasonName(
       return "spill_restore";
     case Reason::kRightOrNullAwareLayout:
       return "right_or_null_aware_layout";
+    case Reason::kUnsupportedType:
+      return "unsupported_type";
   }
   return "unknown";
+}
+
+bool isBmHashJoinSupportedStoredType(const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+    case TypeKind::HUGEINT:
+    case TypeKind::REAL:
+    case TypeKind::DOUBLE:
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+    case TypeKind::TIMESTAMP:
+      return true;
+    case TypeKind::ARRAY:
+    case TypeKind::MAP:
+    case TypeKind::ROW:
+    case TypeKind::UNKNOWN:
+    case TypeKind::FUNCTION:
+    case TypeKind::OPAQUE:
+    case TypeKind::VARIANT:
+    case TypeKind::INVALID:
+      return false;
+  }
+  return false;
 }
 } // namespace
 
@@ -404,6 +433,11 @@ bool HashBuild::canUseBmHashJoin() {
   if (operatorCtx_->task()->bufferManager() == nullptr) {
     return fallback(BmHashJoinFallbackReason::kNoBufferManager);
   }
+  for (auto i = 0; i < tableType_->size(); ++i) {
+    if (!isBmHashJoinSupportedStoredType(tableType_->childAt(i))) {
+      return fallback(BmHashJoinFallbackReason::kUnsupportedType);
+    }
+  }
   bmHashJoinFallbackReason_ = BmHashJoinFallbackReason::kNone;
   return true;
 }
@@ -413,7 +447,7 @@ void HashBuild::recordBmHashJoinFallback(BmHashJoinFallbackReason reason) {
   if (reason == BmHashJoinFallbackReason::kNone) {
     return;
   }
-  addRuntimeStat(
+  stats_.wlock()->setRuntimeStat(
       "bmHashJoinFallbackReason",
       RuntimeCounter(static_cast<int64_t>(reason)));
   LOG(INFO) << name() << " BM hash join fallback: "
@@ -423,12 +457,6 @@ void HashBuild::recordBmHashJoinFallback(BmHashJoinFallbackReason reason) {
 void HashBuild::recordBmHashJoinStats() {
   auto lockedStats = stats_.wlock();
   if (!usingBmHashJoin()) {
-    if (bmHashJoinFallbackReason_ != BmHashJoinFallbackReason::kNone &&
-        lockedStats->runtimeStats.count("bmHashJoinFallbackReason") == 0) {
-      lockedStats->addRuntimeStat(
-          "bmHashJoinFallbackReason",
-          RuntimeCounter(static_cast<int64_t>(bmHashJoinFallbackReason_)));
-    }
     return;
   }
 

@@ -93,6 +93,7 @@ class HashBuild final : public Operator {
     kJitRowEq = 10,
     kSpillRestore = 11,
     kRightOrNullAwareLayout = 12,
+    kUnsupportedType = 13,
   };
 
   static std::string stateName(State state);

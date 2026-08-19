@@ -3,6 +3,7 @@
 #include "bolt/common/base/CompareFlags.h"
 #include "bolt/common/memory/bm/BufferManager.h"
 #include "bolt/common/memory/bm/MemoryTag.h"
+#include "bolt/common/memory/RawVector.h"
 #include "bolt/exec/bm/BmBatchAppend.h"
 #include "bolt/exec/bm/BmRowBlockLoader.h"
 #include "bolt/exec/bm/BmRowContainerPublicTypes.h"
@@ -10,6 +11,7 @@
 #include "bolt/exec/bm/BmRowCopier.h"
 #include "bolt/exec/bm/BmRowLayout.h"
 #include "bolt/exec/bm/BmRowWriteContext.h"
+#include "bolt/exec/bm/BmRoundLease.h"
 #include "bolt/exec/bm/BmSegmentCollection.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/ComplexVector.h"
@@ -85,6 +87,18 @@ class BmRowContainer {
       const char* left,
       const char* right,
       const std::vector<CompareFlags>& flags = {});
+
+  bool equalsDecoded(
+      const char* row,
+      int32_t column,
+      const DecodedVector& decoded,
+      vector_size_t index,
+      bool nullsEqual) const;
+
+  void hashRows(
+      folly::Range<char* const*> rows,
+      folly::Range<const int32_t*> keyColumns,
+      raw_vector<uint64_t>& hashes) const;
 
   FOLLY_ALWAYS_INLINE bool isNull(const char* row, int32_t column) const {
     return layout_.isNull(row, column);
@@ -163,6 +177,11 @@ class BmRowContainer {
 
   SegmentId spillActiveSegment();
   SegmentId spillActivePartitionSegment(PartitionId partition);
+  SegmentId sealActivePartitionSegment(PartitionId partition);
+  SegmentId spillSealedPartition(PartitionId partition);
+  std::vector<char*> loadPartitionRows(PartitionId partition);
+  BmRoundLease acquireRoundLease(PartitionId partition);
+  void releaseRoundLease(BmRoundLease& lease);
 
   // Materializes resident rows in the supplied order into a new
   // finalized/flushed segment. The returned SegmentId can be scanned through
@@ -300,6 +319,16 @@ class BmRowContainer {
       uint64_t targetBytes);
 
   uint64_t unloadedBytes(folly::Range<const SegmentId*> segments) const;
+  void synchronizeLoadedSegmentGeneration(SegmentData& segment);
+
+  void checkRowPointerReadable(const char* row) const;
+  void checkNoLiveLeaseForPartition(PartitionId partition) const;
+  void checkNoLiveLeaseForSegment(SegmentId segment) const;
+  void checkNoLiveLeaseForSegments(folly::Range<const SegmentId*> segments)
+      const;
+  void checkNoLiveLeaseForChunk(SegmentId segment, ChunkId chunk) const;
+  void checkNoLiveLeaseForPopFrontRows(uint64_t rowCount) const;
+  void invalidatePartitionRows(PartitionId partition);
 
   friend class BulkReadSession;
   friend class ReadOnlyWindowReadSession;
@@ -318,6 +347,8 @@ class BmRowContainer {
   BmSegmentCollection segments_;
   BmRowBlockLoader blockLoader_;
   BmRowCopier rowCopier_;
+  std::vector<uint64_t> partitionGenerations_;
+  std::vector<uint32_t> partitionLeaseCounts_;
 };
 
 } // namespace bytedance::bolt::exec::bm

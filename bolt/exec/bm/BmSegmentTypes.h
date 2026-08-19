@@ -38,6 +38,8 @@ struct SegmentMeta {
   // True when rows are physically materialized in merge order. MergeReadSession
   // requires this because it only merges already-ordered segments.
   bool orderedForMerge{false};
+  // Logical epoch of row pointers produced for this segment's partition.
+  uint64_t generation{0};
 };
 
 struct BlockRef {

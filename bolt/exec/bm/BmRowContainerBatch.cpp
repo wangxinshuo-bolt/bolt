@@ -60,6 +60,7 @@ void BmRowContainer::appendBatch(
   if (input->size() == 0) {
     return;
   }
+  checkNoLiveLeaseForPartition(partition);
 
   std::vector<BatchAppendRange> ranges;
   ranges.reserve(input->size());
@@ -67,6 +68,7 @@ void BmRowContainer::appendBatch(
     rows->reserve(rows->size() + input->size());
   }
   auto& segment = segments_.activeSegment(partition);
+  segment.meta.generation = partitionGenerations_[partition];
   segments_.reserveRowsInBatch(segment, 0, input->size(), ranges, rows);
 
   SelectivityVector allRows(input->size());
@@ -117,6 +119,7 @@ void BmRowContainer::appendBatchSelected(
   if (selectedCount == 0) {
     return;
   }
+  checkNoLiveLeaseForPartition(partition);
 
   std::vector<BatchAppendRange> reservedRanges;
   reservedRanges.reserve(selectedCount);
@@ -127,6 +130,7 @@ void BmRowContainer::appendBatchSelected(
   }
 
   auto& segment = segments_.activeSegment(partition);
+  segment.meta.generation = partitionGenerations_[partition];
   segments_.reserveRowsInBatch(
       segment, 0, selectedCount, reservedRanges, &reservedRows);
   auto ranges =

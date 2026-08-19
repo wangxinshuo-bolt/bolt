@@ -2,6 +2,7 @@ set(BOLT_EXEC_BM_STORAGE_SOURCES
   BmRowContainer.cpp
   BmRowContainerBatch.cpp
   BmRowContainerJoin.cpp
+  BmRoundLease.cpp
   BmBulkReadSession.cpp
   BmRowBlockLoader.cpp
   BmRowContainerCompare.cpp

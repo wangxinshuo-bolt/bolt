@@ -16,6 +16,9 @@ void BmRowContainer::extractColumnResident(
     const VectorPtr& result,
     bool exactSize) {
   BOLT_DCHECK_LT(column, layout_.columns().size());
+  for (int32_t i = 0; i < numRows; ++i) {
+    checkRowPointerReadable(rows[i]);
+  }
   BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
       extractColumnTyped,
       types_[column]->kind(),
@@ -35,6 +38,11 @@ void BmRowContainer::extractColumnResident(
     const VectorPtr& result,
     bool exactSize) {
   BOLT_DCHECK_LT(column, layout_.columns().size());
+  for (auto rowNumber : rowNumbers) {
+    if (rowNumber >= 0) {
+      checkRowPointerReadable(rows[rowNumber]);
+    }
+  }
   BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
       extractColumnByRowNumbersTyped,
       types_[column]->kind(),
@@ -52,6 +60,9 @@ void BmRowContainer::extractNullsResident(
     int32_t column,
     const BufferPtr& result) {
   BOLT_DCHECK_LT(column, layout_.columns().size());
+  for (int32_t i = 0; i < numRows; ++i) {
+    checkRowPointerReadable(rows[i]);
+  }
   BOLT_DCHECK(result->size() >= bits::nbytes(numRows));
   auto* rawNulls = result->asMutable<uint64_t>();
   bits::fillBits(rawNulls, 0, numRows, false);

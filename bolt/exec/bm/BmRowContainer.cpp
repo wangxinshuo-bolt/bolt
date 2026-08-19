@@ -22,12 +22,16 @@ BmRowContainer::BmRowContainer(
           rowBlockSize,
           heapBlockSize),
       blockLoader_(bufferManager_, &layout_, &segments_),
-      rowCopier_(&types_, &layout_, &segments_) {
+      rowCopier_(&types_, &layout_, &segments_),
+      partitionGenerations_(kMaxPartitions, 0),
+      partitionLeaseCounts_(kMaxPartitions, 0) {
   BOLT_CHECK_NOT_NULL(bufferManager_);
 }
 
 RowWriteContext BmRowContainer::appendRow(PartitionId partition) {
+  checkNoLiveLeaseForPartition(partition);
   auto& segment = segments_.activeSegment(partition);
+  segment.meta.generation = partitionGenerations_[partition];
   auto* row = segments_.newRowInSegment(segment);
   BOLT_DCHECK_NOT_NULL(segment.writeCursor.chunk);
   auto& chunk = *segment.writeCursor.chunk;

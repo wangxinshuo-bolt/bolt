@@ -242,6 +242,9 @@ class QueryConfig {
   static constexpr const char* kBufferManagerEnabled =
       "buffer-manager-enabled";
 
+  /// Enables resident BufferManager backed hash join for supported inner joins.
+  static constexpr const char* kBmHashJoinEnabled = "bm-hash-join-enabled";
+
   /// Aggregation spilling flag, only applies if "spill_enabled" flag is set.
   static constexpr const char* kAggregationSpillEnabled =
       "aggregation_spill_enabled";
@@ -1060,6 +1063,10 @@ class QueryConfig {
 
   bool bufferManagerEnabled() const {
     return get<bool>(kBufferManagerEnabled, false);
+  }
+
+  bool bmHashJoinEnabled() const {
+    return get<bool>(kBmHashJoinEnabled, false);
   }
 
   config::AB_MODE spillUringEnabled() const {

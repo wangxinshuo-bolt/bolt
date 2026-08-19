@@ -1,23 +1,6 @@
 include(GoogleTest)
 
 add_executable(
-  bolt_exec_bm_storage_link_test
-  BmStorageLinkTest.cpp
-  BmTestMain.cpp
-)
-
-target_compile_features(bolt_exec_bm_storage_link_test PRIVATE cxx_std_20)
-
-target_link_libraries(
-  bolt_exec_bm_storage_link_test
-  PRIVATE bolt_exec_bm_storage
-          bolt_memory_bm
-          GTest::gtest
-)
-
-gtest_add_tests(bolt_exec_bm_storage_link_test "" AUTO)
-
-add_executable(
   bolt_exec_bm_test
   ../benchmarks/BmRowContainerBenchmarkProfiles.cpp
   BmRowContainerBenchmarkProfileTest.cpp
@@ -34,8 +17,7 @@ target_compile_features(bolt_exec_bm_test PRIVATE cxx_std_20)
 
 target_link_libraries(
   bolt_exec_bm_test
-  PRIVATE bolt_exec_bm
-          bolt_testutils
+  PRIVATE bolt_testutils
           GTest::gmock
           GTest::gtest
           pthread

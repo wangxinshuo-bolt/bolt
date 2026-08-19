@@ -133,7 +133,6 @@ target_link_libraries(
   bolt_filter
   bolt_file
   bolt_core
-  bolt_exec_bm_storage
   bolt_vector
   bolt_connector
   bolt_time

@@ -22,6 +22,9 @@ std::vector<BatchAppendRange> BmRowContainer::selectedRanges(
 
   size_t reservedRangeIndex = 0;
   vector_size_t reservedOffset = 0;
+  vector_size_t totalSelectedRows = 0;
+  bool hasLastReservedRangeIndex = false;
+  size_t lastReservedRangeIndex = 0;
   auto advanceReserved = [&]() {
     while (reservedRangeIndex < reservedRanges.size() &&
            reservedOffset == reservedRanges[reservedRangeIndex].rowCount) {
@@ -40,11 +43,13 @@ std::vector<BatchAppendRange> BmRowContainer::selectedRanges(
       rows->push_back(row);
     }
     ++reservedOffset;
+    ++totalSelectedRows;
 
     if (!selected.empty()) {
       auto& last = selected.back();
       const auto* expectedRow = last.rowBegin + last.rowCount * rowStride;
-      if (last.chunk == reservedRanges[rangeIndex].chunk &&
+      if (hasLastReservedRangeIndex && lastReservedRangeIndex == rangeIndex &&
+          last.chunk == reservedRanges[rangeIndex].chunk &&
           last.sourceBegin + last.rowCount == source && expectedRow == row) {
         ++last.rowCount;
         return;
@@ -53,9 +58,11 @@ std::vector<BatchAppendRange> BmRowContainer::selectedRanges(
 
     selected.push_back(
         BatchAppendRange{reservedRanges[rangeIndex].chunk, row, source, 1});
+    lastReservedRangeIndex = rangeIndex;
+    hasLastReservedRangeIndex = true;
   });
 
-  BOLT_DCHECK_EQ(selected.size(), selectedCount);
+  BOLT_DCHECK_EQ(totalSelectedRows, selectedCount);
   return selected;
 }
 

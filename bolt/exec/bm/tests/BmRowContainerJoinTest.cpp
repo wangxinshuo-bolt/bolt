@@ -3,6 +3,7 @@
 #include "bolt/common/base/BitUtil.h"
 #include "bolt/type/HugeInt.h"
 
+#include <numeric>
 #include <optional>
 #include <string>
 #include <vector>
@@ -242,6 +243,15 @@ TEST_F(BmRowContainerTest, SelectedRangesCoalescesContiguousRows) {
       reservedRanges, selected, &rows, rowStride);
 
   ASSERT_EQ(2, ranges.size());
+  EXPECT_EQ(
+      5,
+      std::accumulate(
+          ranges.begin(),
+          ranges.end(),
+          0,
+          [](int total, const BatchAppendRange& range) {
+            return total + range.rowCount;
+          }));
   EXPECT_EQ(&firstChunk, ranges[0].chunk);
   EXPECT_EQ(firstStorage.data(), ranges[0].rowBegin);
   EXPECT_EQ(1, ranges[0].sourceBegin);
@@ -260,18 +270,17 @@ TEST_F(BmRowContainerTest, SelectedRangesCoalescesContiguousRows) {
   EXPECT_EQ(secondStorage.data() + rowStride, rows[4]);
 }
 
-TEST_F(BmRowContainerTest, SelectedRangesRespectsReservedRangeBoundaries) {
-  ChunkData firstChunk;
-  firstChunk.meta.id = 21;
-  ChunkData secondChunk;
-  secondChunk.meta.id = 22;
+TEST_F(
+    BmRowContainerTest,
+    SelectedRangesRespectsReservedRangeBoundariesWithinChunk) {
+  ChunkData chunk;
+  chunk.meta.id = 21;
 
-  std::vector<char> firstStorage(16);
-  std::vector<char> secondStorage(16);
+  std::vector<char> storage(24);
   const uint32_t rowStride = 8;
   std::vector<BatchAppendRange> reservedRanges{
-      BatchAppendRange{&firstChunk, firstStorage.data(), 0, 2},
-      BatchAppendRange{&secondChunk, secondStorage.data(), 2, 2},
+      BatchAppendRange{&chunk, storage.data(), 0, 2},
+      BatchAppendRange{&chunk, storage.data() + 2 * rowStride, 2, 1},
   };
 
   SelectivityVector selected(5, false);
@@ -284,13 +293,22 @@ TEST_F(BmRowContainerTest, SelectedRangesRespectsReservedRangeBoundaries) {
       reservedRanges, selected, nullptr, rowStride);
 
   ASSERT_EQ(2, ranges.size());
-  EXPECT_EQ(&firstChunk, ranges[0].chunk);
-  EXPECT_EQ(firstStorage.data(), ranges[0].rowBegin);
+  EXPECT_EQ(
+      3,
+      std::accumulate(
+          ranges.begin(),
+          ranges.end(),
+          0,
+          [](int total, const BatchAppendRange& range) {
+            return total + range.rowCount;
+          }));
+  EXPECT_EQ(&chunk, ranges[0].chunk);
+  EXPECT_EQ(storage.data(), ranges[0].rowBegin);
   EXPECT_EQ(1, ranges[0].sourceBegin);
   EXPECT_EQ(2, ranges[0].rowCount);
 
-  EXPECT_EQ(&secondChunk, ranges[1].chunk);
-  EXPECT_EQ(secondStorage.data(), ranges[1].rowBegin);
+  EXPECT_EQ(&chunk, ranges[1].chunk);
+  EXPECT_EQ(storage.data() + 2 * rowStride, ranges[1].rowBegin);
   EXPECT_EQ(3, ranges[1].sourceBegin);
   EXPECT_EQ(1, ranges[1].rowCount);
 }

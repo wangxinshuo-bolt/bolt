@@ -117,7 +117,8 @@ add_executable(
 
 add_executable(
   bolt_exec_hash_join_test HashBitRangeTest.cpp HashJoinBridgeTest.cpp HashJoinTest.cpp
-                           HashPartitionFunctionTest.cpp HashTableTest.cpp Main.cpp
+                           HashPartitionFunctionTest.cpp HashTableTest.cpp
+                           BmHashTableTest.cpp Main.cpp
 )
 
 add_executable(bolt_exec_merge_join_test Main.cpp MergeJoinTest.cpp NestedLoopJoinTest.cpp)

@@ -53,6 +53,7 @@ bolt_add_library(
   Generator.cpp
   GroupId.cpp
   GroupingSet.cpp
+  BmHashTable.cpp
   HashAggregation.cpp
   HashBuild.cpp
   HashJoinBridge.cpp

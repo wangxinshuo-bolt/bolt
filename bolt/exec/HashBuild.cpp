@@ -657,10 +657,15 @@ void HashBuild::addInput(RowVectorPtr input) {
       analyzeKeys_ = hasher->mayUseValueIds();
     }
   }
-  auto rows = table_->rows();
-  auto nextOffset = rows->nextOffset();
+  std::vector<const DecodedVector*> keyDecoders;
+  keyDecoders.reserve(hashers.size());
+  for (auto& hasher : hashers) {
+    keyDecoders.push_back(&hasher->decodedVector());
+  }
 
   if (hybridJoin_) {
+    auto rows = table_->rows();
+    auto nextOffset = rows->nextOffset();
     // Get batch/row info before processing
     auto batchId = table_->hybridData()->getNumBatches(); // for scattered mode
     auto baseRow = table_->hybridData()->getNumRows(); // for coalesced mode
@@ -697,21 +702,17 @@ void HashBuild::addInput(RowVectorPtr input) {
         input->as<RowVector>(), dependentChannels_, dependentTypes_, pool());
     table_->hybridData()->addPayload(std::move(payloadInput));
   } else {
-    activeRows_.applyToSelected([&](auto rowIndex) {
-      char* newRow = rows->newRow();
-      if (nextOffset) {
-        *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
-      }
-      // Store the columns for each row in sequence. At probe time
-      // strings of the row will probably be in consecutive places, so
-      // reading one will prime the cache for the next.
-      for (auto i = 0; i < hashers.size(); ++i) {
-        rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
-      }
-      for (auto i = 0; i < dependentChannels_.size(); ++i) {
-        rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
-      }
-    });
+    std::vector<const DecodedVector*> dependentDecoders;
+    dependentDecoders.reserve(decoders_.size());
+    for (const auto& decoder : decoders_) {
+      dependentDecoders.push_back(decoder.get());
+    }
+    table_->appendJoinRows(
+        activeRows_,
+        folly::Range<const DecodedVector* const*>(
+            keyDecoders.data(), keyDecoders.size()),
+        folly::Range<const DecodedVector* const*>(
+            dependentDecoders.data(), dependentDecoders.size()));
   }
   spillRowBasedInput();
 }

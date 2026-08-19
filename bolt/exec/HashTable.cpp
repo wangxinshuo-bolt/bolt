@@ -2300,6 +2300,56 @@ void HashTable<ignoreNullKeys>::directAddRows(
   }
 }
 
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::appendJoinRows(
+    const SelectivityVector& rows,
+    folly::Range<const DecodedVector* const*> keyDecoders,
+    folly::Range<const DecodedVector* const*> dependentDecoders) {
+  const auto nextOffset = rows_->nextOffset();
+  rows.applyToSelected([&](auto rowIndex) {
+    char* newRow = rows_->newRow();
+    if (nextOffset) {
+      *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
+    }
+    for (auto i = 0; i < keyDecoders.size(); ++i) {
+      rows_->store(*keyDecoders[i], rowIndex, newRow, i);
+    }
+    for (auto i = 0; i < dependentDecoders.size(); ++i) {
+      rows_->store(
+          *dependentDecoders[i], rowIndex, newRow, i + keyDecoders.size());
+    }
+  });
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::extractJoinColumn(
+    const char* const* rows,
+    int32_t numRows,
+    int32_t column,
+    const VectorPtr& result) const {
+  rows_->extractColumn(rows, numRows, column, result);
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::setJoinProbedFlags(
+    char* const* rows,
+    int32_t numRows) {
+  rows_->setProbedFlag(const_cast<char**>(rows), numRows);
+}
+
+template <bool ignoreNullKeys>
+void HashTable<ignoreNullKeys>::extractJoinProbedFlags(
+    const char* const* rows,
+    int32_t numRows,
+    const VectorPtr& result) const {
+  rows_->extractProbedFlags(rows, numRows, false, false, result);
+}
+
+template <bool ignoreNullKeys>
+uint64_t HashTable<ignoreNullKeys>::joinRowCount() const {
+  return rows_->numRows();
+}
+
 void BaseHashTable::prepareForGroupProbe(
     HashLookup& lookup,
     const RowVectorPtr& input,

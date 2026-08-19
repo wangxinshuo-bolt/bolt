@@ -38,6 +38,7 @@
 #include "bolt/dwio/common/tests/utils/BatchMaker.h"
 #include "bolt/exec/HashBuild.h"
 #include "bolt/exec/HashJoinBridge.h"
+#include "bolt/exec/HashProbe.h"
 #include "bolt/exec/PlanNodeStats.h"
 #include "bolt/exec/TableScan.h"
 #include "bolt/exec/tests/utils/ArbitratorTestUtil.h"
@@ -5893,6 +5894,97 @@ TEST_F(HashJoinTest, smallOutputBatchSize) {
       .referenceQuery("SELECT c0, u_c1 FROM t, u WHERE c0 = u_c0 AND c1 < u_c1")
       .injectSpill(false)
       .run();
+}
+
+TEST_F(HashJoinTest, innerJoinDuplicateChainSpansOutputBatches) {
+  auto probeVectors = makeRowVector({
+      makeFlatVector<int32_t>({7}),
+      makeFlatVector<int32_t>({70}),
+  });
+  auto buildVectors = makeRowVector(
+      {"u_c0", "u_c1"},
+      {
+          makeFlatVector<int32_t>({7, 7, 7, 7, 7}),
+          makeFlatVector<int32_t>({100, 101, 102, 103, 104}),
+      });
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeVectors})
+                  .hashJoin(
+                      {"c0"},
+                      {"u_c0"},
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildVectors})
+                          .planNode(),
+                      "",
+                      {"c0", "c1", "u_c1"},
+                      core::JoinType::kInner)
+                  .planNode();
+
+  auto expected = makeRowVector({
+      makeFlatVector<int32_t>({7, 7, 7, 7, 7}),
+      makeFlatVector<int32_t>({70, 70, 70, 70, 70}),
+      makeFlatVector<int32_t>({100, 101, 102, 103, 104}),
+  });
+
+  AssertQueryBuilder(plan)
+      .config(core::QueryConfig::kPreferredOutputBatchRows, "2")
+      .assertResults(expected);
+}
+
+TEST_F(HashJoinTest, resetRoundPointerStateClearsBuildRowPointerCaches) {
+  std::vector<HashProbe::RoundPointerStateSnapshot> snapshots;
+  HashProbe::testingSetRoundPointerStateResetCallback(
+      [&](HashProbe::RoundPointerStateSnapshot snapshot) {
+        snapshots.push_back(snapshot);
+      });
+  SCOPE_EXIT {
+    HashProbe::testingSetRoundPointerStateResetCallback(nullptr);
+  };
+
+  auto probeVectors = makeRowVector({
+      makeFlatVector<int32_t>({3}),
+      makeFlatVector<int32_t>({30}),
+  });
+  auto buildVectors = makeRowVector(
+      {"u_c0", "u_c1"},
+      {
+          makeFlatVector<int32_t>({3, 3, 3, 3}),
+          makeFlatVector<int32_t>({300, 301, 302, 303}),
+      });
+
+  auto planNodeIdGenerator = std::make_shared<core::PlanNodeIdGenerator>();
+  auto plan = PlanBuilder(planNodeIdGenerator)
+                  .values({probeVectors})
+                  .hashJoin(
+                      {"c0"},
+                      {"u_c0"},
+                      PlanBuilder(planNodeIdGenerator)
+                          .values({buildVectors})
+                          .planNode(),
+                      "",
+                      {"c0", "c1", "u_c1"},
+                      core::JoinType::kInner)
+                  .planNode();
+
+  AssertQueryBuilder(plan)
+      .config(core::QueryConfig::kPreferredOutputBatchRows, "2")
+      .assertResults(makeRowVector({
+          makeFlatVector<int32_t>({3, 3, 3, 3}),
+          makeFlatVector<int32_t>({30, 30, 30, 30}),
+          makeFlatVector<int32_t>({300, 301, 302, 303}),
+      }));
+
+  ASSERT_FALSE(snapshots.empty());
+  for (const auto& snapshot : snapshots) {
+    EXPECT_EQ(snapshot.lookupHitsWithBuildRows, 0);
+    EXPECT_FALSE(snapshot.joinResultIteratorHasRows);
+    EXPECT_FALSE(snapshot.joinResultIteratorHasHits);
+    EXPECT_FALSE(snapshot.joinResultIteratorHasNextHit);
+    EXPECT_EQ(snapshot.outputTableRowsWithBuildRows, 0);
+    EXPECT_FALSE(snapshot.lastProbeIteratorHasRowContainerState);
+  }
 }
 
 TEST_F(HashJoinTest, spillFileSize) {

@@ -255,6 +255,26 @@ class BaseHashTable {
       SelectivityVector& rows,
       bool decodeAndRemoveNulls) = 0;
 
+  virtual void appendJoinRows(
+      const SelectivityVector& rows,
+      folly::Range<const DecodedVector* const*> keyDecoders,
+      folly::Range<const DecodedVector* const*> dependentDecoders) = 0;
+
+  virtual void extractJoinColumn(
+      const char* const* rows,
+      int32_t numRows,
+      int32_t column,
+      const VectorPtr& result) const = 0;
+
+  virtual void setJoinProbedFlags(char* const* rows, int32_t numRows) = 0;
+
+  virtual void extractJoinProbedFlags(
+      const char* const* rows,
+      int32_t numRows,
+      const VectorPtr& result) const = 0;
+
+  virtual uint64_t joinRowCount() const = 0;
+
   /// Fills 'hits' with consecutive hash join results. The corresponding element
   /// of 'inputRows' is set to the corresponding row number in probe keys.
   /// Returns the number of hits produced. If this s less than hits.size() then
@@ -662,6 +682,26 @@ class HashTable : public BaseHashTable {
       const RowVectorPtr& input,
       SelectivityVector& rows,
       bool decodeAndRemoveNulls) override;
+
+  void appendJoinRows(
+      const SelectivityVector& rows,
+      folly::Range<const DecodedVector* const*> keyDecoders,
+      folly::Range<const DecodedVector* const*> dependentDecoders) override;
+
+  void extractJoinColumn(
+      const char* const* rows,
+      int32_t numRows,
+      int32_t column,
+      const VectorPtr& result) const override;
+
+  void setJoinProbedFlags(char* const* rows, int32_t numRows) override;
+
+  void extractJoinProbedFlags(
+      const char* const* rows,
+      int32_t numRows,
+      const VectorPtr& result) const override;
+
+  uint64_t joinRowCount() const override;
 
   int64_t allocatedBytes() const override {
     // For each row: sizeof(char*) per table entry + memory

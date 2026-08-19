@@ -1,5 +1,5 @@
-bolt_add_library(
-  bolt_exec_bm
+add_library(
+  bolt_exec_bm_storage
   BmRowContainer.cpp
   BmRowContainerBatch.cpp
   BmBulkReadSession.cpp
@@ -21,14 +21,21 @@ bolt_add_library(
   BmRowContainerSegmentLifecycle.cpp
 )
 
-target_compile_features(bolt_exec_bm PRIVATE cxx_std_20)
+target_compile_features(bolt_exec_bm_storage PUBLIC cxx_std_20)
+
+target_link_libraries(
+  bolt_exec_bm_storage
+  PUBLIC bolt_memory_bm
+         bolt_vector
+         bolt_common_base
+)
+
+add_library(bolt_exec_bm INTERFACE)
 
 target_link_libraries(
   bolt_exec_bm
-  bolt_exec
-  bolt_memory_bm
-  bolt_vector
-  bolt_common_base
+  INTERFACE bolt_exec_bm_storage
+            bolt_exec
 )
 
 if(${BOLT_BUILD_TESTING})

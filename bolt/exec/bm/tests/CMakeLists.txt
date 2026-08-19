@@ -13,7 +13,6 @@ target_link_libraries(
   PRIVATE bolt_exec_bm_storage
           bolt_memory_bm
           GTest::gtest
-          pthread
 )
 
 gtest_add_tests(bolt_exec_bm_storage_link_test "" AUTO)

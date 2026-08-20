@@ -12,6 +12,7 @@ TEST(BufferManagerValueMappingTest, AllMemoryTagsHaveStableNames) {
   EXPECT_EQ(static_cast<size_t>(MemoryTag::kCount), kMemoryTagCount);
   EXPECT_STREQ("Unknown", toString(MemoryTag::kUnknown));
   EXPECT_STREQ("HashBuild", toString(MemoryTag::kHashBuild));
+  EXPECT_STREQ("HashJoin", toString(MemoryTag::kHashJoin));
   EXPECT_STREQ("Aggregation", toString(MemoryTag::kAggregation));
   EXPECT_STREQ("Sort", toString(MemoryTag::kSort));
   EXPECT_STREQ("Window", toString(MemoryTag::kWindow));

@@ -67,6 +67,10 @@ struct BufferManagerTagStats {
   uint64_t pinCount{0};
   uint64_t spillWriteCount{0};
   uint64_t spillReadCount{0};
+  uint64_t spillWriteBytes{0};
+  uint64_t spillReadBytes{0};
+  uint64_t spillPhysicalWriteBytes{0};
+  uint64_t spillPhysicalReadBytes{0};
 };
 
 struct BlockMemory;

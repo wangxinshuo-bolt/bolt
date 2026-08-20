@@ -4,6 +4,21 @@
 
 namespace bytedance::bolt::exec {
 
+namespace {
+
+const memory::bm::BufferManagerTagStats& findTagStats(
+    const std::vector<memory::bm::BufferManagerTagStats>& tagStats,
+    memory::bm::MemoryTag tag) {
+  for (const auto& stats : tagStats) {
+    if (stats.tag == tag) {
+      return stats;
+    }
+  }
+  BOLT_FAIL("Missing BufferManager tag stats for {}", toString(tag));
+}
+
+} // namespace
+
 std::shared_ptr<BmHashJoinStorage> BmHashJoinStorage::createForJoin(
     std::vector<TypePtr> types,
     uint32_t numKeys,
@@ -43,11 +58,16 @@ BmHashJoinStorage::BmHashJoinStorage(
       std::move(types),
       std::move(nullable),
       bufferManager_,
-      memory::bm::MemoryTag::kHashBuild,
+      kStorageMemoryTag,
       rowBlockSize,
       heapBlockSize,
       options);
   refreshRowCount();
+}
+
+memory::bm::BufferManagerTagStats BmHashJoinStorage::tagStatsSnapshot(
+    const memory::bm::BufferManager& bufferManager) {
+  return findTagStats(bufferManager.tagStats(), kStorageMemoryTag);
 }
 
 std::vector<bool> BmHashJoinStorage::makeNullable(
@@ -61,9 +81,9 @@ uint64_t BmHashJoinStorage::counterDelta(uint64_t before, uint64_t after) {
 
 void BmHashJoinStorage::addStatsDelta(
     RuntimeStats& stats,
-    const memory::bm::BufferManagerStats& before,
-    const memory::bm::BufferManagerStats& after) {
-  stats.spilledBytes = std::max(stats.spilledBytes, after.spilledBytes);
+    const memory::bm::BufferManagerTagStats& before,
+    const memory::bm::BufferManagerTagStats& after) {
+  stats.spilledBytes = after.spilledBytes;
   stats.spillWriteCount +=
       counterDelta(before.spillWriteCount, after.spillWriteCount);
   stats.spillReadCount +=
@@ -85,14 +105,14 @@ void BmHashJoinStorage::refreshRowCount() {
 void BmHashJoinStorage::spillPartition(bm::PartitionId partition) {
   refreshRowCount();
   runtimeStats_.spilledRows = runtimeStats_.bmRows;
-  const auto before = bufferManager_->stats();
+  const auto before = tagStatsSnapshot(*bufferManager_);
   if (rows_->activeSegmentId(partition) != bm::kNoSegment) {
     rows_->sealActivePartitionSegment(partition);
   }
   if (!rows_->segmentsForPartition(partition).empty()) {
     rows_->spillSealedPartition(partition);
   }
-  const auto after = bufferManager_->stats();
+  const auto after = tagStatsSnapshot(*bufferManager_);
   runtimeStats_.spillSegments = rows_->segmentsForPartition(partition).size();
   runtimeStats_.spilledSegments = runtimeStats_.spillSegments;
   addStatsDelta(runtimeStats_, before, after);
@@ -101,12 +121,12 @@ void BmHashJoinStorage::spillPartition(bm::PartitionId partition) {
 
 BmHashJoinStorage::LoadedPartition BmHashJoinStorage::loadPartition(
     bm::PartitionId partition) {
-  const auto before = bufferManager_->stats();
+  const auto before = tagStatsSnapshot(*bufferManager_);
   LoadedPartition loaded;
-  loaded.rows = rows_->loadPartitionRows(partition);
   loaded.lease = rows_->acquireRoundLease(partition);
+  loaded.rows = rows_->loadPartitionRows(partition);
   ++runtimeStats_.restoreCount;
-  const auto after = bufferManager_->stats();
+  const auto after = tagStatsSnapshot(*bufferManager_);
   refreshRowCount();
   addStatsDelta(runtimeStats_, before, after);
   runtimeStats_.spillBytes = runtimeStats_.spilledBytes;

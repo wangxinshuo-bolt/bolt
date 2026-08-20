@@ -8,6 +8,7 @@ namespace bytedance::bolt::memory::bm {
 enum class MemoryTag : uint8_t {
   kUnknown,
   kHashBuild,
+  kHashJoin,
   kAggregation,
   kSort,
   kWindow,
@@ -24,6 +25,8 @@ inline const char* toString(MemoryTag tag) {
       return "Unknown";
     case MemoryTag::kHashBuild:
       return "HashBuild";
+    case MemoryTag::kHashJoin:
+      return "HashJoin";
     case MemoryTag::kAggregation:
       return "Aggregation";
     case MemoryTag::kSort:

@@ -75,12 +75,17 @@ class BmHashJoinStorage {
       bm::PartitionId partition = bm::kDefaultPartition);
 
  private:
+  static constexpr memory::bm::MemoryTag kStorageMemoryTag =
+      memory::bm::MemoryTag::kHashJoin;
+
+  static memory::bm::BufferManagerTagStats tagStatsSnapshot(
+      const memory::bm::BufferManager& bufferManager);
   static std::vector<bool> makeNullable(const std::vector<TypePtr>& types);
   static uint64_t counterDelta(uint64_t before, uint64_t after);
   static void addStatsDelta(
       RuntimeStats& stats,
-      const memory::bm::BufferManagerStats& before,
-      const memory::bm::BufferManagerStats& after);
+      const memory::bm::BufferManagerTagStats& before,
+      const memory::bm::BufferManagerTagStats& after);
 
   // Keep BufferManager before rows_ so its blocks outlive row-container teardown.
   std::shared_ptr<memory::bm::BufferManager> bufferManager_;

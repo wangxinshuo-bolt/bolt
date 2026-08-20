@@ -15,6 +15,7 @@ namespace {
 constexpr std::array<MemoryTag, kMemoryTagCount> kMemoryTags{
     MemoryTag::kUnknown,
     MemoryTag::kHashBuild,
+    MemoryTag::kHashJoin,
     MemoryTag::kAggregation,
     MemoryTag::kSort,
     MemoryTag::kWindow,
@@ -63,7 +64,10 @@ std::vector<BufferManagerTagStats> nonEmptyTagStats(
     if (stats.allocatedBlocks > 0 || stats.liveBlocks > 0 ||
         stats.residentBytes > 0 || stats.spilledBytes > 0 ||
         stats.reclaimedBytes > 0 || stats.pinCount > 0 ||
-        stats.spillWriteCount > 0 || stats.spillReadCount > 0) {
+        stats.spillWriteCount > 0 || stats.spillReadCount > 0 ||
+        stats.spillWriteBytes > 0 || stats.spillReadBytes > 0 ||
+        stats.spillPhysicalWriteBytes > 0 ||
+        stats.spillPhysicalReadBytes > 0) {
       result.push_back(stats);
     }
   }
@@ -128,7 +132,12 @@ std::string toDebugString(
           << ", reclaimed_bytes=" << tag.reclaimedBytes
           << ", pin_count=" << tag.pinCount
           << ", spill_write_count=" << tag.spillWriteCount
-          << ", spill_read_count=" << tag.spillReadCount << "}";
+          << ", spill_read_count=" << tag.spillReadCount
+          << ", spill_write_bytes=" << tag.spillWriteBytes
+          << ", spill_read_bytes=" << tag.spillReadBytes
+          << ", spill_physical_write_bytes=" << tag.spillPhysicalWriteBytes
+          << ", spill_physical_read_bytes=" << tag.spillPhysicalReadBytes
+          << "}";
     }
     out << "]";
   }
@@ -281,6 +290,8 @@ void BufferManagerStatsCollector::OnReadCompleted(
   tagStats.residentBytes += memory.size;
   tagStats.pinnedResidentBytes += memory.size;
   ++tagStats.spillReadCount;
+  tagStats.spillReadBytes += memory.size;
+  tagStats.spillPhysicalReadBytes += read.physicalBytes;
 }
 
 void BufferManagerStatsCollector::OnSpillStarted(const BlockMemory& memory) {
@@ -333,6 +344,8 @@ void BufferManagerStatsCollector::OnSpillCompleted(
   tagStats.spilledBytes += memory.size;
   tagStats.reclaimedBytes += memory.size;
   ++tagStats.spillWriteCount;
+  tagStats.spillWriteBytes += memory.size;
+  tagStats.spillPhysicalWriteBytes += write.physicalBytes;
 }
 
 void BufferManagerStatsCollector::OnCleanResidentDiscarded(

@@ -75,6 +75,7 @@ bool IsIoUringUnavailable(const std::exception& e) {
 
 TEST(BufferManagerApiTest, MemoryTagHasStableNames) {
   EXPECT_STREQ("Unknown", toString(MemoryTag::kUnknown));
+  EXPECT_STREQ("HashJoin", toString(MemoryTag::kHashJoin));
   EXPECT_STREQ("Testing", toString(MemoryTag::kTesting));
 }
 
@@ -389,6 +390,66 @@ TEST_F(BufferManagerTest, TagStatsTrackAllocationSource) {
   EXPECT_EQ(1, aggStats->liveBlocks);
   EXPECT_EQ(8192, aggStats->residentBytes);
   EXPECT_EQ(8192, aggStats->pinnedResidentBytes);
+}
+
+TEST_F(BufferManagerTest, TagStatsKeepHashJoinIoIsolatedFromOtherTags) {
+  auto bm = makeBufferManager("tag-stats-hash-join-io");
+  std::shared_ptr<BlockHandle> hashJoinBlock;
+  {
+    auto handle = bm->Allocate(4096, MemoryTag::kHashJoin);
+    hashJoinBlock = handle.block();
+    std::memset(handle.Ptr(), 29, hashJoinBlock->size());
+  }
+
+  std::shared_ptr<BlockHandle> sortBlock;
+  {
+    auto handle = bm->Allocate(8192, MemoryTag::kSort);
+    sortBlock = handle.block();
+    std::memset(handle.Ptr(), 11, sortBlock->size());
+  }
+
+  try {
+    ASSERT_EQ(4096, bm->Reclaim(4096));
+    ASSERT_EQ(8192, bm->Reclaim(8192));
+  } catch (const std::exception& e) {
+    if (IsIoUringUnavailable(e)) {
+      GTEST_SKIP() << e.what();
+    }
+    throw;
+  }
+
+  auto hashJoinRepin = bm->Pin(hashJoinBlock);
+  auto sortRepin = bm->Pin(sortBlock);
+  EXPECT_EQ(29, hashJoinRepin.Ptr()[0]);
+  EXPECT_EQ(11, sortRepin.Ptr()[0]);
+
+  const auto tagStats = bm->tagStats();
+  const auto findTag = [&](MemoryTag tag) -> const BufferManagerTagStats* {
+    for (const auto& stats : tagStats) {
+      if (stats.tag == tag) {
+        return &stats;
+      }
+    }
+    return nullptr;
+  };
+
+  const auto* hashJoinStats = findTag(MemoryTag::kHashJoin);
+  ASSERT_NE(nullptr, hashJoinStats);
+  EXPECT_EQ(1, hashJoinStats->spillWriteCount);
+  EXPECT_EQ(1, hashJoinStats->spillReadCount);
+  EXPECT_EQ(4096, hashJoinStats->spillWriteBytes);
+  EXPECT_EQ(4096, hashJoinStats->spillReadBytes);
+  EXPECT_GT(hashJoinStats->spillPhysicalWriteBytes, 0);
+  EXPECT_GT(hashJoinStats->spillPhysicalReadBytes, 0);
+
+  const auto* sortStats = findTag(MemoryTag::kSort);
+  ASSERT_NE(nullptr, sortStats);
+  EXPECT_EQ(1, sortStats->spillWriteCount);
+  EXPECT_EQ(1, sortStats->spillReadCount);
+  EXPECT_EQ(8192, sortStats->spillWriteBytes);
+  EXPECT_EQ(8192, sortStats->spillReadBytes);
+  EXPECT_GT(sortStats->spillPhysicalWriteBytes, 0);
+  EXPECT_GT(sortStats->spillPhysicalReadBytes, 0);
 }
 
 TEST_F(BufferManagerTest, StatsTrackSpillAndReadback) {

@@ -394,6 +394,57 @@ TEST_F(BmHashJoinStorageTest, SpillReloadTracksBmIoAcrossRepeatedReloads) {
   EXPECT_GE(storage->runtimeStats().spillReadCount, firstReadCount);
 }
 
+TEST_F(
+    BmHashJoinStorageTest,
+    LiveLeaseRejectsSecondLoadBeforeResettingMetadataOrGeneration) {
+  auto build = makeRowVector({
+      makeFlatVector<int64_t>({1, 2, 3}),
+      makeFlatVector<std::string>({"one", "two", "three"}),
+      makeFlatVector<int64_t>({10, 20, 30}),
+  });
+  const auto buildType = std::dynamic_pointer_cast<const RowType>(build->type());
+  ASSERT_NE(buildType, nullptr);
+  auto storage = makeStorage(build, 1, true, true, 512, 512);
+  appendRowsToStorage(*storage, build);
+  storage->spillPartition();
+
+  auto firstReload = storage->loadPartition();
+  ASSERT_EQ(3, firstReload.rows.size());
+  storage->rows().setNext(firstReload.rows.front(), firstReload.rows.back());
+  storage->rows().setProbed(firstReload.rows.front(), true);
+
+  const auto generationBefore =
+      bm::BmRowContainerTestPeer::partitionGeneration(
+          storage->rows(), bm::kDefaultPartition);
+  const auto leaseCountBefore =
+      bm::BmRowContainerTestPeer::partitionLeaseCount(
+          storage->rows(), bm::kDefaultPartition);
+  const auto restoreCountBefore = storage->runtimeStats().restoreCount;
+  const auto spillReadCountBefore = storage->runtimeStats().spillReadCount;
+  auto* const firstRow = firstReload.rows.front();
+  auto* const tailRow = firstReload.rows.back();
+
+  EXPECT_THROW((void)storage->loadPartition(), BoltRuntimeError);
+  EXPECT_EQ(tailRow, storage->rows().next(firstRow));
+  EXPECT_TRUE(storage->rows().probed(firstRow));
+  EXPECT_EQ(
+      generationBefore,
+      bm::BmRowContainerTestPeer::partitionGeneration(
+          storage->rows(), bm::kDefaultPartition));
+  EXPECT_EQ(
+      leaseCountBefore,
+      bm::BmRowContainerTestPeer::partitionLeaseCount(
+          storage->rows(), bm::kDefaultPartition));
+  EXPECT_EQ(restoreCountBefore, storage->runtimeStats().restoreCount);
+  EXPECT_EQ(spillReadCountBefore, storage->runtimeStats().spillReadCount);
+
+  auto restoredRows =
+      extractRows(*storage, {firstReload.rows.data(), firstReload.rows.size()}, buildType);
+  EXPECT_EQ(
+      std::vector<std::string>({"1|one|10", "2|two|20", "3|three|30"}),
+      restoredRows);
+}
+
 TEST_F(BmHashJoinStorageTest, RebuildAfterReloadPreservesDuplicateProbeParity) {
   std::vector<int64_t> keys(3000, 7);
   std::vector<int64_t> payload(3000);

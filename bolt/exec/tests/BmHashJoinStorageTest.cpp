@@ -394,6 +394,37 @@ TEST_F(BmHashJoinStorageTest, SpillReloadTracksBmIoAcrossRepeatedReloads) {
   EXPECT_GE(storage->runtimeStats().spillReadCount, firstReadCount);
 }
 
+TEST_F(BmHashJoinStorageTest, ActiveSegmentSpillCountsOnlyRowsInThatSegment) {
+  auto makeBatch = [&](int64_t begin, vector_size_t size) {
+    return makeRowVector({
+        makeFlatVector<int64_t>(
+            size, [begin](auto row) { return begin + row; }),
+        makeFlatVector<std::string>(size, [begin](auto row) {
+          return fmt::format("segment-row-{}", begin + row);
+        }),
+    });
+  };
+  auto storage = makeStorage(makeBatch(0, 1), 1, true, true, 512, 512);
+
+  appendRowsToStorage(*storage, makeBatch(0, 3));
+  ASSERT_EQ(3, storage->activeSegmentRowCount());
+  storage->sealAndSpillActiveSegment();
+  EXPECT_EQ(3, storage->runtimeStats().spilledRows);
+  EXPECT_EQ(1, storage->runtimeStats().spilledSegments);
+
+  appendRowsToStorage(*storage, makeBatch(3, 2));
+  ASSERT_EQ(2, storage->activeSegmentRowCount());
+  storage->sealAndSpillActiveSegment();
+  EXPECT_EQ(5, storage->runtimeStats().spilledRows);
+  EXPECT_EQ(2, storage->runtimeStats().spilledSegments);
+
+  appendRowsToStorage(*storage, makeBatch(5, 4));
+  ASSERT_EQ(4, storage->activeSegmentRowCount());
+  storage->spillPartition();
+  EXPECT_EQ(9, storage->runtimeStats().spilledRows);
+  EXPECT_EQ(3, storage->runtimeStats().spilledSegments);
+}
+
 TEST_F(
     BmHashJoinStorageTest,
     LiveLeaseRejectsSecondLoadBeforeResettingMetadataOrGeneration) {

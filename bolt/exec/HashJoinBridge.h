@@ -128,11 +128,7 @@ class HashJoinBridge : public JoinBridge {
     return numBuilders_;
   }
 
-  void resetHashTable() {
-    if (buildResult_.has_value()) {
-      buildResult_->table.reset();
-    }
-  }
+  void resetHashTable();
 
  private:
   uint32_t numBuilders_{0};

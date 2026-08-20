@@ -34,6 +34,7 @@
 #include "bolt/exec/HashTable.h"
 #include "bolt/exec/Spill.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
+#include <future>
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::exec;
 using bytedance::bolt::exec::test::TempDirectoryPath;
@@ -735,6 +736,35 @@ TEST_P(HashJoinBridgeTest, probeFinishedDestroysTableOutsideBridgeMutex) {
   ASSERT_FALSE(reenteredBridge.load());
 
   ASSERT_FALSE(joinBridge->probeFinished());
+  EXPECT_TRUE(destructorRan.load());
+  EXPECT_TRUE(reenteredBridge.load());
+}
+
+TEST_P(HashJoinBridgeTest, resetHashTableDestroysTableOutsideBridgeMutex) {
+  auto joinBridge = createJoinBridge();
+  joinBridge->addBuilder();
+  joinBridge->start();
+
+  std::atomic<bool> destructorRan{false};
+  std::atomic<bool> reenteredBridge{false};
+  auto table = std::shared_ptr<BaseHashTable>(new ReentrantDestroyHashTable([&] {
+    destructorRan.store(true);
+    ContinueFuture future = ContinueFuture::makeEmpty();
+    auto result = joinBridge->tableOrFuture(&future);
+    reenteredBridge.store(result.has_value() && result->table == nullptr);
+  }));
+
+  ASSERT_FALSE(joinBridge->setHashTable(std::move(table), {}, false));
+  ASSERT_FALSE(destructorRan.load());
+  ASSERT_FALSE(reenteredBridge.load());
+
+  auto reset = std::async(std::launch::async, [&] {
+    joinBridge->resetHashTable();
+  });
+  ASSERT_EQ(
+      std::future_status::ready,
+      reset.wait_for(std::chrono::seconds(10)));
+  reset.get();
   EXPECT_TRUE(destructorRan.load());
   EXPECT_TRUE(reenteredBridge.load());
 }

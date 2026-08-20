@@ -669,10 +669,11 @@ TEST_F(BmHashJoinTest, forcedSpillUsesRealBmIoMetricsAcrossThresholds) {
   const auto tinyStats = hashBuildBmStats(*tinyTask);
   const auto moderateStats = hashBuildBmStats(*moderateTask);
   const auto legacyStats = hashBuildBmStats(*legacyTask);
+  constexpr int64_t kExpectedBuildRows = 384;
 
   EXPECT_EQ(1, tinyStats.backend);
   EXPECT_EQ(0, tinyStats.fallback);
-  EXPECT_GT(tinyStats.spilledRows, 0);
+  EXPECT_EQ(kExpectedBuildRows, tinyStats.spilledRows);
   EXPECT_GT(tinyStats.spilledBytes, 0);
   EXPECT_GT(tinyStats.spilledSegments, 0);
   EXPECT_GT(tinyStats.restoreCount, 0);
@@ -688,7 +689,7 @@ TEST_F(BmHashJoinTest, forcedSpillUsesRealBmIoMetricsAcrossThresholds) {
 
   EXPECT_EQ(1, moderateStats.backend);
   EXPECT_EQ(0, moderateStats.fallback);
-  EXPECT_GT(moderateStats.spilledRows, 0);
+  EXPECT_EQ(kExpectedBuildRows, moderateStats.spilledRows);
   EXPECT_GT(moderateStats.spilledBytes, 0);
   EXPECT_GT(moderateStats.spilledSegments, 0);
   EXPECT_GT(moderateStats.restoreCount, 0);
@@ -703,7 +704,6 @@ TEST_F(BmHashJoinTest, forcedSpillUsesRealBmIoMetricsAcrossThresholds) {
   EXPECT_EQ(0, moderateStats.legacySpilledFiles);
 
   EXPECT_GT(tinyStats.spilledSegments, moderateStats.spilledSegments);
-  EXPECT_GT(tinyStats.spilledRows, moderateStats.spilledRows);
 
   expectFallback(*legacyTask, BmFallback::kDisabled);
 

@@ -168,6 +168,16 @@ bool HashJoinBridge::probeFinished() {
   return hasSpillInput;
 }
 
+void HashJoinBridge::resetHashTable() {
+  std::shared_ptr<BaseHashTable> table;
+  {
+    std::lock_guard<std::mutex> l(mutex_);
+    if (buildResult_.has_value()) {
+      table = std::move(buildResult_->table);
+    }
+  }
+}
+
 std::optional<HashJoinBridge::SpillInput> HashJoinBridge::spillInputOrFuture(
     ContinueFuture* future) {
   std::lock_guard<std::mutex> l(mutex_);

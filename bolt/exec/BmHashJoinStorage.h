@@ -69,8 +69,13 @@ class BmHashJoinStorage {
     return runtimeStats_;
   }
 
+  uint64_t activeSegmentRowCount(
+      bm::PartitionId partition = bm::kDefaultPartition) const;
+
   void refreshRowCount();
   void spillPartition(bm::PartitionId partition = bm::kDefaultPartition);
+  void sealAndSpillActiveSegment(
+      bm::PartitionId partition = bm::kDefaultPartition);
   LoadedPartition loadPartition(
       bm::PartitionId partition = bm::kDefaultPartition);
 

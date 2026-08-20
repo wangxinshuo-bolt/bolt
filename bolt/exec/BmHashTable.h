@@ -6,6 +6,7 @@
 #include "bolt/exec/HashTable.h"
 
 #include <memory>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -30,7 +31,8 @@ class BmHashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       std::shared_ptr<memory::bm::BufferManager> bufferManager,
-      bool jitRowEqVectors) {
+      bool jitRowEqVectors,
+      uint64_t spillThresholdBytes = std::numeric_limits<uint64_t>::max()) {
     return std::make_unique<BmHashTable>(
         std::move(hashers),
         dependentTypes,
@@ -39,7 +41,8 @@ class BmHashTable : public BaseHashTable {
         minTableSizeForParallelJoinBuild,
         pool,
         std::move(bufferManager),
-        jitRowEqVectors);
+        jitRowEqVectors,
+        spillThresholdBytes);
   }
 
   static std::unique_ptr<BmHashTable> createForJoin(
@@ -50,7 +53,8 @@ class BmHashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       std::shared_ptr<BmHashJoinStorage> storage,
-      bool jitRowEqVectors) {
+      bool jitRowEqVectors,
+      uint64_t spillThresholdBytes = std::numeric_limits<uint64_t>::max()) {
     return std::make_unique<BmHashTable>(
         std::move(hashers),
         dependentTypes,
@@ -59,7 +63,8 @@ class BmHashTable : public BaseHashTable {
         minTableSizeForParallelJoinBuild,
         pool,
         std::move(storage),
-        jitRowEqVectors);
+        jitRowEqVectors,
+        spillThresholdBytes);
   }
 
   BmHashTable(
@@ -70,7 +75,8 @@ class BmHashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       std::shared_ptr<memory::bm::BufferManager> bufferManager,
-      bool jitRowEqVectors);
+      bool jitRowEqVectors,
+      uint64_t spillThresholdBytes = std::numeric_limits<uint64_t>::max());
 
   BmHashTable(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -80,7 +86,8 @@ class BmHashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       std::shared_ptr<BmHashJoinStorage> storage,
-      bool jitRowEqVectors);
+      bool jitRowEqVectors,
+      uint64_t spillThresholdBytes = std::numeric_limits<uint64_t>::max());
 
   ~BmHashTable() override = default;
 
@@ -152,6 +159,7 @@ class BmHashTable : public BaseHashTable {
           kNoSpillInputStartPartitionBit) override;
 
   void spillPartition();
+  void finishSpillAndReload();
   void reloadFromStorage();
 
   void joinTableMayHaveDuplicates() override {
@@ -242,7 +250,8 @@ class BmHashTable : public BaseHashTable {
       const std::vector<TypePtr>& dependentTypes,
       bool allowDuplicates,
       bool hasProbedFlag,
-      std::shared_ptr<memory::bm::BufferManager> bufferManager);
+      std::shared_ptr<memory::bm::BufferManager> bufferManager,
+      uint64_t spillThresholdBytes);
 
   void unsupported(folly::StringPiece method) const;
   uint64_t maybeApplyTestHashOverride(uint64_t hash) const;
@@ -252,6 +261,11 @@ class BmHashTable : public BaseHashTable {
   void clearDirectory();
   void rebuildDirectoryFromRows(folly::Range<char* const*> rows);
   char* insertOrFindGroup(char* row, uint64_t hash, bool& insertedNewKey);
+  uint64_t estimateSelectedRowBytes(
+      vector_size_t rowIndex,
+      folly::Range<const DecodedVector* const*> keyDecoders,
+      folly::Range<const DecodedVector* const*> dependentDecoders) const;
+  void maybeSpillForThreshold(uint64_t appendedBytes);
   bool rowsEqualOnKeys(const char* left, const char* right) const;
   bool rowMatchesLookup(
       const char* row,
@@ -263,6 +277,7 @@ class BmHashTable : public BaseHashTable {
   uint32_t minTableSizeForParallelJoinBuild_;
   memory::MemoryPool* pool_;
   std::shared_ptr<BmHashJoinStorage> storage_;
+  uint64_t spillThresholdBytes_;
   std::vector<TypePtr> allTypes_;
   std::vector<TypePtr> dependentTypes_;
   bool joinBuildNoDuplicates_{false};
@@ -279,6 +294,8 @@ class BmHashTable : public BaseHashTable {
   uint64_t numProbeInputs_{0};
   bool hasDuplicates_{false};
   RuntimeStats runtimeStats_;
+  uint64_t bytesSinceLastSpill_{0};
+  bool hasSpilled_{false};
 
   friend class test::BmHashTableTest;
   friend class test::BmHashJoinStorageTest;

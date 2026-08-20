@@ -12,6 +12,8 @@ namespace {
 
 constexpr uint64_t kInitialCapacity = 2048;
 constexpr double kMaxLoadFactor = 0.75;
+constexpr uint32_t kForcedSpillRowBlockSize = 16 * 1024;
+constexpr uint32_t kForcedSpillHeapBlockSize = 16 * 1024;
 
 } // namespace
 
@@ -35,17 +37,26 @@ BmHashTable<ignoreNullKeys>::makeStorageForJoin(
     const std::vector<TypePtr>& dependentTypes,
     bool allowDuplicates,
     bool hasProbedFlag,
-    std::shared_ptr<memory::bm::BufferManager> bufferManager) {
+    std::shared_ptr<memory::bm::BufferManager> bufferManager,
+    uint64_t spillThresholdBytes) {
+  const auto rowBlockSize =
+      spillThresholdBytes == std::numeric_limits<uint64_t>::max()
+      ? static_cast<uint32_t>(
+            memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge))
+      : kForcedSpillRowBlockSize;
+  const auto heapBlockSize =
+      spillThresholdBytes == std::numeric_limits<uint64_t>::max()
+      ? static_cast<uint32_t>(
+            memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge))
+      : kForcedSpillHeapBlockSize;
   return BmHashJoinStorage::createForJoin(
       makeAllTypes(hashers, dependentTypes),
       hashers.size(),
       allowDuplicates,
       hasProbedFlag,
       std::move(bufferManager),
-      static_cast<uint32_t>(
-          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
-      static_cast<uint32_t>(
-          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)));
+      rowBlockSize,
+      heapBlockSize);
 }
 
 template <bool ignoreNullKeys>
@@ -57,7 +68,8 @@ BmHashTable<ignoreNullKeys>::BmHashTable(
     uint32_t minTableSizeForParallelJoinBuild,
     memory::MemoryPool* pool,
     std::shared_ptr<memory::bm::BufferManager> bufferManager,
-    bool jitRowEqVectors)
+      bool jitRowEqVectors,
+      uint64_t spillThresholdBytes)
     : BmHashTable(
           std::move(hashers),
           dependentTypes,
@@ -70,8 +82,10 @@ BmHashTable<ignoreNullKeys>::BmHashTable(
               dependentTypes,
               allowDuplicates,
               hasProbedFlag,
-              std::move(bufferManager)),
-          jitRowEqVectors) {}
+              std::move(bufferManager),
+              spillThresholdBytes),
+          jitRowEqVectors,
+          spillThresholdBytes) {}
 
 template <bool ignoreNullKeys>
 BmHashTable<ignoreNullKeys>::BmHashTable(
@@ -82,11 +96,13 @@ BmHashTable<ignoreNullKeys>::BmHashTable(
     uint32_t minTableSizeForParallelJoinBuild,
     memory::MemoryPool* pool,
     std::shared_ptr<BmHashJoinStorage> storage,
-    bool jitRowEqVectors)
+      bool jitRowEqVectors,
+      uint64_t spillThresholdBytes)
     : BaseHashTable(std::move(hashers)),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
       pool_(pool),
       storage_(std::move(storage)),
+      spillThresholdBytes_(spillThresholdBytes),
       allTypes_(makeAllTypes(hashers_, dependentTypes)),
       dependentTypes_(dependentTypes),
       joinBuildNoDuplicates_(!allowDuplicates),
@@ -241,6 +257,48 @@ void BmHashTable<ignoreNullKeys>::rebuildDirectoryFromRows(
 }
 
 template <bool ignoreNullKeys>
+uint64_t BmHashTable<ignoreNullKeys>::estimateSelectedRowBytes(
+    vector_size_t rowIndex,
+    folly::Range<const DecodedVector* const*> keyDecoders,
+    folly::Range<const DecodedVector* const*> dependentDecoders) const {
+  uint64_t bytes = storage_->rows().rowSize();
+  auto addVariableBytes = [&](const DecodedVector& decoded, const TypePtr& type) {
+    if (decoded.isNullAt(rowIndex)) {
+      return;
+    }
+    if (type->kind() == TypeKind::VARCHAR || type->kind() == TypeKind::VARBINARY) {
+      bytes += decoded.valueAt<StringView>(rowIndex).size();
+    }
+  };
+  for (auto i = 0; i < keyDecoders.size(); ++i) {
+    addVariableBytes(*keyDecoders[i], hashers_[i]->type());
+  }
+  for (auto i = 0; i < dependentDecoders.size(); ++i) {
+    addVariableBytes(*dependentDecoders[i], dependentTypes_[i]);
+  }
+  return bytes;
+}
+
+template <bool ignoreNullKeys>
+void BmHashTable<ignoreNullKeys>::maybeSpillForThreshold(
+    uint64_t appendedBytes) {
+  if (spillThresholdBytes_ == std::numeric_limits<uint64_t>::max()) {
+    return;
+  }
+  bytesSinceLastSpill_ += appendedBytes;
+  if (bytesSinceLastSpill_ < spillThresholdBytes_) {
+    return;
+  }
+
+  clearDirectory();
+  roundLease_ = bm::BmRoundLease{};
+  storage_->sealAndSpillActiveSegment();
+  runtimeStats_ = storage_->runtimeStats();
+  bytesSinceLastSpill_ = 0;
+  hasSpilled_ = true;
+}
+
+template <bool ignoreNullKeys>
 void BmHashTable<ignoreNullKeys>::appendJoinRows(
     const SelectivityVector& rows,
     folly::Range<const DecodedVector* const*> keyDecoders,
@@ -260,7 +318,20 @@ void BmHashTable<ignoreNullKeys>::appendJoinRows(
           context, *dependentDecoders[i], rowIndex, i + keyDecoders.size());
     }
     appended.push_back(context.row());
+    maybeSpillForThreshold(
+        estimateSelectedRowBytes(rowIndex, keyDecoders, dependentDecoders));
   });
+
+  numRows_ += appended.size();
+  storage_->refreshRowCount();
+  runtimeStats_ = storage_->runtimeStats();
+  BOLT_CHECK_EQ(
+      storage_->rows().numRows(),
+      rowCountBefore + static_cast<int64_t>(appended.size()));
+
+  if (spillThresholdBytes_ != std::numeric_limits<uint64_t>::max()) {
+    return;
+  }
 
   raw_vector<uint64_t> hashes;
   hashes.resize(appended.size());
@@ -274,13 +345,6 @@ void BmHashTable<ignoreNullKeys>::appendJoinRows(
     auto hash = maybeApplyTestHashOverride(hashes[i]);
     insertOrFindGroup(appended[i], hash, insertedNewKey);
   }
-
-  numRows_ += appended.size();
-  storage_->refreshRowCount();
-  runtimeStats_ = storage_->runtimeStats();
-  BOLT_CHECK_EQ(
-      storage_->rows().numRows(),
-      rowCountBefore + static_cast<int64_t>(appended.size()));
 }
 
 template <bool ignoreNullKeys>
@@ -288,6 +352,15 @@ void BmHashTable<ignoreNullKeys>::spillPartition() {
   roundLease_ = bm::BmRoundLease{};
   storage_->spillPartition();
   runtimeStats_ = storage_->runtimeStats();
+}
+
+template <bool ignoreNullKeys>
+void BmHashTable<ignoreNullKeys>::finishSpillAndReload() {
+  if (!hasSpilled_) {
+    return;
+  }
+  spillPartition();
+  reloadFromStorage();
 }
 
 template <bool ignoreNullKeys>

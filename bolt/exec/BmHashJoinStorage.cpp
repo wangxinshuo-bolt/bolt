@@ -83,13 +83,14 @@ void BmHashJoinStorage::addStatsDelta(
     RuntimeStats& stats,
     const memory::bm::BufferManagerTagStats& before,
     const memory::bm::BufferManagerTagStats& after) {
-  stats.spilledBytes = after.spilledBytes;
+  const auto writeBytes =
+      counterDelta(before.spillWriteBytes, after.spillWriteBytes);
+  stats.spilledBytes += writeBytes;
   stats.spillWriteCount +=
       counterDelta(before.spillWriteCount, after.spillWriteCount);
   stats.spillReadCount +=
       counterDelta(before.spillReadCount, after.spillReadCount);
-  stats.spillWriteBytes +=
-      counterDelta(before.spillWriteBytes, after.spillWriteBytes);
+  stats.spillWriteBytes += writeBytes;
   stats.spillReadBytes +=
       counterDelta(before.spillReadBytes, after.spillReadBytes);
   stats.spillPhysicalWriteBytes += counterDelta(
@@ -102,9 +103,20 @@ void BmHashJoinStorage::refreshRowCount() {
   runtimeStats_.bmRows = rows_->numRows();
 }
 
+uint64_t BmHashJoinStorage::activeSegmentRowCount(bm::PartitionId partition)
+    const {
+  const auto active = rows_->activeSegmentId(partition);
+  if (active == bm::kNoSegment) {
+    return 0;
+  }
+  return rows_->activeSegmentNextRowNumber(partition);
+}
+
 void BmHashJoinStorage::spillPartition(bm::PartitionId partition) {
   refreshRowCount();
-  runtimeStats_.spilledRows = runtimeStats_.bmRows;
+  runtimeStats_.spilledRows = runtimeStats_.spilledRows == 0
+      ? runtimeStats_.bmRows
+      : runtimeStats_.spilledRows + runtimeStats_.bmRows;
   const auto before = tagStatsSnapshot(*bufferManager_);
   if (rows_->activeSegmentId(partition) != bm::kNoSegment) {
     rows_->sealActivePartitionSegment(partition);
@@ -115,6 +127,28 @@ void BmHashJoinStorage::spillPartition(bm::PartitionId partition) {
   const auto after = tagStatsSnapshot(*bufferManager_);
   runtimeStats_.spillSegments = rows_->segmentsForPartition(partition).size();
   runtimeStats_.spilledSegments = runtimeStats_.spillSegments;
+  addStatsDelta(runtimeStats_, before, after);
+  runtimeStats_.spillBytes = runtimeStats_.spilledBytes;
+}
+
+void BmHashJoinStorage::sealAndSpillActiveSegment(bm::PartitionId partition) {
+  refreshRowCount();
+  if (rows_->activeSegmentId(partition) == bm::kNoSegment) {
+    return;
+  }
+
+  const auto rowsCoveredBySpill = runtimeStats_.bmRows;
+  const auto segmentsBefore = rows_->segmentsForPartition(partition).size();
+  const auto before = tagStatsSnapshot(*bufferManager_);
+  rows_->sealActivePartitionSegment(partition);
+  rows_->spillSealedPartition(partition);
+  const auto after = tagStatsSnapshot(*bufferManager_);
+  const auto segmentsAfter = rows_->segmentsForPartition(partition).size();
+
+  runtimeStats_.spilledRows += rowsCoveredBySpill;
+  runtimeStats_.spillSegments = segmentsAfter;
+  runtimeStats_.spilledSegments +=
+      counterDelta(segmentsBefore, segmentsAfter);
   addStatsDelta(runtimeStats_, before, after);
   runtimeStats_.spillBytes = runtimeStats_.spilledBytes;
 }

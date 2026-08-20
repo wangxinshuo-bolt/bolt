@@ -245,6 +245,12 @@ class QueryConfig {
   /// Enables resident BufferManager backed hash join for supported inner joins.
   static constexpr const char* kBmHashJoinEnabled = "bm-hash-join-enabled";
 
+  /// Logical BM row bytes to append before sealing and spilling a BM hash join
+  /// build segment. The default max value disables BM hash join spilling. A
+  /// value of 0 forces a spill after every appended row.
+  static constexpr const char* kBmHashJoinSpillThreshold =
+      "bm-hash-join-spill-threshold";
+
   /// Aggregation spilling flag, only applies if "spill_enabled" flag is set.
   static constexpr const char* kAggregationSpillEnabled =
       "aggregation_spill_enabled";
@@ -1067,6 +1073,11 @@ class QueryConfig {
 
   bool bmHashJoinEnabled() const {
     return get<bool>(kBmHashJoinEnabled, false);
+  }
+
+  uint64_t bmHashJoinSpillThreshold() const {
+    return get<uint64_t>(
+        kBmHashJoinSpillThreshold, std::numeric_limits<uint64_t>::max());
   }
 
   config::AB_MODE spillUringEnabled() const {

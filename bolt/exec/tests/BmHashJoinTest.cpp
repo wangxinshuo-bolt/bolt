@@ -36,8 +36,25 @@ namespace {
 struct HashBuildBmStats {
   int64_t backend{0};
   int64_t fallback{0};
+  int64_t spilledRows{0};
   int64_t spilledBytes{0};
+  int64_t spilledSegments{0};
   int64_t restoreCount{0};
+  int64_t spillWriteCount{0};
+  int64_t spillReadCount{0};
+  int64_t spillWriteBytes{0};
+  int64_t spillReadBytes{0};
+  int64_t spillPhysicalWriteBytes{0};
+  int64_t spillPhysicalReadBytes{0};
+  int64_t legacySpilledRows{0};
+  int64_t legacySpilledBytes{0};
+  int64_t legacySpilledFiles{0};
+};
+
+struct ForcedSpillJoinData {
+  RowVectorPtr probe;
+  RowVectorPtr build;
+  RowVectorPtr expected;
 };
 
 using BmFallback = HashBuild::BmHashJoinFallbackReason;
@@ -70,10 +87,29 @@ HashBuildBmStats hashBuildBmStats(const Task& task) {
       result.backend += runtimeStatSum(op.runtimeStats, "bmHashJoinBackend");
       result.fallback +=
           runtimeStatExactCode(op.runtimeStats, "bmHashJoinFallbackReason");
+      result.spilledRows +=
+          runtimeStatSum(op.runtimeStats, "bmHashJoinSpilledRows");
       result.spilledBytes +=
           runtimeStatSum(op.runtimeStats, "bmHashJoinSpilledBytes");
+      result.spilledSegments +=
+          runtimeStatSum(op.runtimeStats, "bmHashJoinSpilledSegments");
       result.restoreCount +=
           runtimeStatSum(op.runtimeStats, "bmHashJoinRestoreCount");
+      result.spillWriteCount +=
+          runtimeStatSum(op.runtimeStats, "bmHashJoinSpillWriteCount");
+      result.spillReadCount +=
+          runtimeStatSum(op.runtimeStats, "bmHashJoinSpillReadCount");
+      result.spillWriteBytes +=
+          runtimeStatSum(op.runtimeStats, "bmHashJoinSpillWriteBytes");
+      result.spillReadBytes +=
+          runtimeStatSum(op.runtimeStats, "bmHashJoinSpillReadBytes");
+      result.spillPhysicalWriteBytes += runtimeStatSum(
+          op.runtimeStats, "bmHashJoinSpillPhysicalWriteBytes");
+      result.spillPhysicalReadBytes += runtimeStatSum(
+          op.runtimeStats, "bmHashJoinSpillPhysicalReadBytes");
+      result.legacySpilledRows += op.spilledRows;
+      result.legacySpilledBytes += op.spilledBytes;
+      result.legacySpilledFiles += op.spilledFiles;
     }
   }
   return result;
@@ -243,20 +279,93 @@ class BmHashJoinTest : public HiveConnectorTestBase {
     return std::const_pointer_cast<core::HashJoinNode>(plan);
   }
 
+  ForcedSpillJoinData makeForcedSpillJoinData(
+      int32_t numBuildRows,
+      int32_t blobBytes) {
+    std::vector<int32_t> buildKeys;
+    std::vector<int32_t> buildPayloads;
+    std::vector<std::string> buildBlobs;
+    buildKeys.reserve(numBuildRows);
+    buildPayloads.reserve(numBuildRows);
+    buildBlobs.reserve(numBuildRows);
+    for (auto i = 0; i < numBuildRows; ++i) {
+      buildKeys.push_back(i);
+      buildPayloads.push_back(100000 + i);
+      buildBlobs.push_back(
+          std::string(blobBytes, static_cast<char>('a' + (i % 26))));
+    }
+
+    std::vector<int32_t> probeKeys{0, 17, numBuildRows / 3, numBuildRows - 1, -1};
+    std::vector<int32_t> probePayloads{10, 20, 30, 40, 50};
+
+    return ForcedSpillJoinData{
+        .probe = makeRowVector(
+            {"t_k", "t_payload"},
+            {
+                makeFlatVector<int32_t>(probeKeys),
+                makeFlatVector<int32_t>(probePayloads),
+            }),
+        .build = makeRowVector(
+            {"u_k", "u_payload", "u_blob"},
+            {
+                makeFlatVector<int32_t>(buildKeys),
+                makeFlatVector<int32_t>(buildPayloads),
+                makeFlatVector<std::string>(buildBlobs),
+            }),
+        .expected = makeRowVector(
+            {"t_k", "t_payload", "u_payload"},
+            {
+                makeFlatVector<int32_t>(
+                    {probeKeys[0], probeKeys[1], probeKeys[2], probeKeys[3]}),
+                makeFlatVector<int32_t>(
+                    {probePayloads[0],
+                     probePayloads[1],
+                     probePayloads[2],
+                     probePayloads[3]}),
+                makeFlatVector<int32_t>(
+                    {100000 + probeKeys[0],
+                     100000 + probeKeys[1],
+                     100000 + probeKeys[2],
+                     100000 + probeKeys[3]}),
+            })};
+  }
+
   void expectBmBackend(const Task& task) {
     const auto stats = hashBuildBmStats(task);
     EXPECT_EQ(1, stats.backend);
     EXPECT_EQ(0, stats.fallback);
+    EXPECT_EQ(0, stats.spilledRows);
     EXPECT_EQ(0, stats.spilledBytes);
+    EXPECT_EQ(0, stats.spilledSegments);
     EXPECT_EQ(0, stats.restoreCount);
+    EXPECT_EQ(0, stats.spillWriteCount);
+    EXPECT_EQ(0, stats.spillReadCount);
+    EXPECT_EQ(0, stats.spillWriteBytes);
+    EXPECT_EQ(0, stats.spillReadBytes);
+    EXPECT_EQ(0, stats.spillPhysicalWriteBytes);
+    EXPECT_EQ(0, stats.spillPhysicalReadBytes);
+    EXPECT_EQ(0, stats.legacySpilledRows);
+    EXPECT_EQ(0, stats.legacySpilledBytes);
+    EXPECT_EQ(0, stats.legacySpilledFiles);
   }
 
   void expectFallback(const Task& task, BmFallback reason) {
     const auto stats = hashBuildBmStats(task);
     EXPECT_EQ(0, stats.backend);
     EXPECT_EQ(static_cast<int64_t>(reason), stats.fallback);
+    EXPECT_EQ(0, stats.spilledRows);
     EXPECT_EQ(0, stats.spilledBytes);
+    EXPECT_EQ(0, stats.spilledSegments);
     EXPECT_EQ(0, stats.restoreCount);
+    EXPECT_EQ(0, stats.spillWriteCount);
+    EXPECT_EQ(0, stats.spillReadCount);
+    EXPECT_EQ(0, stats.spillWriteBytes);
+    EXPECT_EQ(0, stats.spillReadBytes);
+    EXPECT_EQ(0, stats.spillPhysicalWriteBytes);
+    EXPECT_EQ(0, stats.spillPhysicalReadBytes);
+    EXPECT_EQ(0, stats.legacySpilledRows);
+    EXPECT_EQ(0, stats.legacySpilledBytes);
+    EXPECT_EQ(0, stats.legacySpilledFiles);
   }
 
   RowVectorPtr probe_;
@@ -521,6 +630,119 @@ TEST_F(BmHashJoinTest, duplicateCompositeKeysSpanOutputBatchesOnBmBackend) {
 
   expectBmBackend(*task);
   OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
+}
+
+TEST_F(BmHashJoinTest, forcedSpillUsesRealBmIoMetricsAcrossThresholds) {
+  const auto data = makeForcedSpillJoinData(384, 8192);
+  const auto plan = makePlanForVectors(
+      data.probe,
+      data.build,
+      {"t_k"},
+      {"u_k"},
+      {"t_k", "t_payload", "u_payload"});
+
+  auto tinyTask = runPlan(
+      plan,
+      data.expected,
+      true,
+      true,
+      1,
+      true,
+      {{core::QueryConfig::kBmHashJoinSpillThreshold, "16384"}});
+  auto moderateTask = runPlan(
+      plan,
+      data.expected,
+      true,
+      true,
+      1,
+      true,
+      {{core::QueryConfig::kBmHashJoinSpillThreshold, "262144"}});
+  auto legacyTask = runPlan(
+      plan,
+      data.expected,
+      false,
+      true,
+      1,
+      true,
+      {{core::QueryConfig::kBmHashJoinSpillThreshold, "16384"}});
+
+  const auto tinyStats = hashBuildBmStats(*tinyTask);
+  const auto moderateStats = hashBuildBmStats(*moderateTask);
+  const auto legacyStats = hashBuildBmStats(*legacyTask);
+
+  EXPECT_EQ(1, tinyStats.backend);
+  EXPECT_EQ(0, tinyStats.fallback);
+  EXPECT_GT(tinyStats.spilledRows, 0);
+  EXPECT_GT(tinyStats.spilledBytes, 0);
+  EXPECT_GT(tinyStats.spilledSegments, 0);
+  EXPECT_GT(tinyStats.restoreCount, 0);
+  EXPECT_GT(tinyStats.spillWriteCount, 0);
+  EXPECT_GT(tinyStats.spillReadCount, 0);
+  EXPECT_GT(tinyStats.spillWriteBytes, 0);
+  EXPECT_GT(tinyStats.spillReadBytes, 0);
+  EXPECT_GT(tinyStats.spillPhysicalWriteBytes, 0);
+  EXPECT_GT(tinyStats.spillPhysicalReadBytes, 0);
+  EXPECT_EQ(0, tinyStats.legacySpilledRows);
+  EXPECT_EQ(0, tinyStats.legacySpilledBytes);
+  EXPECT_EQ(0, tinyStats.legacySpilledFiles);
+
+  EXPECT_EQ(1, moderateStats.backend);
+  EXPECT_EQ(0, moderateStats.fallback);
+  EXPECT_GT(moderateStats.spilledRows, 0);
+  EXPECT_GT(moderateStats.spilledBytes, 0);
+  EXPECT_GT(moderateStats.spilledSegments, 0);
+  EXPECT_GT(moderateStats.restoreCount, 0);
+  EXPECT_GT(moderateStats.spillWriteCount, 0);
+  EXPECT_GT(moderateStats.spillReadCount, 0);
+  EXPECT_GT(moderateStats.spillWriteBytes, 0);
+  EXPECT_GT(moderateStats.spillReadBytes, 0);
+  EXPECT_GT(moderateStats.spillPhysicalWriteBytes, 0);
+  EXPECT_GT(moderateStats.spillPhysicalReadBytes, 0);
+  EXPECT_EQ(0, moderateStats.legacySpilledRows);
+  EXPECT_EQ(0, moderateStats.legacySpilledBytes);
+  EXPECT_EQ(0, moderateStats.legacySpilledFiles);
+
+  EXPECT_GT(tinyStats.spilledSegments, moderateStats.spilledSegments);
+  EXPECT_GT(tinyStats.spilledRows, moderateStats.spilledRows);
+
+  expectFallback(*legacyTask, BmFallback::kDisabled);
+
+  moderateTask.reset();
+  legacyTask.reset();
+  OperatorTestBase::deleteTaskAndCheckSpillDirectory(tinyTask);
+}
+
+TEST_F(BmHashJoinTest, forcedSpillRepeatsWithoutFallingBack) {
+  const auto data = makeForcedSpillJoinData(384, 8192);
+  const auto plan = makePlanForVectors(
+      data.probe,
+      data.build,
+      {"t_k"},
+      {"u_k"},
+      {"t_k", "t_payload", "u_payload"});
+
+  for (auto iteration = 0; iteration < 2; ++iteration) {
+    auto task = runPlan(
+        plan,
+        data.expected,
+        true,
+        true,
+        1,
+        true,
+        {{core::QueryConfig::kBmHashJoinSpillThreshold, "16384"}});
+    const auto stats = hashBuildBmStats(*task);
+    EXPECT_EQ(1, stats.backend);
+    EXPECT_EQ(0, stats.fallback);
+    EXPECT_GT(stats.spilledRows, 0);
+    EXPECT_GT(stats.spilledSegments, 0);
+    EXPECT_GT(stats.restoreCount, 0);
+    EXPECT_GT(stats.spillWriteCount, 0);
+    EXPECT_GT(stats.spillReadCount, 0);
+    EXPECT_EQ(0, stats.legacySpilledRows);
+    EXPECT_EQ(0, stats.legacySpilledBytes);
+    EXPECT_EQ(0, stats.legacySpilledFiles);
+    OperatorTestBase::deleteTaskAndCheckSpillDirectory(task);
+  }
 }
 
 TEST_F(BmHashJoinTest, dateAndDecimalAliasesUseBmBackend) {

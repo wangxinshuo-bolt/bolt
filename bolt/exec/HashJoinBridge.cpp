@@ -134,6 +134,7 @@ std::optional<HashJoinBridge::HashBuildResult> HashJoinBridge::tableOrFuture(
 
 bool HashJoinBridge::probeFinished() {
   std::vector<ContinuePromise> promises;
+  std::optional<HashBuildResult> finishedBuildResult;
   bool hasSpillInput = false;
   {
     std::lock_guard<std::mutex> l(mutex_);
@@ -147,6 +148,7 @@ bool HashJoinBridge::probeFinished() {
     // NOTE: we are clearing the hash table as it has been fully processed and
     // not needed anymore. We'll wait for the HashBuild operator to build a new
     // table from the next spill partition now.
+    finishedBuildResult = std::move(buildResult_);
     buildResult_.reset();
 
     if (!spillPartitionSets_.empty()) {
@@ -161,6 +163,7 @@ bool HashJoinBridge::probeFinished() {
       BOLT_CHECK(promises_.empty());
     }
   }
+  finishedBuildResult.reset();
   notify(std::move(promises));
   return hasSpillInput;
 }

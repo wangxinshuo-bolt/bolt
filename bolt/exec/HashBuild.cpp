@@ -347,7 +347,8 @@ void HashBuild::setupTable() {
             queryConfig.minTableRowsForParallelJoinBuild(),
             pool(),
             operatorCtx_->task()->bufferManager(),
-            queryConfig.enableJitRowEqVectors());
+            queryConfig.enableJitRowEqVectors(),
+            queryConfig.bmHashJoinSpillThreshold());
       } else {
         table_ = HashTable<true>::createForJoin(
             std::move(keyHashers),
@@ -464,9 +465,27 @@ void HashBuild::recordBmHashJoinStats() {
   BOLT_CHECK_NOT_NULL(bmTable);
   const auto& stats = bmTable->runtimeStats();
   lockedStats->addRuntimeStat(
+      "bmHashJoinSpilledRows", RuntimeCounter(stats.spilledRows));
+  lockedStats->addRuntimeStat(
       "bmHashJoinSpilledBytes", RuntimeCounter(stats.spillBytes));
   lockedStats->addRuntimeStat(
+      "bmHashJoinSpilledSegments", RuntimeCounter(stats.spilledSegments));
+  lockedStats->addRuntimeStat(
       "bmHashJoinRestoreCount", RuntimeCounter(stats.restoreCount));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillWriteCount", RuntimeCounter(stats.spillWriteCount));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillReadCount", RuntimeCounter(stats.spillReadCount));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillWriteBytes", RuntimeCounter(stats.spillWriteBytes));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillReadBytes", RuntimeCounter(stats.spillReadBytes));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillPhysicalWriteBytes",
+      RuntimeCounter(stats.spillPhysicalWriteBytes));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillPhysicalReadBytes",
+      RuntimeCounter(stats.spillPhysicalReadBytes));
 }
 
 uint64_t HashBuild::joinRowCount() const {
@@ -1410,6 +1429,11 @@ bool HashBuild::finishHashBuild() {
   // https://github.com/facebookincubator/velox/issues/3567 is fixed.
   const bool allowParallelJoinBuild =
       !otherTables.empty() && spillPartitions.empty();
+  if (usingBmHashJoin()) {
+    auto* bmTable = dynamic_cast<BmHashTable<true>*>(table_.get());
+    BOLT_CHECK_NOT_NULL(bmTable);
+    bmTable->finishSpillAndReload();
+  }
   table_->prepareJoinTable(
       std::move(otherTables),
       allowParallelJoinBuild ? operatorCtx_->task()->queryCtx()->executor()

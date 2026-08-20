@@ -16,12 +16,6 @@ constexpr double kMaxLoadFactor = 0.75;
 } // namespace
 
 template <bool ignoreNullKeys>
-std::vector<bool> BmHashTable<ignoreNullKeys>::makeNullable(
-    const std::vector<TypePtr>& types) {
-  return std::vector<bool>(types.size(), true);
-}
-
-template <bool ignoreNullKeys>
 std::vector<TypePtr> BmHashTable<ignoreNullKeys>::makeAllTypes(
     const std::vector<std::unique_ptr<VectorHasher>>& hashers,
     const std::vector<TypePtr>& dependentTypes) {
@@ -35,6 +29,26 @@ std::vector<TypePtr> BmHashTable<ignoreNullKeys>::makeAllTypes(
 }
 
 template <bool ignoreNullKeys>
+std::shared_ptr<BmHashJoinStorage>
+BmHashTable<ignoreNullKeys>::makeStorageForJoin(
+    const std::vector<std::unique_ptr<VectorHasher>>& hashers,
+    const std::vector<TypePtr>& dependentTypes,
+    bool allowDuplicates,
+    bool hasProbedFlag,
+    std::shared_ptr<memory::bm::BufferManager> bufferManager) {
+  return BmHashJoinStorage::createForJoin(
+      makeAllTypes(hashers, dependentTypes),
+      hashers.size(),
+      allowDuplicates,
+      hasProbedFlag,
+      std::move(bufferManager),
+      static_cast<uint32_t>(
+          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
+      static_cast<uint32_t>(
+          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)));
+}
+
+template <bool ignoreNullKeys>
 BmHashTable<ignoreNullKeys>::BmHashTable(
     std::vector<std::unique_ptr<VectorHasher>>&& hashers,
     const std::vector<TypePtr>& dependentTypes,
@@ -44,10 +58,35 @@ BmHashTable<ignoreNullKeys>::BmHashTable(
     memory::MemoryPool* pool,
     std::shared_ptr<memory::bm::BufferManager> bufferManager,
     bool jitRowEqVectors)
+    : BmHashTable(
+          std::move(hashers),
+          dependentTypes,
+          allowDuplicates,
+          hasProbedFlag,
+          minTableSizeForParallelJoinBuild,
+          pool,
+          makeStorageForJoin(
+              hashers,
+              dependentTypes,
+              allowDuplicates,
+              hasProbedFlag,
+              std::move(bufferManager)),
+          jitRowEqVectors) {}
+
+template <bool ignoreNullKeys>
+BmHashTable<ignoreNullKeys>::BmHashTable(
+    std::vector<std::unique_ptr<VectorHasher>>&& hashers,
+    const std::vector<TypePtr>& dependentTypes,
+    bool allowDuplicates,
+    bool hasProbedFlag,
+    uint32_t minTableSizeForParallelJoinBuild,
+    memory::MemoryPool* pool,
+    std::shared_ptr<BmHashJoinStorage> storage,
+    bool jitRowEqVectors)
     : BaseHashTable(std::move(hashers)),
       minTableSizeForParallelJoinBuild_(minTableSizeForParallelJoinBuild),
       pool_(pool),
-      bufferManager_(std::move(bufferManager)),
+      storage_(std::move(storage)),
       allTypes_(makeAllTypes(hashers_, dependentTypes)),
       dependentTypes_(dependentTypes),
       joinBuildNoDuplicates_(!allowDuplicates),
@@ -55,25 +94,10 @@ BmHashTable<ignoreNullKeys>::BmHashTable(
       enableJit_(jitRowEqVectors) {
   BOLT_CHECK(ignoreNullKeys, "Task 5 only supports ignore-null-key inner join");
   BOLT_CHECK_NOT_NULL(pool_);
-  BOLT_CHECK_NOT_NULL(bufferManager_);
-  bm::BmJoinLayoutOptions options{
-      .numKeys = static_cast<uint32_t>(hashers_.size()),
-      .hasNext = allowDuplicates,
-      .hasProbedFlag = hasProbedFlag,
-      .hasNormalizedKey = false,
-  };
-  bmRows_ = std::make_unique<bm::BmRowContainer>(
-      allTypes_,
-      makeNullable(allTypes_),
-      bufferManager_,
-      memory::bm::MemoryTag::kHashBuild,
-      static_cast<uint32_t>(
-          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
-      static_cast<uint32_t>(
-          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
-      options);
+  BOLT_CHECK_NOT_NULL(storage_);
   capacity_ = kInitialCapacity;
   buckets_.reserve(capacity_);
+  runtimeStats_ = storage_->runtimeStats();
 }
 
 template <bool ignoreNullKeys>
@@ -134,7 +158,8 @@ bool BmHashTable<ignoreNullKeys>::rowsEqualOnKeys(
     const char* left,
     const char* right) const {
   for (auto i = 0; i < hashers_.size(); ++i) {
-    if (bmRows_->compare(left, right, i, CompareFlags{true, true}) != 0) {
+    if (storage_->rows().compare(left, right, i, CompareFlags{true, true}) !=
+        0) {
       return false;
     }
   }
@@ -147,7 +172,7 @@ bool BmHashTable<ignoreNullKeys>::rowMatchesLookup(
     HashLookup& lookup,
     vector_size_t probeRow) const {
   for (auto i = 0; i < lookup.hashers.size(); ++i) {
-    if (!bmRows_->equalsDecoded(
+    if (!storage_->rows().equalsDecoded(
             row,
             i,
             lookup.hashers[i]->decodedVector(),
@@ -168,14 +193,14 @@ char* BmHashTable<ignoreNullKeys>::insertOrFindGroup(
   for (auto& distinct : bucket.heads) {
     if (rowsEqualOnKeys(distinct.head, row)) {
       insertedNewKey = false;
-      if (bmRows_->next(row) != nullptr) {
+      if (storage_->rows().next(row) != nullptr) {
         BOLT_FAIL("New BM join row must not have a pre-linked next pointer");
       }
-      if (bmRows_->next(distinct.head) == nullptr) {
-        hasDuplicates_.set();
+      if (storage_->rows().next(distinct.head) == nullptr) {
+        hasDuplicates_ = true;
       }
-      bmRows_->setNext(row, bmRows_->next(distinct.head));
-      bmRows_->setNext(distinct.head, row);
+      storage_->rows().setNext(row, storage_->rows().next(distinct.head));
+      storage_->rows().setNext(distinct.head, row);
       return distinct.head;
     }
   }
@@ -188,22 +213,50 @@ char* BmHashTable<ignoreNullKeys>::insertOrFindGroup(
 }
 
 template <bool ignoreNullKeys>
+void BmHashTable<ignoreNullKeys>::clearDirectory() {
+  buckets_.clear();
+  capacity_ = kInitialCapacity;
+  buckets_.reserve(capacity_);
+  numDistinctKeys_ = 0;
+  hasDuplicates_ = false;
+}
+
+template <bool ignoreNullKeys>
+void BmHashTable<ignoreNullKeys>::rebuildDirectoryFromRows(
+    folly::Range<char* const*> rows) {
+  clearDirectory();
+
+  raw_vector<uint64_t> hashes;
+  hashes.resize(rows.size());
+  std::fill(hashes.begin(), hashes.end(), 0);
+  std::vector<int32_t> keyColumns(hashers_.size());
+  std::iota(keyColumns.begin(), keyColumns.end(), 0);
+  storage_->rows().hashRows(rows, keyColumns, hashes);
+
+  for (auto i = 0; i < rows.size(); ++i) {
+    bool insertedNewKey = false;
+    const auto hash = maybeApplyTestHashOverride(hashes[i]);
+    insertOrFindGroup(rows[i], hash, insertedNewKey);
+  }
+}
+
+template <bool ignoreNullKeys>
 void BmHashTable<ignoreNullKeys>::appendJoinRows(
     const SelectivityVector& rows,
     folly::Range<const DecodedVector* const*> keyDecoders,
     folly::Range<const DecodedVector* const*> dependentDecoders) {
   BOLT_CHECK_EQ(keyDecoders.size(), hashers_.size());
-  auto rowCountBefore = bmRows_->numRows();
+  auto rowCountBefore = storage_->rows().numRows();
   std::vector<char*> appended;
   appended.reserve(rows.countSelected());
 
   rows.applyToSelected([&](auto rowIndex) {
-    auto context = bmRows_->appendRow();
+    auto context = storage_->rows().appendRow();
     for (auto i = 0; i < keyDecoders.size(); ++i) {
-      bmRows_->store(context, *keyDecoders[i], rowIndex, i);
+      storage_->rows().store(context, *keyDecoders[i], rowIndex, i);
     }
     for (auto i = 0; i < dependentDecoders.size(); ++i) {
-      bmRows_->store(
+      storage_->rows().store(
           context, *dependentDecoders[i], rowIndex, i + keyDecoders.size());
     }
     appended.push_back(context.row());
@@ -214,7 +267,7 @@ void BmHashTable<ignoreNullKeys>::appendJoinRows(
   std::fill(hashes.begin(), hashes.end(), 0);
   std::vector<int32_t> keyColumns(hashers_.size());
   std::iota(keyColumns.begin(), keyColumns.end(), 0);
-  bmRows_->hashRows(appended, keyColumns, hashes);
+  storage_->rows().hashRows(appended, keyColumns, hashes);
 
   for (auto i = 0; i < appended.size(); ++i) {
     bool insertedNewKey = false;
@@ -223,10 +276,27 @@ void BmHashTable<ignoreNullKeys>::appendJoinRows(
   }
 
   numRows_ += appended.size();
-  runtimeStats_.bmRows = bmRows_->numRows();
+  storage_->refreshRowCount();
+  runtimeStats_ = storage_->runtimeStats();
   BOLT_CHECK_EQ(
-      bmRows_->numRows(),
+      storage_->rows().numRows(),
       rowCountBefore + static_cast<int64_t>(appended.size()));
+}
+
+template <bool ignoreNullKeys>
+void BmHashTable<ignoreNullKeys>::spillPartition() {
+  roundLease_ = bm::BmRoundLease{};
+  storage_->spillPartition();
+  runtimeStats_ = storage_->runtimeStats();
+}
+
+template <bool ignoreNullKeys>
+void BmHashTable<ignoreNullKeys>::reloadFromStorage() {
+  auto loaded = storage_->loadPartition();
+  roundLease_ = std::move(loaded.lease);
+  numRows_ = static_cast<uint64_t>(loaded.rows.size());
+  rebuildDirectoryFromRows({loaded.rows.data(), loaded.rows.size()});
+  runtimeStats_ = loaded.stats;
 }
 
 template <bool ignoreNullKeys>
@@ -291,7 +361,7 @@ int32_t BmHashTable<ignoreNullKeys>::listJoinResults(
       inputRows[numOut] = row;
       hits[numOut] = current;
       ++numOut;
-      iter.nextHit = bmRows_->next(current);
+      iter.nextHit = storage_->rows().next(current);
       if (!iter.nextHit) {
         ++iter.lastRowIndex;
       }
@@ -309,7 +379,7 @@ void BmHashTable<ignoreNullKeys>::extractJoinColumn(
     int32_t numRows,
     int32_t column,
     const VectorPtr& result) const {
-  bmRows_->extractColumnResident(rows, numRows, column, result);
+  storage_->rows().extractColumnResident(rows, numRows, column, result);
 }
 
 template <bool ignoreNullKeys>
@@ -321,7 +391,7 @@ void BmHashTable<ignoreNullKeys>::setJoinProbedFlags(
       "BmHashTable does not have probed flag storage for this join layout");
   for (auto i = 0; i < numRows; ++i) {
     if (rows[i] != nullptr) {
-      bmRows_->setProbed(rows[i], true);
+      storage_->rows().setProbed(rows[i], true);
     }
   }
 }
@@ -347,7 +417,7 @@ void BmHashTable<ignoreNullKeys>::extractJoinProbedFlags(
       values[i] = false;
       continue;
     }
-    const auto probed = bmRows_->probed(rows[i]);
+    const auto probed = storage_->rows().probed(rows[i]);
     bits::setNull(nulls, i, setNullForNonProbedRow && !probed);
     values[i] = probed;
   }
@@ -372,12 +442,13 @@ void BmHashTable<ignoreNullKeys>::prepareJoinTable(
       !dropDuplicates,
       "BmHashTable Task5 resident backend does not support dropDuplicates");
   checkHashBitsOverlap(spillInputStartPartitionBit);
-  runtimeStats_.bmRows = bmRows_->numRows();
+  storage_->refreshRowCount();
+  runtimeStats_ = storage_->runtimeStats();
 }
 
 template <bool ignoreNullKeys>
 int64_t BmHashTable<ignoreNullKeys>::allocatedBytes() const {
-  const auto bmStats = bufferManager_->stats();
+  const auto bmStats = storage_->bufferManager()->stats();
   const auto directoryBytes = static_cast<uint64_t>(
       buckets_.size() * sizeof(typename decltype(buckets_)::value_type) +
       numDistinctKeys_ * sizeof(DistinctHead));

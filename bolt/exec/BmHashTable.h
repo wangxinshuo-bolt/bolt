@@ -1,8 +1,9 @@
 #pragma once
 
+#include "bolt/common/memory/bm/AllocateSize.h"
 #include "bolt/common/memory/bm/BufferManager.h"
+#include "bolt/exec/BmHashJoinStorage.h"
 #include "bolt/exec/HashTable.h"
-#include "bolt/exec/bm/BmRowContainer.h"
 
 #include <memory>
 #include <string>
@@ -13,17 +14,13 @@ namespace bytedance::bolt::exec {
 
 namespace test {
 class BmHashTableTest;
+class BmHashJoinStorageTest;
 }
 
 template <bool ignoreNullKeys>
 class BmHashTable : public BaseHashTable {
  public:
-  struct RuntimeStats {
-    uint64_t bmRows{0};
-    uint64_t spillBytes{0};
-    uint64_t spillSegments{0};
-    uint64_t restoreCount{0};
-  };
+  using RuntimeStats = BmHashJoinStorage::RuntimeStats;
 
   static std::unique_ptr<BmHashTable> createForJoin(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
@@ -45,6 +42,26 @@ class BmHashTable : public BaseHashTable {
         jitRowEqVectors);
   }
 
+  static std::unique_ptr<BmHashTable> createForJoin(
+      std::vector<std::unique_ptr<VectorHasher>>&& hashers,
+      const std::vector<TypePtr>& dependentTypes,
+      bool allowDuplicates,
+      bool hasProbedFlag,
+      uint32_t minTableSizeForParallelJoinBuild,
+      memory::MemoryPool* pool,
+      std::shared_ptr<BmHashJoinStorage> storage,
+      bool jitRowEqVectors) {
+    return std::make_unique<BmHashTable>(
+        std::move(hashers),
+        dependentTypes,
+        allowDuplicates,
+        hasProbedFlag,
+        minTableSizeForParallelJoinBuild,
+        pool,
+        std::move(storage),
+        jitRowEqVectors);
+  }
+
   BmHashTable(
       std::vector<std::unique_ptr<VectorHasher>>&& hashers,
       const std::vector<TypePtr>& dependentTypes,
@@ -53,6 +70,16 @@ class BmHashTable : public BaseHashTable {
       uint32_t minTableSizeForParallelJoinBuild,
       memory::MemoryPool* pool,
       std::shared_ptr<memory::bm::BufferManager> bufferManager,
+      bool jitRowEqVectors);
+
+  BmHashTable(
+      std::vector<std::unique_ptr<VectorHasher>>&& hashers,
+      const std::vector<TypePtr>& dependentTypes,
+      bool allowDuplicates,
+      bool hasProbedFlag,
+      uint32_t minTableSizeForParallelJoinBuild,
+      memory::MemoryPool* pool,
+      std::shared_ptr<BmHashJoinStorage> storage,
       bool jitRowEqVectors);
 
   ~BmHashTable() override = default;
@@ -124,6 +151,9 @@ class BmHashTable : public BaseHashTable {
       int8_t spillInputStartPartitionBit =
           kNoSpillInputStartPartitionBit) override;
 
+  void spillPartition();
+  void reloadFromStorage();
+
   void joinTableMayHaveDuplicates() override {
     joinBuildNoDuplicates_ = false;
   }
@@ -156,7 +186,7 @@ class BmHashTable : public BaseHashTable {
   uint64_t estimateHashTableSize(uint64_t numDistinct) const override;
 
   bool hasDuplicateKeys() const override {
-    return hasDuplicates_.check();
+    return hasDuplicates_;
   }
 
   HashMode hashMode() const override {
@@ -182,7 +212,11 @@ class BmHashTable : public BaseHashTable {
   }
 
   const bm::BmRowContainer& bmRows() const {
-    return *bmRows_;
+    return storage_->rows();
+  }
+
+  const std::shared_ptr<BmHashJoinStorage>& storage() const {
+    return storage_;
   }
 
  private:
@@ -200,16 +234,23 @@ class BmHashTable : public BaseHashTable {
   void setHashMode(HashMode mode, int32_t numNew) override;
   int sizeBits() const override;
 
-  static std::vector<bool> makeNullable(const std::vector<TypePtr>& types);
   static std::vector<TypePtr> makeAllTypes(
       const std::vector<std::unique_ptr<VectorHasher>>& hashers,
       const std::vector<TypePtr>& dependentTypes);
+  static std::shared_ptr<BmHashJoinStorage> makeStorageForJoin(
+      const std::vector<std::unique_ptr<VectorHasher>>& hashers,
+      const std::vector<TypePtr>& dependentTypes,
+      bool allowDuplicates,
+      bool hasProbedFlag,
+      std::shared_ptr<memory::bm::BufferManager> bufferManager);
 
   void unsupported(folly::StringPiece method) const;
   uint64_t maybeApplyTestHashOverride(uint64_t hash) const;
   void testingSetHashOverride(uint64_t (*override)(uint64_t));
   void maybeGrowDirectory(uint64_t requiredRows);
   uint64_t nextCapacity(uint64_t requiredRows) const;
+  void clearDirectory();
+  void rebuildDirectoryFromRows(folly::Range<char* const*> rows);
   char* insertOrFindGroup(char* row, uint64_t hash, bool& insertedNewKey);
   bool rowsEqualOnKeys(const char* left, const char* right) const;
   bool rowMatchesLookup(
@@ -221,14 +262,14 @@ class BmHashTable : public BaseHashTable {
 
   uint32_t minTableSizeForParallelJoinBuild_;
   memory::MemoryPool* pool_;
-  std::shared_ptr<memory::bm::BufferManager> bufferManager_;
-  std::unique_ptr<bm::BmRowContainer> bmRows_;
+  std::shared_ptr<BmHashJoinStorage> storage_;
   std::vector<TypePtr> allTypes_;
   std::vector<TypePtr> dependentTypes_;
   bool joinBuildNoDuplicates_{false};
   bool hasProbedFlag_{false};
   bool enableJit_{false};
   uint64_t (*testHashOverride_)(uint64_t){nullptr};
+  bm::BmRoundLease roundLease_;
 
   std::unordered_map<uint64_t, BucketEntry> buckets_;
   uint64_t capacity_{0};
@@ -236,10 +277,11 @@ class BmHashTable : public BaseHashTable {
   uint64_t numDistinctKeys_{0};
   uint64_t numRehashes_{0};
   uint64_t numProbeInputs_{0};
-  OneWayStatusFlag hasDuplicates_;
+  bool hasDuplicates_{false};
   RuntimeStats runtimeStats_;
 
   friend class test::BmHashTableTest;
+  friend class test::BmHashJoinStorageTest;
 };
 
 extern template class BmHashTable<true>;

@@ -47,6 +47,9 @@ namespace {
 // Batch size used when iterating the row container.
 constexpr int kBatchSize = 1024;
 
+std::function<void(HashProbe::RoundPointerStateSnapshot)>
+    roundPointerStateResetCallback;
+
 // Returns the type for the hash table row. Build side keys first,
 // then dependent build side columns.
 RowTypePtr makeTableType(
@@ -147,7 +150,7 @@ void extractColumns(
             BaseVector::create(resultTypes[resultChannel], rows.size(), pool);
       }
       child->resize(rows.size());
-      table->rows()->extractColumn(
+      table->extractJoinColumn(
           rows.data(), rows.size(), projection.inputChannel, child);
     }
   }
@@ -502,13 +505,13 @@ void HashProbe::prepareForSpillRestore() {
 
   // Reset the internal states which are relevant to the previous probe run.
   noMoreSpillInput_ = false;
+  resetRoundPointerState();
   table_.reset();
   spiller_.reset();
   if (!reuseSpillReader_) {
     spillInputReader_.reset();
   }
   spillInputPartitionIds_.clear();
-  lastProbeIterator_.reset();
 
   BOLT_CHECK(promises_.empty() || lastProber_);
   if (!lastProber_) {
@@ -1044,7 +1047,7 @@ RowVectorPtr HashProbe::getBuildSideOutput() {
       // ones with a null join key.
       matchColumn() = createConstantFalse(numOut, pool());
     } else {
-      table_->rows()->extractProbedFlags(
+      table_->extractJoinProbedFlags(
           outputTableRows_.data(),
           numOut,
           nullAware_,
@@ -1248,7 +1251,7 @@ RowVectorPtr HashProbe::getOutput() {
 
     if (needLastProbe()) {
       // Mark build-side rows that have a match on the join condition.
-      table_->rows()->setProbedFlag(outputTableRows_.data(), numOut);
+      table_->setJoinProbedFlags(outputTableRows_.data(), numOut);
     }
 
     // Right semi join only returns the build side output when the probe side
@@ -1851,10 +1854,47 @@ void HashProbe::setRunning() {
   setState(ProbeOperatorState::kRunning);
 }
 
+void HashProbe::testingSetRoundPointerStateResetCallback(
+    std::function<void(RoundPointerStateSnapshot)> callback) {
+  roundPointerStateResetCallback = std::move(callback);
+}
+
+void HashProbe::resetRoundPointerState() {
+  if (lookup_) {
+    lookup_->hits.clear();
+  }
+  results_ = {};
+  outputTableRows_.clear();
+  lastProbeIterator_.reset();
+
+  if (roundPointerStateResetCallback) {
+    RoundPointerStateSnapshot snapshot;
+    if (lookup_) {
+      snapshot.lookupHitsWithBuildRows = std::count_if(
+          lookup_->hits.begin(), lookup_->hits.end(), [](auto* row) {
+            return row != nullptr;
+          });
+    }
+    snapshot.joinResultIteratorHasRows = results_.rows != nullptr;
+    snapshot.joinResultIteratorHasHits = results_.hits != nullptr;
+    snapshot.joinResultIteratorHasNextHit = results_.nextHit != nullptr;
+    snapshot.outputTableRowsWithBuildRows = std::count_if(
+        outputTableRows_.begin(), outputTableRows_.end(), [](auto* row) {
+          return row != nullptr;
+        });
+    snapshot.lastProbeIteratorHasRowContainerState =
+        lastProbeIterator_.hashTableIndex_ != -1 ||
+        lastProbeIterator_.rowContainerIterator_.rowBegin != nullptr ||
+        lastProbeIterator_.rowContainerIterator_.endOfRun != nullptr;
+    roundPointerStateResetCallback(snapshot);
+  }
+}
+
 void HashProbe::close() {
   Operator::close();
 
   // Free up major memory usage.
+  resetRoundPointerState();
   joinBridge_.reset();
   spiller_.reset();
   matchFlagSpiller_.reset();
@@ -1915,6 +1955,7 @@ void HashProbe::resetHashTable() {
       isFinished() &&
       FOLLY_LIKELY(
           !operatorCtx_->driverCtx()->queryConfig().morselDrivenEnabled())) {
+    resetRoundPointerState();
     table_.reset();
     joinBridge_->resetHashTable();
   }

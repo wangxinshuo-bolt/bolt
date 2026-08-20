@@ -30,8 +30,10 @@ uint32_t typeWidth(const TypePtr& type) {
 BmRowLayout::BmRowLayout(
     const std::vector<TypePtr>& types,
     const std::vector<bool>& nullable,
-    uint32_t rowBlockSize) {
+    uint32_t rowBlockSize,
+    BmJoinLayoutOptions joinOptions) {
   BOLT_CHECK_EQ(types.size(), nullable.size());
+  BOLT_CHECK_LE(joinOptions.numKeys, types.size());
   uint32_t nullBits = 0;
   for (auto isNullable : nullable) {
     if (isNullable) {
@@ -40,6 +42,7 @@ BmRowLayout::BmRowLayout(
   }
   nullBytes_ = bits::nbytes(nullBits);
   fixedRowSize_ = nullBytes_;
+  joinOptions_ = joinOptions;
   columns_.reserve(types.size());
   stringColumns_.reserve(types.size());
   storePlans_.reserve(types.size());
@@ -79,6 +82,27 @@ BmRowLayout::BmRowLayout(
     }
     fixedRowSize_ += width;
   }
+  persistedRowSize_ = fixedRowSize_;
+  if (joinOptions_.hasNext) {
+    fixedRowSize_ = bits::roundUp(fixedRowSize_, alignof(char*));
+    joinRuntimeLayout_.hasNext = true;
+    joinRuntimeLayout_.nextOffset = fixedRowSize_;
+    fixedRowSize_ += sizeof(char*);
+  }
+  if (joinOptions_.hasProbedFlag) {
+    fixedRowSize_ = bits::roundUp(fixedRowSize_, alignof(bool));
+    joinRuntimeLayout_.hasProbedFlag = true;
+    joinRuntimeLayout_.probedOffset = fixedRowSize_;
+    fixedRowSize_ += sizeof(bool);
+  }
+  if (joinOptions_.hasNormalizedKey) {
+    fixedRowSize_ = bits::roundUp(fixedRowSize_, alignof(uint64_t));
+    joinRuntimeLayout_.hasNormalizedKey = true;
+    joinRuntimeLayout_.normalizedKeyOffset = fixedRowSize_;
+    fixedRowSize_ += sizeof(uint64_t);
+  }
+  joinRuntimeLayout_.offset = persistedRowSize_;
+  joinRuntimeLayout_.size = fixedRowSize_ - persistedRowSize_;
   BOLT_CHECK_LE(fixedRowSize_, rowBlockSize);
 }
 

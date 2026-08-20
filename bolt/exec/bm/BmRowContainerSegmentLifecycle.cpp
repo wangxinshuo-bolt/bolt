@@ -9,6 +9,15 @@
 namespace bytedance::bolt::exec::bm {
 namespace {
 
+bool blockContainsRow(const BlockRef& block, const char* row) {
+  if (block.ptr == nullptr) {
+    return false;
+  }
+  const auto* begin = block.ptr;
+  const auto* end = begin + block.used;
+  return row >= begin && row < end;
+}
+
 void collectReadOnlyEvictBlock(
     BlockRef& block,
     uint64_t& selectedBytes,
@@ -55,30 +64,115 @@ void collectReadOnlyEvictChunkBlocks(
 } // namespace
 
 SegmentId BmRowContainer::spillActiveSegment() {
-  return segments_.spillActiveSegment();
+  checkNoLiveLeaseForPartition(kDefaultPartition);
+  const auto segment = segments_.spillActiveSegment();
+  invalidatePartitionRows(kDefaultPartition);
+  return segment;
 }
 
 SegmentId BmRowContainer::spillActivePartitionSegment(PartitionId partition) {
-  return segments_.spillActivePartitionSegment(partition);
+  checkNoLiveLeaseForPartition(partition);
+  const auto segment = segments_.spillActivePartitionSegment(partition);
+  invalidatePartitionRows(partition);
+  return segment;
+}
+
+SegmentId BmRowContainer::sealActivePartitionSegment(PartitionId partition) {
+  checkNoLiveLeaseForPartition(partition);
+  return segments_.sealActivePartitionSegment(partition);
+}
+
+SegmentId BmRowContainer::spillSealedPartition(PartitionId partition) {
+  checkNoLiveLeaseForPartition(partition);
+  const auto segment = segments_.spillSealedPartition(partition);
+  invalidatePartitionRows(partition);
+  return segment;
+}
+
+std::vector<char*> BmRowContainer::loadPartitionRows(PartitionId partition) {
+  const auto& segments = segments_.segmentsForPartition(partition);
+  auto rows = loadAllRows({segments.data(), segments.size()});
+  for (auto segment : segments) {
+    auto& data = segments_.segmentData(segment);
+    data.meta.generation = partitionLeaseStates_[partition]->generation;
+    for (auto& chunkPtr : data.chunks) {
+      auto& chunk = *chunkPtr;
+      if (chunk.consumed || !chunk.rowBlock.handle.valid()) {
+        continue;
+      }
+      bufferManager_->MarkDirty(chunk.rowBlock.block);
+      auto* row = chunk.rowBlock.ptr;
+      for (uint32_t i = 0; i < chunk.meta.rowCount; ++i) {
+        layout_.resetJoinRuntimeMetadata(row);
+        row += segments_.rowStride();
+      }
+    }
+  }
+  return rows;
+}
+
+BmRoundLease BmRowContainer::acquireRoundLease(PartitionId partition) {
+  BOLT_CHECK_LT(partition, kMaxPartitions);
+  auto& state = partitionLeaseStates_[partition];
+  BOLT_CHECK_EQ(
+      state->activeLeaseCount,
+      0,
+      "Partition {} already has a live BM round lease",
+      partition);
+  ++state->activeLeaseCount;
+  return BmRoundLease(state, state->generation);
+}
+
+void BmRowContainer::releaseRoundLease(BmRoundLease& lease) {
+  if (!lease.active()) {
+    return;
+  }
+  auto state = lease.state_;
+  BOLT_CHECK_NOT_NULL(state);
+  BOLT_CHECK(state->ownerAlive, "Lease owner has already been destroyed");
+  BOLT_CHECK(state->owner == this, "Lease does not belong to this container");
+  const auto partition = lease.partition_;
+  BOLT_CHECK_LT(partition, kMaxPartitions);
+  BOLT_CHECK(
+      state.get() == partitionLeaseStates_[partition].get(),
+      "Lease state does not match partition {}",
+      partition);
+  BOLT_CHECK_EQ(
+      lease.generation_,
+      state->generation,
+      "Lease generation {} is stale for partition {} current generation {}",
+      lease.generation_,
+      partition,
+      state->generation);
+  BOLT_CHECK_GT(state->activeLeaseCount, 0);
+  --state->activeLeaseCount;
+  lease.state_.reset();
+  invalidatePartitionRows(partition);
+  lease.partition_ = kDefaultPartition;
+  lease.generation_ = 0;
 }
 
 void BmRowContainer::releaseSegment(SegmentId segment) {
+  checkNoLiveLeaseForSegment(segment);
   segments_.releaseSegment(segment);
 }
 
 void BmRowContainer::releaseSegments(folly::Range<const SegmentId*> segments) {
+  checkNoLiveLeaseForSegments(segments);
   for (auto segment : segments) {
     releaseSegment(segment);
   }
 }
 
 void BmRowContainer::releaseChunk(SegmentId segment, ChunkId chunk) {
+  checkNoLiveLeaseForChunk(segment, chunk);
   auto& segmentData = segments_.segmentData(segment);
   BOLT_CHECK_LT(chunk, segmentData.chunks.size());
   segments_.releaseChunkBlocks(*segmentData.chunks[chunk]);
 }
 
 void BmRowContainer::popFrontRows(uint64_t rowCount) {
+  checkNoLiveLeaseForPopFrontRows(rowCount);
   segments_.popFrontRows(rowCount);
 }
 
@@ -97,6 +191,7 @@ uint64_t BmRowContainer::evictReadOnlyLoadedChunks(
     if (selectedBytes >= targetBytes) {
       break;
     }
+    checkNoLiveLeaseForChunk(segment, chunk);
     auto& segmentData = segments_.segmentData(segment);
     BOLT_CHECK(
         segmentData.meta.state != SegmentState::kActiveResident,
@@ -208,6 +303,81 @@ void BmRowContainer::copyRowWithDeepColumns(
 
 int64_t BmRowContainer::numRows() const {
   return segments_.numRows();
+}
+
+void BmRowContainer::checkRowPointerReadable(const char* row) const {
+  BOLT_CHECK_NOT_NULL(row);
+  for (auto segment : segments_.allSegmentIds()) {
+    const auto& data = segments_.segmentData(segment);
+    for (const auto& chunkPtr : data.chunks) {
+      const auto& chunk = *chunkPtr;
+      if (chunk.consumed || !blockContainsRow(chunk.rowBlock, row)) {
+        continue;
+      }
+      const auto rowOffset = static_cast<uintptr_t>(row - chunk.rowBlock.ptr);
+      BOLT_CHECK_EQ(
+          rowOffset % segments_.rowStride(),
+          0,
+          "BM row pointer is not row-aligned");
+      if (data.meta.partitionId.has_value()) {
+        const auto partition = *data.meta.partitionId;
+        BOLT_CHECK_EQ(
+            data.meta.generation,
+            partitionLeaseStates_[partition]->generation,
+            "BM row pointer belongs to stale partition epoch");
+      }
+      return;
+    }
+  }
+  BOLT_FAIL("BM row pointer is not reachable in the current epoch");
+}
+
+void BmRowContainer::checkNoLiveLeaseForPartition(PartitionId partition) const {
+  BOLT_CHECK_LT(partition, kMaxPartitions);
+  BOLT_CHECK_EQ(
+      partitionLeaseStates_[partition]->activeLeaseCount,
+      0,
+      "Partition {} has a live BM round lease",
+      partition);
+}
+
+void BmRowContainer::checkNoLiveLeaseForSegment(SegmentId segment) const {
+  const auto partition = segments_.partitionForSegment(segment);
+  if (partition.has_value()) {
+    checkNoLiveLeaseForPartition(*partition);
+    return;
+  }
+  for (PartitionId partitionId = 0; partitionId < kMaxPartitions;
+       ++partitionId) {
+    checkNoLiveLeaseForPartition(partitionId);
+  }
+}
+
+void BmRowContainer::checkNoLiveLeaseForSegments(
+    folly::Range<const SegmentId*> segments) const {
+  for (auto segment : segments) {
+    checkNoLiveLeaseForSegment(segment);
+  }
+}
+
+void BmRowContainer::checkNoLiveLeaseForChunk(
+    SegmentId segment,
+    ChunkId /*chunk*/) const {
+  checkNoLiveLeaseForSegment(segment);
+}
+
+void BmRowContainer::checkNoLiveLeaseForPopFrontRows(uint64_t rowCount) const {
+  if (rowCount == 0) {
+    return;
+  }
+  for (PartitionId partition = 0; partition < kMaxPartitions; ++partition) {
+    checkNoLiveLeaseForPartition(partition);
+  }
+}
+
+void BmRowContainer::invalidatePartitionRows(PartitionId partition) {
+  BOLT_CHECK_LT(partition, kMaxPartitions);
+  ++partitionLeaseStates_[partition]->generation;
 }
 
 } // namespace bytedance::bolt::exec::bm

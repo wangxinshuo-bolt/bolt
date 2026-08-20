@@ -41,6 +41,7 @@
 #include "bolt/common/base/StatsReporter.h"
 #include "bolt/common/base/SuccinctPrinter.h"
 #include "bolt/common/testutil/TestValue.h"
+#include "bolt/exec/BmHashTable.h"
 #include "bolt/exec/OperatorUtils.h"
 #include "bolt/exec/RowContainer.h"
 #include "bolt/exec/Spiller.h"
@@ -67,6 +68,69 @@ BlockingReason fromStateToBlockingReason(HashBuild::State state) {
     default:
       BOLT_UNREACHABLE(HashBuild::stateName(state));
   }
+}
+
+const char* bmFallbackReasonName(
+    HashBuild::BmHashJoinFallbackReason reason) {
+  using Reason = HashBuild::BmHashJoinFallbackReason;
+  switch (reason) {
+    case Reason::kNone:
+      return "none";
+    case Reason::kDisabled:
+      return "disabled";
+    case Reason::kNonSerialExecution:
+      return "non_serial_execution";
+    case Reason::kMultipleBuildDrivers:
+      return "multiple_build_drivers";
+    case Reason::kGroupedExecution:
+      return "grouped_execution";
+    case Reason::kUnsupportedJoinType:
+      return "unsupported_join_type";
+    case Reason::kDropDuplicates:
+      return "drop_duplicates";
+    case Reason::kHybridJoin:
+      return "hybrid_join";
+    case Reason::kReusableHashTable:
+      return "reusable_hash_table";
+    case Reason::kNoBufferManager:
+      return "no_buffer_manager";
+    case Reason::kJitRowEq:
+      return "jit_row_eq";
+    case Reason::kSpillRestore:
+      return "spill_restore";
+    case Reason::kRightOrNullAwareLayout:
+      return "right_or_null_aware_layout";
+    case Reason::kUnsupportedType:
+      return "unsupported_type";
+  }
+  return "unknown";
+}
+
+bool isBmHashJoinSupportedStoredType(const TypePtr& type) {
+  switch (type->kind()) {
+    case TypeKind::BOOLEAN:
+    case TypeKind::TINYINT:
+    case TypeKind::SMALLINT:
+    case TypeKind::INTEGER:
+    case TypeKind::BIGINT:
+    case TypeKind::HUGEINT:
+    case TypeKind::REAL:
+    case TypeKind::DOUBLE:
+    case TypeKind::VARCHAR:
+    case TypeKind::VARBINARY:
+    case TypeKind::TIMESTAMP:
+      return true;
+    case TypeKind::ARRAY:
+    case TypeKind::MAP:
+    case TypeKind::ROW:
+    case TypeKind::UNKNOWN:
+    case TypeKind::FUNCTION:
+    case TypeKind::OPAQUE:
+    case TypeKind::VARIANT:
+    case TypeKind::INVALID:
+      return false;
+  }
+  return false;
 }
 } // namespace
 
@@ -119,6 +183,7 @@ HashBuild::HashBuild(
   joinBridge_->addBuilder();
   if (auto opaqueHashTable = joinNode_->reusableHashTable()) {
     TestValue::adjust("bytedance::bolt::exec::HashBuild::HashBuild", this);
+    recordBmHashJoinFallback(BmHashJoinFallbackReason::kReusableHashTable);
     setReusableHashTable(opaqueHashTable);
     return;
   }
@@ -197,7 +262,9 @@ HashBuild::HashBuild(
         driverId_);
   }
   setupTable();
-  setupSpiller();
+  if (!usingBmHashJoin()) {
+    setupSpiller();
+  }
   intermediateStateCleared_ = false;
 
   LOG(INFO) << name() << " HashBuild created for " << operatorCtx_->toString()
@@ -237,6 +304,7 @@ void HashBuild::setupTable() {
     dependentTypes.emplace_back(tableType_->childAt(i));
   }
   auto& queryConfig = operatorCtx_->driverCtx()->queryConfig();
+  bmHashJoinEnabledForBuild_ = canUseBmHashJoin();
   if (joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
       joinNode_->isRightSemiProjectJoin()) {
     // Do not ignore null keys.
@@ -270,17 +338,30 @@ void HashBuild::setupTable() {
           hybridJoin_);
     } else {
       // Ignore null keys
-      table_ = HashTable<true>::createForJoin(
-          std::move(keyHashers),
-          dependentTypes,
-          isDREnabled_ ? false : !dropDuplicates_, // allowDuplicates
-          needProbedFlag, // hasProbedFlag
-          isDREnabled_ ? BaseHashTable::HashMode::kHash
-                       : BaseHashTable::HashMode::kArray,
-          queryConfig.minTableRowsForParallelJoinBuild(),
-          pool(),
-          queryConfig.enableJitRowEqVectors(),
-          hybridJoin_);
+      if (bmHashJoinEnabledForBuild_) {
+        table_ = BmHashTable<true>::createForJoin(
+            std::move(keyHashers),
+            dependentTypes,
+            !dropDuplicates_, // allowDuplicates
+            needProbedFlag, // hasProbedFlag
+            queryConfig.minTableRowsForParallelJoinBuild(),
+            pool(),
+            operatorCtx_->task()->bufferManager(),
+            queryConfig.enableJitRowEqVectors(),
+            queryConfig.bmHashJoinSpillThreshold());
+      } else {
+        table_ = HashTable<true>::createForJoin(
+            std::move(keyHashers),
+            dependentTypes,
+            isDREnabled_ ? false : !dropDuplicates_, // allowDuplicates
+            needProbedFlag, // hasProbedFlag
+            isDREnabled_ ? BaseHashTable::HashMode::kHash
+                         : BaseHashTable::HashMode::kArray,
+            queryConfig.minTableRowsForParallelJoinBuild(),
+            pool(),
+            queryConfig.enableJitRowEqVectors(),
+            hybridJoin_);
+      }
     }
   }
   lookup_ = std::make_unique<HashLookup>(
@@ -303,6 +384,112 @@ void HashBuild::setupTable() {
     // and rowId encodes (batchId, rowInBatch) instead of global row index.
     table_->hybridData()->setScatteredModeEnabled(scatteredMode_);
   }
+}
+
+bool HashBuild::canUseBmHashJoin() {
+  const auto& queryConfig = operatorCtx_->driverCtx()->queryConfig();
+  auto fallback = [&](BmHashJoinFallbackReason reason) {
+    recordBmHashJoinFallback(reason);
+    return false;
+  };
+
+  if (!queryConfig.bmHashJoinEnabled()) {
+    return fallback(BmHashJoinFallbackReason::kDisabled);
+  }
+  if (operatorCtx_->task()->executionMode() != Task::ExecutionMode::kSerial) {
+    return fallback(BmHashJoinFallbackReason::kNonSerialExecution);
+  }
+  if (operatorCtx_->task()->queryCtx()->isExecutorSupplied()) {
+    return fallback(BmHashJoinFallbackReason::kNonSerialExecution);
+  }
+  if (operatorCtx_->task()->numDrivers(operatorCtx_->driverCtx()) != 1 ||
+      joinBridge_->numBuilders() != 1) {
+    return fallback(BmHashJoinFallbackReason::kMultipleBuildDrivers);
+  }
+  if (!operatorCtx_->task()->isUngroupedExecution()) {
+    return fallback(BmHashJoinFallbackReason::kGroupedExecution);
+  }
+  if (joinType_ != core::JoinType::kInner || nullAware_ ||
+      joinNode_->filter() != nullptr) {
+    return fallback(BmHashJoinFallbackReason::kUnsupportedJoinType);
+  }
+  if (dropDuplicates_ || joinNode_->isRightJoin() || joinNode_->isFullJoin() ||
+      joinNode_->isRightSemiFilterJoin() ||
+      joinNode_->isRightSemiProjectJoin() ||
+      isLeftNullAwareJoinWithFilter(joinNode_)) {
+    return fallback(BmHashJoinFallbackReason::kRightOrNullAwareLayout);
+  }
+  if (hybridJoin_ || scatteredMode_) {
+    return fallback(BmHashJoinFallbackReason::kHybridJoin);
+  }
+  if (reuseHashTable_ || joinNode_->reusableHashTable()) {
+    return fallback(BmHashJoinFallbackReason::kReusableHashTable);
+  }
+  if (isInputFromSpill()) {
+    return fallback(BmHashJoinFallbackReason::kSpillRestore);
+  }
+  if (queryConfig.enableJitRowEqVectors()) {
+    return fallback(BmHashJoinFallbackReason::kJitRowEq);
+  }
+  if (operatorCtx_->task()->bufferManager() == nullptr) {
+    return fallback(BmHashJoinFallbackReason::kNoBufferManager);
+  }
+  for (auto i = 0; i < tableType_->size(); ++i) {
+    if (!isBmHashJoinSupportedStoredType(tableType_->childAt(i))) {
+      return fallback(BmHashJoinFallbackReason::kUnsupportedType);
+    }
+  }
+  bmHashJoinFallbackReason_ = BmHashJoinFallbackReason::kNone;
+  return true;
+}
+
+void HashBuild::recordBmHashJoinFallback(BmHashJoinFallbackReason reason) {
+  bmHashJoinFallbackReason_ = reason;
+  if (reason == BmHashJoinFallbackReason::kNone) {
+    return;
+  }
+  stats_.wlock()->setRuntimeStat(
+      "bmHashJoinFallbackReason",
+      RuntimeCounter(static_cast<int64_t>(reason)));
+  LOG(INFO) << name() << " BM hash join fallback: "
+            << bmFallbackReasonName(reason);
+}
+
+void HashBuild::recordBmHashJoinStats() {
+  auto lockedStats = stats_.wlock();
+  if (!usingBmHashJoin()) {
+    return;
+  }
+
+  auto* bmTable = dynamic_cast<BmHashTable<true>*>(table_.get());
+  BOLT_CHECK_NOT_NULL(bmTable);
+  const auto& stats = bmTable->runtimeStats();
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpilledRows", RuntimeCounter(stats.spilledRows));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpilledBytes", RuntimeCounter(stats.spillBytes));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpilledSegments", RuntimeCounter(stats.spilledSegments));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinRestoreCount", RuntimeCounter(stats.restoreCount));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillWriteCount", RuntimeCounter(stats.spillWriteCount));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillReadCount", RuntimeCounter(stats.spillReadCount));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillWriteBytes", RuntimeCounter(stats.spillWriteBytes));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillReadBytes", RuntimeCounter(stats.spillReadBytes));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillPhysicalWriteBytes",
+      RuntimeCounter(stats.spillPhysicalWriteBytes));
+  lockedStats->addRuntimeStat(
+      "bmHashJoinSpillPhysicalReadBytes",
+      RuntimeCounter(stats.spillPhysicalReadBytes));
+}
+
+uint64_t HashBuild::joinRowCount() const {
+  return table_ == nullptr ? 0 : table_->joinRowCount();
 }
 
 void HashBuild::setReusableHashTable(
@@ -335,6 +522,9 @@ void HashBuild::setReusableHashTable(
 void HashBuild::setupSpiller(
     SpillPartition* spillPartition,
     uint64_t maxPartitionRowCount) {
+  BOLT_CHECK(
+      !usingBmHashJoin(),
+      "Resident BM hash join does not support build spilling");
   BOLT_CHECK_NULL(spiller_);
   BOLT_CHECK_NULL(spillInputReader_);
 
@@ -510,6 +700,9 @@ void HashBuild::removeInputRowsForAntiJoinFilter() {
 
 // add spilled Rows
 void HashBuild::addSpilledRowInput(std::vector<char*>& rows, uint32_t size) {
+  BOLT_CHECK(
+      !usingBmHashJoin(),
+      "Resident BM hash join does not support spilled build input");
   if (rows.empty()) {
     return;
   }
@@ -600,9 +793,10 @@ void HashBuild::addInput(RowVectorPtr input) {
     noMoreInput();
     return;
   }
-  if (spillConfig_->rowBasedSpillMode != common::RowBasedSpillMode::DISABLE) {
+  if (!usingBmHashJoin() &&
+      spillConfig_->rowBasedSpillMode != common::RowBasedSpillMode::DISABLE) {
     spillRowBasedInput(); // spill previous input rows in hash tables.
-  } else {
+  } else if (!usingBmHashJoin()) {
     spillInput(input);
   }
 
@@ -657,10 +851,15 @@ void HashBuild::addInput(RowVectorPtr input) {
       analyzeKeys_ = hasher->mayUseValueIds();
     }
   }
-  auto rows = table_->rows();
-  auto nextOffset = rows->nextOffset();
+  std::vector<const DecodedVector*> keyDecoders;
+  keyDecoders.reserve(hashers.size());
+  for (auto& hasher : hashers) {
+    keyDecoders.push_back(&hasher->decodedVector());
+  }
 
   if (hybridJoin_) {
+    auto rows = table_->rows();
+    auto nextOffset = rows->nextOffset();
     // Get batch/row info before processing
     auto batchId = table_->hybridData()->getNumBatches(); // for scattered mode
     auto baseRow = table_->hybridData()->getNumRows(); // for coalesced mode
@@ -697,21 +896,22 @@ void HashBuild::addInput(RowVectorPtr input) {
         input->as<RowVector>(), dependentChannels_, dependentTypes_, pool());
     table_->hybridData()->addPayload(std::move(payloadInput));
   } else {
-    activeRows_.applyToSelected([&](auto rowIndex) {
-      char* newRow = rows->newRow();
-      if (nextOffset) {
-        *reinterpret_cast<char**>(newRow + nextOffset) = nullptr;
-      }
-      // Store the columns for each row in sequence. At probe time
-      // strings of the row will probably be in consecutive places, so
-      // reading one will prime the cache for the next.
-      for (auto i = 0; i < hashers.size(); ++i) {
-        rows->store(hashers[i]->decodedVector(), rowIndex, newRow, i);
-      }
-      for (auto i = 0; i < dependentChannels_.size(); ++i) {
-        rows->store(*decoders_[i], rowIndex, newRow, i + hashers.size());
-      }
-    });
+    std::vector<const DecodedVector*> dependentDecoders;
+    dependentDecoders.reserve(decoders_.size());
+    for (const auto& decoder : decoders_) {
+      dependentDecoders.push_back(decoder.get());
+    }
+    table_->appendJoinRows(
+        activeRows_,
+        folly::Range<const DecodedVector* const*>(
+            keyDecoders.data(), keyDecoders.size()),
+        folly::Range<const DecodedVector* const*>(
+            dependentDecoders.data(), dependentDecoders.size()));
+    if (usingBmHashJoin() && !bmHashJoinBackendRecorded_ &&
+        activeRows_.countSelected() > 0) {
+      addRuntimeStat("bmHashJoinBackend", RuntimeCounter(1));
+      bmHashJoinBackendRecorded_ = true;
+    }
   }
   spillRowBasedInput();
 }
@@ -756,6 +956,9 @@ bool HashBuild::reserveMemory(
     const RowVectorPtr& input,
     SpilledRows spilledRows) {
   BOLT_CHECK(spillEnabled());
+  if (usingBmHashJoin()) {
+    return true;
+  }
 
   Operator::ReclaimableSectionGuard guard(this);
   numSpillRows_ = 0;
@@ -850,6 +1053,9 @@ bool HashBuild::reserveMemory(
 }
 
 void HashBuild::spillRowBasedInput() {
+  if (usingBmHashJoin()) {
+    return;
+  }
   if (spillConfig_->rowBasedSpillMode == common::RowBasedSpillMode::DISABLE) {
     return;
   }
@@ -864,6 +1070,9 @@ void HashBuild::spillRowBasedInput() {
 }
 
 void HashBuild::spillInput(const RowVectorPtr& input) {
+  if (usingBmHashJoin()) {
+    return;
+  }
   BOLT_CHECK_EQ(input->size(), activeRows_.size());
 
   if (spillConfig_->rowBasedSpillMode != common::RowBasedSpillMode::DISABLE) {
@@ -941,6 +1150,9 @@ void HashBuild::prepareInputIndicesBuffers(
 }
 
 void HashBuild::computeSpillPartitions(const RowVectorPtr& input) {
+  BOLT_CHECK(
+      !usingBmHashJoin(),
+      "Resident BM hash join does not support spill partition computation");
   if (hashes_.size() < activeRows_.end()) {
     hashes_.resize(activeRows_.end());
   }
@@ -1123,7 +1335,7 @@ bool HashBuild::finishHashBuild() {
 
   std::vector<HashBuild*> otherBuilds;
   otherBuilds.reserve(peers.size());
-  uint64_t numRows = table_->rows()->numRows();
+  uint64_t numRows = joinRowCount();
   for (auto& peer : peers) {
     auto op = peer->findOperator(planNodeId());
     HashBuild* build = dynamic_cast<HashBuild*>(op);
@@ -1141,7 +1353,7 @@ bool HashBuild::finishHashBuild() {
           !build->intermediateStateCleared_,
           "Intermediate state for a peer is empty. It might have been "
           "already closed.");
-      numRows += build->table_->rows()->numRows();
+      numRows += build->joinRowCount();
     }
     otherBuilds.push_back(build);
   }
@@ -1217,6 +1429,11 @@ bool HashBuild::finishHashBuild() {
   // https://github.com/facebookincubator/velox/issues/3567 is fixed.
   const bool allowParallelJoinBuild =
       !otherTables.empty() && spillPartitions.empty();
+  if (usingBmHashJoin()) {
+    auto* bmTable = dynamic_cast<BmHashTable<true>*>(table_.get());
+    BOLT_CHECK_NOT_NULL(bmTable);
+    bmTable->finishSpillAndReload();
+  }
   table_->prepareJoinTable(
       std::move(otherTables),
       allowParallelJoinBuild ? operatorCtx_->task()->queryCtx()->executor()
@@ -1225,6 +1442,7 @@ bool HashBuild::finishHashBuild() {
       isInputFromSpill() ? spillConfig()->startPartitionBit
                          : BaseHashTable::kNoSpillInputStartPartitionBit);
   addRuntimeStats();
+  recordBmHashJoinStats();
 
   // [Morsel-driven] early capture empty hashtable and stop build side
   // morsel-driven driver schedulers and localExchangeQueue.
@@ -1412,7 +1630,7 @@ void HashBuild::ensureTableFits(
 void HashBuild::postHashBuildProcess() {
   checkRunning();
 
-  if (!spillEnabled()) {
+  if (!spillEnabled() || usingBmHashJoin()) {
     setState(State::kFinish);
     return;
   }
@@ -1793,7 +2011,7 @@ bool HashBuild::nonReclaimableState() const {
   return ((state_ != State::kRunning) && (state_ != State::kWaitForBuild) &&
           (state_ != State::kYield)) ||
       nonReclaimableSection_ || intermediateStateCleared_ ||
-      spiller_->finalized();
+      (spiller_ != nullptr && spiller_->finalized());
 }
 
 void HashBuild::close() {
@@ -1814,6 +2032,9 @@ template <bool isRepartition>
 bool HashBuild::calculateJoinBits(
     uint8_t maxjoinBits,
     uint64_t maxPartitionRowCount) {
+  BOLT_CHECK(
+      !usingBmHashJoin(),
+      "Resident BM hash join does not support join spill partitioning");
   uint32_t numPartitions;
   uint64_t rowsInMem = table_->rows()->numRows();
 

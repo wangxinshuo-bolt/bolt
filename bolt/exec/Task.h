@@ -188,6 +188,10 @@ class Task : public std::enable_shared_from_this<Task> {
 
   bool isUngroupedExecution() const;
 
+  ExecutionMode executionMode() const {
+    return mode_;
+  }
+
   /// Starts executing the plan fragment specified in the constructor. If leaf
   /// nodes require splits (e.g. TableScan, Exchange, etc.), these splits can be
   /// added before or after calling start().

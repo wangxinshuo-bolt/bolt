@@ -144,6 +144,7 @@ uint64_t ReadOnlyWindowReadSession::releaseLoadedChunks(uint64_t targetBytes) {
     if (released >= targetBytes) {
       break;
     }
+    container_->checkNoLiveLeaseForChunk(segment, chunk);
     auto& segmentData = container_->segments_.segmentData(segment);
     if (segmentData.meta.state == SegmentState::kActiveResident) {
       continue;

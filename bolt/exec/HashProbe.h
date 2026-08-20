@@ -30,6 +30,8 @@
 
 #pragma once
 
+#include <functional>
+
 #include "bolt/exec/HashBuild.h"
 #include "bolt/exec/HashPartitionFunction.h"
 #include "bolt/exec/HashTable.h"
@@ -83,6 +85,18 @@ class HashProbe : public Operator {
   void close() override;
 
   void clearDynamicFilters() override;
+
+  struct RoundPointerStateSnapshot {
+    int32_t lookupHitsWithBuildRows{0};
+    bool joinResultIteratorHasRows{false};
+    bool joinResultIteratorHasHits{false};
+    bool joinResultIteratorHasNextHit{false};
+    int32_t outputTableRowsWithBuildRows{0};
+    bool lastProbeIteratorHasRowContainerState{false};
+  };
+
+  static void testingSetRoundPointerStateResetCallback(
+      std::function<void(RoundPointerStateSnapshot)> callback);
 
  private:
   // Indicates if the join type includes misses from the left side in the
@@ -218,6 +232,8 @@ class HashProbe : public Operator {
   // operator will also notify the hash build operators to build the next hash
   // table from spilled data.
   void prepareForSpillRestore();
+
+  void resetRoundPointerState();
 
   // Invoked to read next batch of spilled probe inputs from disk to process.
   void addSpillInput();

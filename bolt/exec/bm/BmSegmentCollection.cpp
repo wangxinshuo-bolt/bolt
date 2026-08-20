@@ -61,7 +61,46 @@ SegmentId BmSegmentCollection::spillActiveSegment() {
 
 SegmentId BmSegmentCollection::spillActivePartitionSegment(
     PartitionId partition) {
-  return finalizeAndFlush(partition);
+  const auto segment = sealActivePartitionSegment(partition);
+  return finalizeAndFlushSegment(segmentData(segment));
+}
+
+SegmentId BmSegmentCollection::sealActivePartitionSegment(
+    PartitionId partition) {
+  checkPartition(partition);
+  auto active = activeSegments_[partition];
+  BOLT_CHECK_NE(active, kNoSegment);
+  auto& segment = segmentData(active);
+  BOLT_CHECK(
+      segment.meta.state == SegmentState::kActiveResident,
+      "Partition {} active segment {} is not active",
+      partition,
+      active);
+  segment.meta.state = SegmentState::kFinalizedResident;
+  partitionSegments_[partition].push_back(active);
+  activeSegments_[partition] = kNoSegment;
+  return active;
+}
+
+SegmentId BmSegmentCollection::spillSealedPartition(PartitionId partition) {
+  checkPartition(partition);
+  const auto& segments = partitionSegments_[partition];
+  BOLT_CHECK(!segments.empty(), "Partition {} has no sealed segment", partition);
+  SegmentId last = kNoSegment;
+  for (auto segment : segments) {
+    auto& data = segmentData(segment);
+    if (data.meta.state == SegmentState::kFinalizedResident) {
+      finalizeAndFlushSegment(data);
+    } else {
+      BOLT_CHECK(
+          data.meta.state == SegmentState::kFinalizedFlushed,
+          "Partition {} segment {} is not sealed or spilled",
+          partition,
+          segment);
+    }
+    last = segment;
+  }
+  return last;
 }
 
 void BmSegmentCollection::releaseSegment(SegmentId segment) {
@@ -98,6 +137,23 @@ const std::vector<SegmentId>& BmSegmentCollection::segmentsForPartition(
     PartitionId partition) const {
   checkPartition(partition);
   return partitionSegments_[partition];
+}
+
+bool BmSegmentCollection::segmentBelongsToPartition(
+    SegmentId segment,
+    PartitionId partition) const {
+  checkPartition(partition);
+  if (segment >= segments_.size() || segments_[segment] == nullptr) {
+    return false;
+  }
+  const auto& data = *segments_[segment];
+  return data.meta.partitionId.has_value() &&
+      *data.meta.partitionId == partition;
+}
+
+std::optional<PartitionId> BmSegmentCollection::partitionForSegment(
+    SegmentId segment) const {
+  return segmentData(segment).meta.partitionId;
 }
 
 std::vector<SegmentId> BmSegmentCollection::allSegmentIds() const {
@@ -164,19 +220,15 @@ SegmentData& BmSegmentCollection::createSegment(
 }
 
 SegmentId BmSegmentCollection::finalizeAndFlush(PartitionId partition) {
-  checkPartition(partition);
-  auto active = activeSegments_[partition];
-  BOLT_CHECK_NE(active, kNoSegment);
-  auto& segment = segmentData(active);
-  const auto id = finalizeAndFlushSegment(segment);
-  partitionSegments_[partition].push_back(id);
-  activeSegments_[partition] = kNoSegment;
-  return id;
+  const auto sealed = sealActivePartitionSegment(partition);
+  return finalizeAndFlushSegment(segmentData(sealed));
 }
 
 SegmentId BmSegmentCollection::finalizeAndFlushSegment(
     SegmentData& segment) {
-  BOLT_DCHECK(segment.meta.state == SegmentState::kActiveResident);
+  BOLT_DCHECK(
+      segment.meta.state == SegmentState::kActiveResident ||
+      segment.meta.state == SegmentState::kFinalizedResident);
   segment.meta.state = SegmentState::kFinalizedResident;
 
   std::vector<std::shared_ptr<memory::bm::BlockHandle>> blocks;

@@ -1,5 +1,6 @@
 #include "bolt/exec/bm/BmRowContainer.h"
 
+#include "bolt/common/base/BitUtil.h"
 #include "bolt/common/base/Exceptions.h"
 #include "bolt/type/HugeInt.h"
 
@@ -82,6 +83,50 @@ compareScalarValue(const char* left, const char* right, const TypePtr& type) {
   }
 }
 
+template <typename T>
+bool equalValues(const char* left, const DecodedVector& decoded, vector_size_t index) {
+  return *reinterpret_cast<const T*>(left) == decoded.valueAt<T>(index);
+}
+
+template <TypeKind Kind>
+bool equalsDecodedNonNullValue(
+    const char* rowValue,
+    const DecodedVector& decoded,
+    vector_size_t index,
+    const TypePtr& type) {
+  if constexpr (Kind == TypeKind::VARCHAR || Kind == TypeKind::VARBINARY) {
+    const auto left = *reinterpret_cast<const StringView*>(rowValue);
+    const auto right = decoded.valueAt<StringView>(index);
+    return left == right;
+  } else if constexpr (Kind == TypeKind::HUGEINT) {
+    return HugeInt::deserialize(rowValue) == decoded.valueAt<int128_t>(index);
+  } else if constexpr (
+      Kind == TypeKind::UNKNOWN || !TypeTraits<Kind>::isPrimitiveType ||
+      !TypeTraits<Kind>::isFixedWidth) {
+    BOLT_NYI("Unsupported equalsDecoded type {}", type->toString());
+  } else {
+    using T = typename TypeTraits<Kind>::NativeType;
+    return equalValues<T>(rowValue, decoded, index);
+  }
+}
+
+template <TypeKind Kind>
+uint64_t hashStoredNonNullValue(const char* rowValue, const TypePtr& type) {
+  if constexpr (Kind == TypeKind::VARCHAR || Kind == TypeKind::VARBINARY) {
+    return folly::hasher<StringView>()(
+        *reinterpret_cast<const StringView*>(rowValue));
+  } else if constexpr (Kind == TypeKind::HUGEINT) {
+    return folly::hasher<int128_t>()(HugeInt::deserialize(rowValue));
+  } else if constexpr (
+      Kind == TypeKind::UNKNOWN || !TypeTraits<Kind>::isPrimitiveType ||
+      !TypeTraits<Kind>::isFixedWidth) {
+    BOLT_NYI("Unsupported hash type {}", type->toString());
+  } else {
+    using T = typename TypeTraits<Kind>::NativeType;
+    return folly::hasher<T>()(*reinterpret_cast<const T*>(rowValue));
+  }
+}
+
 } // namespace
 
 int32_t BmRowContainer::compare(
@@ -98,6 +143,8 @@ int32_t BmRowContainer::compare(
     int32_t leftColumn,
     int32_t rightColumn,
     CompareFlags flags) {
+  checkRowPointerReadable(left);
+  checkRowPointerReadable(right);
   BOLT_DCHECK_LT(leftColumn, layout_.columns().size());
   BOLT_DCHECK_LT(rightColumn, layout_.columns().size());
   BOLT_DCHECK_EQ(
@@ -128,6 +175,62 @@ int32_t BmRowContainer::compare(
     result = -result;
   }
   return result;
+}
+
+bool BmRowContainer::equalsDecoded(
+    const char* row,
+    int32_t column,
+    const DecodedVector& decoded,
+    vector_size_t index,
+    bool nullsEqual) const {
+  checkRowPointerReadable(row);
+  BOLT_DCHECK_LT(column, layout_.columns().size());
+  const auto rowNull = layout_.isNull(row, column);
+  const auto decodedNull = decoded.isNullAt(index);
+  if (rowNull || decodedNull) {
+    return rowNull && decodedNull && nullsEqual;
+  }
+  return BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
+      equalsDecodedNonNullValue,
+      types_[column]->kind(),
+      layout_.valueAddress(row, column),
+      decoded,
+      index,
+      types_[column]);
+}
+
+void BmRowContainer::hashRows(
+    folly::Range<char* const*> rows,
+    folly::Range<const int32_t*> keyColumns,
+    raw_vector<uint64_t>& hashes) const {
+  BOLT_CHECK_EQ(
+      rows.size(),
+      hashes.size(),
+      "hashRows requires one output hash per input row");
+  if (keyColumns.empty()) {
+    return;
+  }
+
+  for (auto row : rows) {
+    checkRowPointerReadable(row);
+  }
+
+  for (auto keyIndex = 0; keyIndex < keyColumns.size(); ++keyIndex) {
+    const auto column = keyColumns[keyIndex];
+    BOLT_DCHECK_LT(column, layout_.columns().size());
+    for (size_t rowIndex = 0; rowIndex < rows.size(); ++rowIndex) {
+      const auto* row = rows[rowIndex];
+      const auto hash = layout_.isNull(row, column)
+          ? BaseVector::kNullHash
+          : BOLT_DYNAMIC_TYPE_DISPATCH_ALL(
+                hashStoredNonNullValue,
+                types_[column]->kind(),
+                layout_.valueAddress(row, column),
+                types_[column]);
+      hashes[rowIndex] =
+          keyIndex == 0 ? hash : bits::hashMix(hashes[rowIndex], hash);
+    }
+  }
 }
 
 int32_t BmRowContainer::compareRows(

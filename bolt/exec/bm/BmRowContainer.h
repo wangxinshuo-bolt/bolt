@@ -3,6 +3,7 @@
 #include "bolt/common/base/CompareFlags.h"
 #include "bolt/common/memory/bm/BufferManager.h"
 #include "bolt/common/memory/bm/MemoryTag.h"
+#include "bolt/common/memory/RawVector.h"
 #include "bolt/exec/bm/BmBatchAppend.h"
 #include "bolt/exec/bm/BmRowBlockLoader.h"
 #include "bolt/exec/bm/BmRowContainerPublicTypes.h"
@@ -10,6 +11,7 @@
 #include "bolt/exec/bm/BmRowCopier.h"
 #include "bolt/exec/bm/BmRowLayout.h"
 #include "bolt/exec/bm/BmRowWriteContext.h"
+#include "bolt/exec/bm/BmRoundLease.h"
 #include "bolt/exec/bm/BmSegmentCollection.h"
 #include "bolt/type/Type.h"
 #include "bolt/vector/ComplexVector.h"
@@ -25,6 +27,8 @@
 
 namespace bytedance::bolt::exec::bm {
 
+struct BmRowContainerTestPeer;
+
 class BmRowContainer {
  public:
   BmRowContainer(
@@ -35,7 +39,9 @@ class BmRowContainer {
       uint32_t rowBlockSize = static_cast<uint32_t>(
           memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
       uint32_t heapBlockSize = static_cast<uint32_t>(
-          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)));
+          memory::bm::allocateSizeBytes(memory::bm::AllocateSize::kLarge)),
+      BmJoinLayoutOptions joinOptions = {});
+  ~BmRowContainer();
 
   // Allocates one row in the active segment for partition. The caller must fill
   // columns with store() before treating the row as complete.
@@ -46,6 +52,13 @@ class BmRowContainer {
   // keeps its separate row-wise path.
   void appendBatch(
       const RowVectorPtr& input,
+      PartitionId partition = kDefaultPartition,
+      std::vector<char*>* rows = nullptr,
+      BmBatchStringStoreMode stringStoreMode = BmBatchStringStoreMode::kCopy);
+
+  void appendBatchSelected(
+      const RowVectorPtr& input,
+      const SelectivityVector& selectedRows,
       PartitionId partition = kDefaultPartition,
       std::vector<char*>* rows = nullptr,
       BmBatchStringStoreMode stringStoreMode = BmBatchStringStoreMode::kCopy);
@@ -76,8 +89,60 @@ class BmRowContainer {
       const char* right,
       const std::vector<CompareFlags>& flags = {});
 
+  bool equalsDecoded(
+      const char* row,
+      int32_t column,
+      const DecodedVector& decoded,
+      vector_size_t index,
+      bool nullsEqual) const;
+
+  void hashRows(
+      folly::Range<char* const*> rows,
+      folly::Range<const int32_t*> keyColumns,
+      raw_vector<uint64_t>& hashes) const;
+
   FOLLY_ALWAYS_INLINE bool isNull(const char* row, int32_t column) const {
     return layout_.isNull(row, column);
+  }
+
+  FOLLY_ALWAYS_INLINE char* next(const char* row) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNext);
+    return *reinterpret_cast<char* const*>(row + runtime.nextOffset);
+  }
+
+  FOLLY_ALWAYS_INLINE void setNext(char* row, char* nextRow) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNext);
+    *reinterpret_cast<char**>(row + runtime.nextOffset) = nextRow;
+  }
+
+  FOLLY_ALWAYS_INLINE bool probed(const char* row) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasProbedFlag);
+    return *reinterpret_cast<const bool*>(row + runtime.probedOffset);
+  }
+
+  FOLLY_ALWAYS_INLINE void setProbed(char* row, bool value) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasProbedFlag);
+    *reinterpret_cast<bool*>(row + runtime.probedOffset) = value;
+  }
+
+  FOLLY_ALWAYS_INLINE uint64_t normalizedKey(const char* row) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNormalizedKey);
+    return *reinterpret_cast<const uint64_t*>(row + runtime.normalizedKeyOffset);
+  }
+
+  FOLLY_ALWAYS_INLINE void setNormalizedKey(char* row, uint64_t value) const {
+    const auto& runtime = layout_.joinRuntimeLayout();
+    BOLT_DCHECK(runtime.hasNormalizedKey);
+    *reinterpret_cast<uint64_t*>(row + runtime.normalizedKeyOffset) = value;
+  }
+
+  FOLLY_ALWAYS_INLINE void resetJoinRuntimeMetadata(char* row) const {
+    layout_.resetJoinRuntimeMetadata(row);
   }
 
   void extractColumnResident(
@@ -113,6 +178,11 @@ class BmRowContainer {
 
   SegmentId spillActiveSegment();
   SegmentId spillActivePartitionSegment(PartitionId partition);
+  SegmentId sealActivePartitionSegment(PartitionId partition);
+  SegmentId spillSealedPartition(PartitionId partition);
+  std::vector<char*> loadPartitionRows(PartitionId partition);
+  BmRoundLease acquireRoundLease(PartitionId partition);
+  void releaseRoundLease(BmRoundLease& lease);
 
   // Materializes resident rows in the supplied order into a new
   // finalized/flushed segment. The returned SegmentId can be scanned through
@@ -168,6 +238,7 @@ class BmRowContainer {
 
  private:
   friend class BmRowLayout;
+  friend struct BmRowContainerTestPeer;
 
   int32_t compareNonNull(
       const char* left,
@@ -217,6 +288,11 @@ class BmRowContainer {
       folly::Range<const BatchAppendRange*> ranges,
       const ColumnStorePlan& column,
       BmBatchStringStoreMode stringStoreMode);
+  static std::vector<BatchAppendRange> selectedRanges(
+      const std::vector<BatchAppendRange>& reservedRanges,
+      const SelectivityVector& selectedRows,
+      std::vector<char*>* rows,
+      uint32_t rowStride);
   template <TypeKind Kind>
   void extractColumnTyped(
       const char* const* rows,
@@ -244,6 +320,16 @@ class BmRowContainer {
       uint64_t targetBytes);
 
   uint64_t unloadedBytes(folly::Range<const SegmentId*> segments) const;
+  void synchronizeLoadedSegmentGeneration(SegmentData& segment);
+
+  void checkRowPointerReadable(const char* row) const;
+  void checkNoLiveLeaseForPartition(PartitionId partition) const;
+  void checkNoLiveLeaseForSegment(SegmentId segment) const;
+  void checkNoLiveLeaseForSegments(folly::Range<const SegmentId*> segments)
+      const;
+  void checkNoLiveLeaseForChunk(SegmentId segment, ChunkId chunk) const;
+  void checkNoLiveLeaseForPopFrontRows(uint64_t rowCount) const;
+  void invalidatePartitionRows(PartitionId partition);
 
   friend class BulkReadSession;
   friend class ReadOnlyWindowReadSession;
@@ -262,6 +348,7 @@ class BmRowContainer {
   BmSegmentCollection segments_;
   BmRowBlockLoader blockLoader_;
   BmRowCopier rowCopier_;
+  std::vector<std::shared_ptr<BmRoundLeaseState>> partitionLeaseStates_;
 };
 
 } // namespace bytedance::bolt::exec::bm

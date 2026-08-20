@@ -7,6 +7,7 @@ add_executable(
   BmMergeReadSessionTest.cpp
   BmPartitionTest.cpp
   BmRowContainerBatchTest.cpp
+  BmRowContainerJoinTest.cpp
   BmRowContainerReadTest.cpp
   BmRowContainerResidentTest.cpp
   BmSegmentCollectionTest.cpp
@@ -17,8 +18,7 @@ target_compile_features(bolt_exec_bm_test PRIVATE cxx_std_20)
 
 target_link_libraries(
   bolt_exec_bm_test
-  PRIVATE bolt_exec_bm
-          bolt_testutils
+  PRIVATE bolt_testutils
           GTest::gmock
           GTest::gtest
           pthread

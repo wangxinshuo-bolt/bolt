@@ -52,11 +52,15 @@ class BmSegmentCollection {
   // Segment lifecycle and partition ownership.
   SegmentId spillActiveSegment();
   SegmentId spillActivePartitionSegment(PartitionId partition);
+  SegmentId sealActivePartitionSegment(PartitionId partition);
+  SegmentId spillSealedPartition(PartitionId partition);
   void releaseSegment(SegmentId segment);
   void releaseSegments(folly::Range<const SegmentId*> segments);
   SegmentState segmentState(SegmentId segment) const;
   const std::vector<SegmentId>& segmentsForPartition(
       PartitionId partition) const;
+  bool segmentBelongsToPartition(SegmentId segment, PartitionId partition) const;
+  std::optional<PartitionId> partitionForSegment(SegmentId segment) const;
   std::vector<SegmentId> allSegmentIds() const;
   int64_t numRows() const;
   SegmentId activeSegmentId(PartitionId partition) const;

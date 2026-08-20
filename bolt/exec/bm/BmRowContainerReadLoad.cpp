@@ -37,6 +37,14 @@ uint64_t BmRowContainer::unloadedBytes(
   return bytes;
 }
 
+void BmRowContainer::synchronizeLoadedSegmentGeneration(SegmentData& segment) {
+  if (!segment.meta.partitionId.has_value()) {
+    return;
+  }
+  segment.meta.generation =
+      partitionLeaseStates_[*segment.meta.partitionId]->generation;
+}
+
 bool BmRowContainer::canBulkRead(
     folly::Range<const SegmentId*> segments) const {
   validateSegments(segments);
@@ -59,6 +67,9 @@ void BmRowContainer::ensureSegmentsLoaded(
 
   try {
     blockLoader_.loadSegments(segments);
+    for (auto segmentId : segments) {
+      synchronizeLoadedSegmentGeneration(segments_.segmentData(segmentId));
+    }
     bufferManager_->ReleaseUnusedReservation();
   } catch (const std::exception&) {
     bufferManager_->ReleaseUnusedReservation();
@@ -79,6 +90,11 @@ void BmRowContainer::ensureChunksLoaded(
 
   try {
     blockLoader_.loadChunks(chunks);
+    for (auto* chunk : chunks) {
+      BOLT_CHECK_NOT_NULL(chunk);
+      synchronizeLoadedSegmentGeneration(
+          segments_.segmentData(chunk->meta.segmentId));
+    }
     bufferManager_->ReleaseUnusedReservation();
   } catch (const std::exception&) {
     bufferManager_->ReleaseUnusedReservation();

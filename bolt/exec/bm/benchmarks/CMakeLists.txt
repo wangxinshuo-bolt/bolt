@@ -11,8 +11,7 @@ function(add_bm_row_container_benchmark TARGET)
 
   target_link_libraries(
     ${TARGET}
-    PRIVATE bolt_exec_bm
-            bolt_testutils
+    PRIVATE bolt_testutils
             ${FOLLY_BENCHMARK}
             GTest::gtest_main
             pthread

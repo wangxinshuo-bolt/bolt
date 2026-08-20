@@ -189,6 +189,64 @@ TEST_F(BufferManagerInternalsTest, AccountingRecordsSpillReadLifecycle) {
   EXPECT_EQ(8192, tag.reclaimedBytes);
   EXPECT_EQ(1, tag.spillWriteCount);
   EXPECT_EQ(1, tag.spillReadCount);
+  EXPECT_EQ(8192, tag.spillWriteBytes);
+  EXPECT_EQ(8192, tag.spillReadBytes);
+  EXPECT_EQ(1024, tag.spillPhysicalWriteBytes);
+  EXPECT_EQ(2048, tag.spillPhysicalReadBytes);
+}
+
+TEST_F(
+    BufferManagerInternalsTest,
+    AccountingKeepsCumulativeIoScopedToEachTag) {
+  BufferManagerStatsCollector accounting;
+
+  auto hashJoin = makeBlock(4096, MemoryTag::kHashJoin);
+  hashJoin.pinCount = 1;
+  accounting.RecordAllocate(hashJoin);
+  accounting.OnResidentUnpinned(hashJoin);
+  hashJoin.pinCount = 0;
+  accounting.OnSpillStarted(hashJoin);
+  SpillWriteResult hashJoinWrite;
+  hashJoinWrite.rawBytes = hashJoin.size;
+  hashJoinWrite.physicalBytes = 512;
+  accounting.OnSpillCompleted(hashJoin, hashJoinWrite);
+  accounting.OnReadSubmitted(hashJoin);
+  accounting.OnReadFutureConsumed(hashJoin);
+  SpillReadResult hashJoinRead;
+  hashJoinRead.physicalBytes = 256;
+  accounting.OnReadCompleted(hashJoin, hashJoinRead);
+
+  auto sort = makeBlock(2048, MemoryTag::kSort);
+  sort.pinCount = 1;
+  accounting.RecordAllocate(sort);
+  accounting.OnResidentUnpinned(sort);
+  sort.pinCount = 0;
+  accounting.OnSpillStarted(sort);
+  SpillWriteResult sortWrite;
+  sortWrite.rawBytes = sort.size;
+  sortWrite.physicalBytes = 128;
+  accounting.OnSpillCompleted(sort, sortWrite);
+  accounting.OnReadSubmitted(sort);
+  accounting.OnReadFutureConsumed(sort);
+  SpillReadResult sortRead;
+  sortRead.physicalBytes = 64;
+  accounting.OnReadCompleted(sort, sortRead);
+
+  const auto& hashJoinTag = findTag(accounting.tagStats(), MemoryTag::kHashJoin);
+  EXPECT_EQ(1, hashJoinTag.spillWriteCount);
+  EXPECT_EQ(1, hashJoinTag.spillReadCount);
+  EXPECT_EQ(4096, hashJoinTag.spillWriteBytes);
+  EXPECT_EQ(4096, hashJoinTag.spillReadBytes);
+  EXPECT_EQ(512, hashJoinTag.spillPhysicalWriteBytes);
+  EXPECT_EQ(256, hashJoinTag.spillPhysicalReadBytes);
+
+  const auto& sortTag = findTag(accounting.tagStats(), MemoryTag::kSort);
+  EXPECT_EQ(1, sortTag.spillWriteCount);
+  EXPECT_EQ(1, sortTag.spillReadCount);
+  EXPECT_EQ(2048, sortTag.spillWriteBytes);
+  EXPECT_EQ(2048, sortTag.spillReadBytes);
+  EXPECT_EQ(128, sortTag.spillPhysicalWriteBytes);
+  EXPECT_EQ(64, sortTag.spillPhysicalReadBytes);
 }
 
 TEST_F(BufferManagerInternalsTest, AccountingDestroysBlocksInEachState) {

@@ -34,6 +34,7 @@
 #include "bolt/exec/HashTable.h"
 #include "bolt/exec/Spill.h"
 #include "bolt/exec/tests/utils/TempDirectoryPath.h"
+#include <future>
 using namespace bytedance::bolt;
 using namespace bytedance::bolt::exec;
 using bytedance::bolt::exec::test::TempDirectoryPath;
@@ -112,6 +113,185 @@ class HashJoinBridgeTest : public testing::Test,
         pool_.get(),
         jitRowEqVectors_);
   }
+
+  class ReentrantDestroyHashTable final : public BaseHashTable {
+   public:
+    explicit ReentrantDestroyHashTable(std::function<void()> onDestroy)
+        : BaseHashTable({}), onDestroy_(std::move(onDestroy)) {}
+
+    ~ReentrantDestroyHashTable() override {
+      if (onDestroy_) {
+        onDestroy_();
+      }
+    }
+
+    void groupProbe(HashLookup&) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    void joinProbe(HashLookup&) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    void directAddRows(
+        HashLookup&,
+        const RowVectorPtr&,
+        SelectivityVector&,
+        bool) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    void appendJoinRows(
+        const SelectivityVector&,
+        folly::Range<const DecodedVector* const*>,
+        folly::Range<const DecodedVector* const*>) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    void extractJoinColumn(
+        const char* const*,
+        int32_t,
+        int32_t,
+        const VectorPtr&) const override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    void setJoinProbedFlags(char* const*, int32_t) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    void extractJoinProbedFlags(
+        const char* const*,
+        int32_t,
+        bool,
+        bool,
+        const VectorPtr&) const override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    uint64_t joinRowCount() const override {
+      return 0;
+    }
+
+    int32_t listJoinResults(
+        JoinResultIterator&,
+        bool,
+        folly::Range<vector_size_t*>,
+        folly::Range<char**>,
+        const BaseVector*) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    int32_t listNotProbedRows(
+        RowsIterator*,
+        int32_t,
+        uint64_t,
+        char**) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    int32_t listProbedRows(
+        RowsIterator*,
+        int32_t,
+        uint64_t,
+        char**) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    int32_t listAllRows(
+        RowsIterator*,
+        int32_t,
+        uint64_t,
+        char**) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    int32_t listNullKeyRows(
+        NullKeyRowsIterator*,
+        int32_t,
+        char**) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    void prepareJoinTable(
+        std::vector<std::unique_ptr<BaseHashTable>>,
+        folly::Executor*,
+        bool,
+        int8_t) override {}
+
+    void joinTableMayHaveDuplicates() override {}
+
+    int64_t allocatedBytes() const override {
+      return 0;
+    }
+
+    void clear() override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    uint64_t capacity() const override {
+      return 0;
+    }
+
+    uint64_t numDistinct() const override {
+      return 0;
+    }
+
+    float getDistinctRatio() const override {
+      return 0;
+    }
+
+    HashTableStats stats() const override {
+      return HashTableStats{};
+    }
+
+    uint64_t hashTableSizeIncrease(int32_t) const override {
+      return 0;
+    }
+
+    uint64_t estimateHashTableSize(uint64_t) const override {
+      return 0;
+    }
+
+    bool hasDuplicateKeys() const override {
+      return false;
+    }
+
+    HashMode hashMode() const override {
+      return HashMode::kHash;
+    }
+
+    void decideHashMode(int32_t, bool) override {}
+
+    void setHashMode(HashMode, int32_t) override {}
+
+    int sizeBits() const override {
+      return 0;
+    }
+
+    void erase(folly::Range<char**>) override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    std::string toString() override {
+      return "ReentrantDestroyHashTable";
+    }
+
+    std::vector<RowContainer*> allRows() const override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+    std::vector<HybridContainer*> allHybridContainers() const override {
+      return {};
+    }
+
+    HashStringAllocator* stringAllocator() override {
+      BOLT_UNSUPPORTED("test-only");
+    }
+
+   private:
+    std::function<void()> onDestroy_;
+  };
 
   std::vector<ContinueFuture> createEmptyFutures(int32_t count) {
     std::vector<ContinueFuture> futures;
@@ -535,6 +715,58 @@ TEST_P(HashJoinBridgeTest, multiThreading) {
       }
     }
   }
+}
+
+TEST_P(HashJoinBridgeTest, probeFinishedDestroysTableOutsideBridgeMutex) {
+  auto joinBridge = createJoinBridge();
+  joinBridge->addBuilder();
+  joinBridge->start();
+
+  std::atomic<bool> destructorRan{false};
+  std::atomic<bool> reenteredBridge{false};
+  auto table = std::shared_ptr<BaseHashTable>(new ReentrantDestroyHashTable([&] {
+    destructorRan.store(true);
+    ContinueFuture future = ContinueFuture::makeEmpty();
+    auto result = joinBridge->tableOrFuture(&future);
+    reenteredBridge.store(!result.has_value() && future.valid());
+  }));
+
+  ASSERT_FALSE(joinBridge->setHashTable(std::move(table), {}, false));
+  ASSERT_FALSE(destructorRan.load());
+  ASSERT_FALSE(reenteredBridge.load());
+
+  ASSERT_FALSE(joinBridge->probeFinished());
+  EXPECT_TRUE(destructorRan.load());
+  EXPECT_TRUE(reenteredBridge.load());
+}
+
+TEST_P(HashJoinBridgeTest, resetHashTableDestroysTableOutsideBridgeMutex) {
+  auto joinBridge = createJoinBridge();
+  joinBridge->addBuilder();
+  joinBridge->start();
+
+  std::atomic<bool> destructorRan{false};
+  std::atomic<bool> reenteredBridge{false};
+  auto table = std::shared_ptr<BaseHashTable>(new ReentrantDestroyHashTable([&] {
+    destructorRan.store(true);
+    ContinueFuture future = ContinueFuture::makeEmpty();
+    auto result = joinBridge->tableOrFuture(&future);
+    reenteredBridge.store(result.has_value() && result->table == nullptr);
+  }));
+
+  ASSERT_FALSE(joinBridge->setHashTable(std::move(table), {}, false));
+  ASSERT_FALSE(destructorRan.load());
+  ASSERT_FALSE(reenteredBridge.load());
+
+  auto reset = std::async(std::launch::async, [&] {
+    joinBridge->resetHashTable();
+  });
+  ASSERT_EQ(
+      std::future_status::ready,
+      reset.wait_for(std::chrono::seconds(10)));
+  reset.get();
+  EXPECT_TRUE(destructorRan.load());
+  EXPECT_TRUE(reenteredBridge.load());
 }
 
 TEST_P(HashJoinBridgeTest, isHashBuildMemoryPool) {

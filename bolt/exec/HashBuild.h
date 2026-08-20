@@ -79,6 +79,23 @@ class HashBuild final : public Operator {
     uint32_t size;
   };
 
+  enum class BmHashJoinFallbackReason : int64_t {
+    kNone = 0,
+    kDisabled = 1,
+    kNonSerialExecution = 2,
+    kMultipleBuildDrivers = 3,
+    kGroupedExecution = 4,
+    kUnsupportedJoinType = 5,
+    kDropDuplicates = 6,
+    kHybridJoin = 7,
+    kReusableHashTable = 8,
+    kNoBufferManager = 9,
+    kJitRowEq = 10,
+    kSpillRestore = 11,
+    kRightOrNullAwareLayout = 12,
+    kUnsupportedType = 13,
+  };
+
   static std::string stateName(State state);
 
   HashBuild(
@@ -138,6 +155,14 @@ class HashBuild final : public Operator {
 
   // Invoked to set up hash table to build.
   void setupTable();
+
+  bool canUseBmHashJoin();
+  void recordBmHashJoinFallback(BmHashJoinFallbackReason reason);
+  void recordBmHashJoinStats();
+  uint64_t joinRowCount() const;
+  bool usingBmHashJoin() const {
+    return bmHashJoinEnabledForBuild_;
+  }
 
   // Reuse the pre-built hash table.
   void setReusableHashTable(
@@ -362,6 +387,10 @@ class HashBuild final : public Operator {
 
   // Container for the rows being accumulated.
   std::unique_ptr<BaseHashTable> table_;
+  bool bmHashJoinEnabledForBuild_{false};
+  bool bmHashJoinBackendRecorded_{false};
+  BmHashJoinFallbackReason bmHashJoinFallbackReason_{
+      BmHashJoinFallbackReason::kNone};
 
   // Key channels in 'input_'
   std::vector<column_index_t> keyChannels_;
